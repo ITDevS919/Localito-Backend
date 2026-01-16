@@ -25,7 +25,7 @@ passport.use(
     } catch (error) {
       return done(error);
     }
-  })
+  }) as passport.Strategy
 );
 
 // Serialize user for session
@@ -96,7 +96,7 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
           return done(error);
         }
       }
-    )
+    ) as passport.Strategy
   );
 }
 
