@@ -226,7 +226,7 @@ router.get("/auth/google", (req, res, next) => {
 
 router.get("/auth/google/callback",
   passport.authenticate("google", { 
-    failureRedirect: `${process.env.FRONTEND_URL || "http://localhost:3000"}/login/customer?error=google_auth_failed` 
+    failureRedirect: `${process.env.FRONTEND_URL || "http://localhost:5173"}/login/customer?error=google_auth_failed` 
   }),
   async (req, res) => {
     try {
@@ -242,7 +242,7 @@ router.get("/auth/google/callback",
       }
 
       // Redirect based on user role
-      const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
+      const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
       
       if (user.role === "retailer") {
         res.redirect(`${frontendUrl}/retailer/dashboard`);
@@ -252,7 +252,7 @@ router.get("/auth/google/callback",
         res.redirect(`${frontendUrl}/`);
       }
     } catch (error) {
-      const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
+      const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
       res.redirect(`${frontendUrl}/login/customer?error=google_auth_failed`);
     }
   }
@@ -2376,7 +2376,7 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
             // For web: Create Checkout Session
             const backendUrl = process.env.BACKEND_URL || process.env.API_URL || `${req.protocol}://${req.get("host")}`;
             const successUrl = `${backendUrl}/api/stripe/success?orderId=${order.id}`;
-            const cancelUrl = `${process.env.FRONTEND_URL || "http://localhost:3000"}/checkout?canceled=true`;   
+            const cancelUrl = `${process.env.FRONTEND_URL || "http://localhost:5173"}/checkout?canceled=true`;   
 
             const session = await stripeService.createCheckoutSession(
               order.id,
@@ -5107,7 +5107,7 @@ router.get("/stripe/success", async (req, res) => {
 
     // Check if there are more orders to pay for (multi-retailer scenario)
     // We'll pass this info to the frontend so it can handle sequential payments
-    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
+    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
     
     // Detect if request is from mobile app (check User-Agent or custom header)
     const userAgent = req.get("User-Agent") || "";
@@ -5117,7 +5117,7 @@ router.get("/stripe/success", async (req, res) => {
       // For mobile, serve an HTML page that attempts to open the app via deep link
       // This works around browser limitations with custom URL schemes
       const deepLinkUrl = `localito://order/${orderId}?success=true`;
-      const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
+      const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
       const fallbackUrl = `${frontendUrl}/orders/${orderId}?success=true`;
       
       const html = `
@@ -5240,7 +5240,7 @@ router.get("/stripe/success", async (req, res) => {
     }
   } catch (err: any) {
     console.error("Stripe success redirect error:", err?.message || err);
-    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
+    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
     return res.redirect(302, `${frontendUrl}/orders?error=redirect_failed`);
   }
 });
@@ -5267,7 +5267,7 @@ router.get("/retailer/stripe/oauth/callback", async (req, res) => {
     const account = await stripeService.exchangeOAuthCode(code, retailerId);
 
     // Redirect back to frontend payouts page with status
-    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
+    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
     const redirectUrl = `${frontendUrl}/retailer/payouts?stripe=connected&acct=${account.id}`;
     return res.redirect(302, redirectUrl);
   } catch (err: any) {

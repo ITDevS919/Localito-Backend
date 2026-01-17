@@ -279,7 +279,7 @@ export class EmailService {
     </div>
     
     <div style="text-align: center;">
-      <a href="${process.env.FRONTEND_URL || 'http://localhost:3000'}/orders/${bookingDetails.orderId}" class="button">
+      <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/orders/${bookingDetails.orderId}" class="button">
         View Order Details
       </a>
     </div>
@@ -498,7 +498,7 @@ export class EmailService {
     </div>
     
     <div style="text-align: center;">
-      <a href="${process.env.FRONTEND_URL || 'http://localhost:3000'}/retailer/orders/${bookingDetails.orderId}" class="button">
+      <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/retailer/orders/${bookingDetails.orderId}" class="button">
         View Order Details
       </a>
     </div>

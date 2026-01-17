@@ -43,7 +43,7 @@ npm install
    # Server Configuration
    PORT=5000
    NODE_ENV=development
-   FRONTEND_URL=http://localhost:3000
+   FRONTEND_URL=http://localhost:5173
    BACKEND_URL=http://localhost:5000
 
    # Session Secret (change this in production!)
