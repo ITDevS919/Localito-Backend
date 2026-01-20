@@ -41,6 +41,8 @@ app.use(
       httpOnly: true,
       maxAge: 1000 * 60 * 60 * 24 * 7, // 7 days
       sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
+      domain: process.env.NODE_ENV === "production" ? ".localito.com" : undefined, // Add this line
+      path: "/", // Explicitly set path    
     },
   })
 );
