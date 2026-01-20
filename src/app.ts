@@ -36,17 +36,16 @@ app.use(
     secret: process.env.SESSION_SECRET || "localito-secret-key-change-in-production",
     resave: false,
     saveUninitialized: false,
+    name: "connect.sid", // Explicit session name
     cookie: {
-      secure: process.env.NODE_ENV === "production",
+      secure: process.env.NODE_ENV === "production", // Requires HTTPS in production
       httpOnly: true,
       maxAge: 1000 * 60 * 60 * 24 * 7, // 7 days
-      sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
-      domain: process.env.NODE_ENV === "production" ? ".localito.com" : undefined, // Add this line
+      sameSite: process.env.NODE_ENV === "production" ? "none" : "lax", // "none" required for cross-origin
       path: "/", // Explicitly set path    
     },
   })
 );
-
 // Initialize Passport
 app.use(passport.initialize());
 app.use(passport.session());
