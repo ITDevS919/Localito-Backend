@@ -236,11 +236,13 @@ router.get("/auth/google/callback",
 
       // If user was just created and role needs to be set, update it
       const user = req.user as any;
-      if (user && role !== "customer" && user.role === "customer") {
-        // Note: In a real implementation, you might want to update the user's role
-        // For now, we'll use the role from the session
+      // Save session before redirect to ensure cookie is set
+      req.session.save((err) => {
+          if (err) {
+            console.error("Session save error:", err);
+            const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+            return res.redirect(`${frontendUrl}/login/customer?error=session_error`);
       }
-
       // Redirect based on user role
       const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
       
@@ -251,6 +253,8 @@ router.get("/auth/google/callback",
       } else {
         res.redirect(`${frontendUrl}/`);
       }
+    });
+
     } catch (error) {
       const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
       res.redirect(`${frontendUrl}/login/customer?error=google_auth_failed`);
