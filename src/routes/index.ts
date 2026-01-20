@@ -243,18 +243,30 @@ router.get("/auth/google/callback",
       const role = (req.session as any)?.googleAuthRole || "customer";
       delete (req.session as any).googleAuthRole;
 
-      // Redirect based on user role
-      const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
-      
-      console.log(`[Google Auth] Successful authentication for user ${user.id} with role ${user.role}`);
-      
-      if (user.role === "retailer") {
-        res.redirect(`${frontendUrl}/retailer/dashboard`);
-      } else if (user.role === "admin") {
-        res.redirect(`${frontendUrl}/admin/dashboard`);
-      } else {
-        res.redirect(`${frontendUrl}/`);
-      }
+      // Explicitly save session to ensure cookie is set
+      req.session.save((err) => {
+        if (err) {
+          console.error("[Google Auth] Session save error:", err);
+          const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+          return res.redirect(`${frontendUrl}/login/customer?error=session_error`);
+        }
+
+        // Redirect based on user role
+        const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+        
+        console.log(`[Google Auth] Successful authentication for user ${user.id} with role ${user.role}`);
+        console.log(`[Google Auth] Session ID: ${req.sessionID}`);
+        console.log(`[Google Auth] Request origin: ${req.headers.origin}`);
+        console.log(`[Google Auth] Request host: ${req.headers.host}`);
+        
+        if (user.role === "retailer") {
+          res.redirect(`${frontendUrl}/retailer/dashboard`);
+        } else if (user.role === "admin") {
+          res.redirect(`${frontendUrl}/admin/dashboard`);
+        } else {
+          res.redirect(`${frontendUrl}/`);
+        }
+      });
     } catch (error: any) {
       console.error("[Google Auth] Callback error:", error);
       const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";

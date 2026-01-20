@@ -16,10 +16,28 @@ const PgSession = connectPgSimple(session);
 const app = express();
 const httpServer = createServer(app);
 
-// Middleware
+// Middleware - CORS configuration
+// Support multiple origins (comma-separated) for production
+const allowedOrigins = process.env.FRONTEND_URL 
+  ? process.env.FRONTEND_URL.split(',').map(url => url.trim())
+  : ["http://localhost:5173"];
+
 app.use(cors({
-  origin: process.env.FRONTEND_URL || "http://localhost:5173",
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      console.warn(`[CORS] Blocked origin: ${origin}`);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  exposedHeaders: ['Set-Cookie'],
 }));
 
 app.use(express.json());
@@ -42,10 +60,13 @@ app.use(
       httpOnly: true,
       maxAge: 1000 * 60 * 60 * 24 * 7, // 7 days
       sameSite: process.env.NODE_ENV === "production" ? "none" : "lax", // "none" required for cross-origin
+      // DO NOT set domain - let it default to the exact domain that sets it (api.localito.com)
+      // Setting domain can prevent cookies from being sent in cross-origin requests
       path: "/", // Explicitly set path    
     },
   })
 );
+
 // Initialize Passport
 app.use(passport.initialize());
 app.use(passport.session());
