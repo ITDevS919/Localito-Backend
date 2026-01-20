@@ -16,6 +16,10 @@ const PgSession = connectPgSimple(session);
 const app = express();
 const httpServer = createServer(app);
 
+// Trust proxy to correctly detect HTTPS when behind reverse proxy (nginx, load balancer, etc.)
+// This is critical for setting secure cookies correctly in production
+app.set('trust proxy', 1);
+
 // Middleware - CORS configuration
 // Support multiple origins (comma-separated) for production
 const allowedOrigins = process.env.FRONTEND_URL 
@@ -43,6 +47,11 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
+// Determine if we should use secure cookies
+// In production, check if request is actually HTTPS (after trust proxy is set)
+// In development, always use non-secure cookies
+const isSecure = process.env.NODE_ENV === "production";
+
 // Session configuration with PostgreSQL store
 app.use(
   session({
@@ -56,10 +65,10 @@ app.use(
     saveUninitialized: false,
     name: "connect.sid", // Explicit session name
     cookie: {
-      secure: process.env.NODE_ENV === "production", // Requires HTTPS in production
+      secure: isSecure, // Requires HTTPS in production (trust proxy ensures correct detection)
       httpOnly: true,
       maxAge: 1000 * 60 * 60 * 24 * 7, // 7 days
-      sameSite: process.env.NODE_ENV === "production" ? "none" : "lax", // "none" required for cross-origin
+      sameSite: isSecure ? "none" : "lax", // "none" required for cross-origin in production
       // DO NOT set domain - let it default to the exact domain that sets it (api.localito.com)
       // Setting domain can prevent cookies from being sent in cross-origin requests
       path: "/", // Explicitly set path    
@@ -70,6 +79,25 @@ app.use(
 // Initialize Passport
 app.use(passport.initialize());
 app.use(passport.session());
+
+// Debug middleware for cookie issues (only in development or when DEBUG_COOKIES is set)
+if (process.env.NODE_ENV !== "production" || process.env.DEBUG_COOKIES === "true") {
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    // Only log for API routes to avoid noise
+    if (req.path.startsWith("/api")) {
+      console.log(`[Cookie Debug] ${req.method} ${req.path}`);
+      console.log(`[Cookie Debug] Received cookies:`, req.headers.cookie || "none");
+      console.log(`[Cookie Debug] Session ID:`, req.sessionID);
+      console.log(`[Cookie Debug] Is authenticated:`, req.isAuthenticated());
+      console.log(`[Cookie Debug] Origin:`, req.headers.origin);
+      console.log(`[Cookie Debug] Referer:`, req.headers.referer);
+      console.log(`[Cookie Debug] Protocol:`, req.protocol);
+      console.log(`[Cookie Debug] Secure:`, req.secure);
+      console.log(`[Cookie Debug] Host:`, req.headers.host);
+    }
+    next();
+  });
+}
 
 // Request logging
 app.use(requestLogger);
