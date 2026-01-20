@@ -5407,6 +5407,21 @@ router.get("/user/points", isAuthenticated, async (req, res, next) => {
   }
 });
 
+// Get user points transactions
+router.get("/user/points/transactions", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user) {
+      return res.status(401).json({ success: false, message: "Not authenticated" });
+    }
+
+    const transactions = await rewardsService.getUserPointsTransactions(user.id);
+    res.json({ success: true, data: transactions });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Validate discount code
 router.post("/discount-codes/validate", async (req, res, next) => {
   try {
