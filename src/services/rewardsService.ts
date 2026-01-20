@@ -127,35 +127,35 @@ export class RewardsService {
     }
   }
 
-    /**
+  /**
    * Get user points transactions
    */
-    async getUserPointsTransactions(userId: string) {
-      try {
-        const result = await pool.query(
-          `SELECT id, user_id, order_id, transaction_type, amount, description, created_at
-           FROM points_transactions
-           WHERE user_id = $1
-           ORDER BY created_at DESC`,
-          [userId]
-        );
-  
-        return result.rows.map((row) => ({
-          id: row.id,
-          user_id: row.user_id,
-          order_id: row.order_id,
-          transaction_type: row.transaction_type,
-          type: row.transaction_type, // Alias for customer-app compatibility
-          amount: parseFloat(row.amount) || 0,
-          description: row.description,
-          created_at: row.created_at,
-        }));
-      } catch (error: any) {
-        console.error('[Rewards] Failed to get user points transactions:', error);
-        throw error;
-      }
+  async getUserPointsTransactions(userId: string) {
+    try {
+      const result = await pool.query(
+        `SELECT id, user_id, order_id, transaction_type, amount, description, created_at
+         FROM points_transactions
+         WHERE user_id = $1
+         ORDER BY created_at DESC`,
+        [userId]
+      );
+
+      return result.rows.map((row) => ({
+        id: row.id,
+        user_id: row.user_id,
+        order_id: row.order_id,
+        transaction_type: row.transaction_type,
+        type: row.transaction_type, // Alias for customer-app compatibility
+        amount: parseFloat(row.amount) || 0,
+        description: row.description,
+        created_at: row.created_at,
+      }));
+    } catch (error: any) {
+      console.error('[Rewards] Failed to get user points transactions:', error);
+      throw error;
     }
-  
+  }
+
   /**
    * Validate discount code
    */

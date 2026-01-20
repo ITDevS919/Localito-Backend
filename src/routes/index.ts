@@ -2627,8 +2627,8 @@ router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
 
     // Update order status with BOPIS timestamp tracking
     let updateQuery = `UPDATE orders SET status = $1, updated_at = CURRENT_TIMESTAMP`;
-    const updateParams: any[] = [status, req.params.id];
-    let paramCount = 2;
+    const updateParams: any[] = [status];
+    let paramCount = 1;
 
     // If order status is being changed from 'pending' to a non-pending status,
     // and retailer_amount is not set, calculate and set it
@@ -2666,7 +2666,9 @@ router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
       updateQuery += `, picked_up_at = CURRENT_TIMESTAMP`;
     }
 
-    updateQuery += ` WHERE id = $${paramCount} RETURNING *`;
+    // Always use the next parameter index for the WHERE clause (order ID)
+    updateQuery += ` WHERE id = $${++paramCount} RETURNING *`;
+    updateParams.push(req.params.id);
 
     const updatedResult = await pool.query(updateQuery, updateParams);
 
