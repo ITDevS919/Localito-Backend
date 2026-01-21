@@ -139,7 +139,7 @@ export async function runMigrations() {
         user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         retailer_id UUID NOT NULL REFERENCES retailers(id) ON DELETE CASCADE,
         status VARCHAR(20) NOT NULL DEFAULT 'pending' 
-        CHECK (status IN ('pending', 'processing', 'shipped', 'delivered', 'cancelled', 'ready_for_pickup', 'picked_up')),
+        CHECK (status IN ('awaiting_payment', 'pending', 'processing', 'shipped', 'delivered', 'cancelled', 'ready_for_pickup', 'picked_up')),
         total DECIMAL(10, 2) NOT NULL CHECK (total >= 0),
         stripe_session_id VARCHAR(255),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -197,10 +197,10 @@ export async function runMigrations() {
           EXECUTE 'ALTER TABLE orders DROP CONSTRAINT ' || quote_ident(constraint_name_var);
         END IF;
         
-        -- Add new constraint with BOPIS statuses
+        -- Add new constraint with BOPIS statuses and awaiting_payment
         ALTER TABLE orders 
         ADD CONSTRAINT orders_status_check 
-        CHECK (status IN ('pending', 'processing', 'shipped', 'delivered', 'cancelled', 'ready_for_pickup', 'picked_up'));
+        CHECK (status IN ('awaiting_payment', 'pending', 'processing', 'shipped', 'delivered', 'cancelled', 'ready_for_pickup', 'picked_up'));
       EXCEPTION
         WHEN duplicate_object THEN
           -- Constraint already exists, skip
@@ -368,8 +368,76 @@ export async function runMigrations() {
       END $$;
     `);
 
+    // Update reviews table to support services
+    await client.query(`
+      DO $$ 
+      BEGIN
+        -- Make product_id nullable
+        IF EXISTS (SELECT 1 FROM information_schema.columns 
+                  WHERE table_name='reviews' AND column_name='product_id' AND is_nullable='NO') THEN
+          ALTER TABLE reviews ALTER COLUMN product_id DROP NOT NULL;
+        END IF;
+        
+        -- Add service_id column if it doesn't exist
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='reviews' AND column_name='service_id') THEN
+          ALTER TABLE reviews ADD COLUMN service_id UUID REFERENCES services(id) ON DELETE CASCADE;
+        END IF;
+        
+        -- Add constraint to ensure either product_id or service_id is set
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint 
+          WHERE conname = 'reviews_product_or_service_check'
+        ) THEN
+          ALTER TABLE reviews ADD CONSTRAINT reviews_product_or_service_check 
+            CHECK ((product_id IS NOT NULL AND service_id IS NULL) OR 
+                   (product_id IS NULL AND service_id IS NOT NULL));
+        END IF;
+        
+        -- Drop old unique constraint if it exists
+        IF EXISTS (
+          SELECT 1 FROM pg_constraint 
+          WHERE conname = 'reviews_product_id_user_id_key'
+        ) THEN
+          ALTER TABLE reviews DROP CONSTRAINT reviews_product_id_user_id_key;
+        END IF;
+        
+        -- Add new unique indexes for products and services separately
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relname = 'reviews_product_user_unique' AND n.nspname = 'public'
+        ) THEN
+          CREATE UNIQUE INDEX reviews_product_user_unique 
+            ON reviews(product_id, user_id) 
+            WHERE product_id IS NOT NULL;
+        END IF;
+        
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relname = 'reviews_service_user_unique' AND n.nspname = 'public'
+        ) THEN
+          CREATE UNIQUE INDEX reviews_service_user_unique 
+            ON reviews(service_id, user_id) 
+            WHERE service_id IS NOT NULL;
+        END IF;
+      END $$;
+    `);
 
-    // Create indexes for products (reviews indexes moved to after services/reviews updates)
+    // Create indexes for reviews
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_reviews_product_id ON reviews(product_id)
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_reviews_service_id ON reviews(service_id)
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_reviews_user_id ON reviews(user_id)
+    `);
+
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_products_review_count ON products(review_count)
     `);
@@ -837,77 +905,6 @@ export async function runMigrations() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(retailer_id, booking_date, booking_time)
       )
-    `);
-
-    // Update reviews table to support services (run after services table exists)
-    await client.query(`
-      DO $$ 
-      BEGIN
-        -- Make product_id nullable
-        IF EXISTS (SELECT 1 FROM information_schema.columns 
-                  WHERE table_name='reviews' AND column_name='product_id' AND is_nullable='NO') THEN
-          ALTER TABLE reviews ALTER COLUMN product_id DROP NOT NULL;
-        END IF;
-        
-        -- Add service_id column if it doesn't exist
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                      WHERE table_name='reviews' AND column_name='service_id') THEN
-          ALTER TABLE reviews ADD COLUMN service_id UUID REFERENCES services(id) ON DELETE CASCADE;
-        END IF;
-        
-        -- Add constraint to ensure either product_id or service_id is set
-        IF NOT EXISTS (
-          SELECT 1 FROM pg_constraint 
-          WHERE conname = 'reviews_product_or_service_check'
-        ) THEN
-          ALTER TABLE reviews ADD CONSTRAINT reviews_product_or_service_check 
-            CHECK ((product_id IS NOT NULL AND service_id IS NULL) OR 
-                   (product_id IS NULL AND service_id IS NOT NULL));
-        END IF;
-        
-        -- Drop old unique constraint if it exists
-        IF EXISTS (
-          SELECT 1 FROM pg_constraint 
-          WHERE conname = 'reviews_product_id_user_id_key'
-        ) THEN
-          ALTER TABLE reviews DROP CONSTRAINT reviews_product_id_user_id_key;
-        END IF;
-        
-        -- Add new unique indexes for products and services separately
-        IF NOT EXISTS (
-          SELECT 1 FROM pg_class c
-          JOIN pg_namespace n ON n.oid = c.relnamespace
-          WHERE c.relname = 'reviews_product_user_unique' AND n.nspname = 'public'
-        ) THEN
-          CREATE UNIQUE INDEX reviews_product_user_unique 
-            ON reviews(product_id, user_id) 
-            WHERE product_id IS NOT NULL;
-        END IF;
-        
-        IF NOT EXISTS (
-          SELECT 1 FROM pg_class c
-          JOIN pg_namespace n ON n.oid = c.relnamespace
-          WHERE c.relname = 'reviews_service_user_unique' AND n.nspname = 'public'
-        ) THEN
-          CREATE UNIQUE INDEX reviews_service_user_unique 
-            ON reviews(service_id, user_id) 
-            WHERE service_id IS NOT NULL;
-        END IF;
-      END $$;
-    `);
-
-
-    // Create indexes for reviews (added after service_id column may have been created)
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_reviews_product_id ON reviews(product_id)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_reviews_service_id ON reviews(service_id)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_reviews_user_id ON reviews(user_id)
     `);
 
     // Create indexes for services and booking

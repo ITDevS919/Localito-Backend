@@ -2164,7 +2164,8 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
         }
       }
 
-      // Create order with booking fields if it's a service order
+      // Create order with status 'awaiting_payment' - payment must be confirmed before finalizing
+      // Stock will NOT be deducted and cart will NOT be cleared until payment succeeds
       const orderResult = await pool.query(
         `INSERT INTO orders (user_id, retailer_id, status, total, pickup_location, pickup_instructions, discount_amount, points_used, booking_date, booking_time, booking_duration_minutes, booking_status)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
@@ -2172,7 +2173,7 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
         [
           user.id,
           retailerId,
-          "pending",
+          "awaiting_payment", // Order is reserved, awaiting payment confirmation
           total,
           pickupLocation,
           pickupInstructions || null,
@@ -2187,7 +2188,7 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
 
       const order = orderResult.rows[0];
 
-      // Apply discount code to order if provided
+      // Apply discount code to order if provided (this is OK to do now)
       if (discountCode && retailerDiscount > 0) {
         try {
           await rewardsService.applyDiscountCode(order.id, discountCode);
@@ -2196,35 +2197,20 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
         }
       }
 
-      // Redeem points if provided
-      if (retailerPoints > 0) {
-        try {
-          await rewardsService.redeemPoints(user.id, order.id, retailerPoints);
-        } catch (err) {
-          console.error('Failed to redeem points:', err);
-        }
-      }
+      // NOTE: Points redemption will happen after payment succeeds (in webhook)
+      // We store the points amount but don't redeem yet
 
-      // Create order items and update stock (products)
+      // Create order items (but DON'T deduct stock yet - will happen after payment)
       for (const item of items) {
-        // Create order item
+        // Create order item record
         await pool.query(
           `INSERT INTO order_items (order_id, product_id, quantity, price)
            VALUES ($1, $2, $3, $4)`,
           [order.id, item.product_id, item.quantity, item.price]
         );
 
-        // Update product stock
-        await pool.query(
-          "UPDATE products SET stock = stock - $1 WHERE id = $2",
-          [item.quantity, item.product_id]
-        );
-
-        // Remove from cart
-        await pool.query(
-          "DELETE FROM cart_items WHERE user_id = $1 AND product_id = $2",
-          [user.id, item.product_id]
-        );
+        // DO NOT deduct stock here - will be done after payment succeeds
+        // DO NOT clear cart here - will be done after payment succeeds
       }
 
       // Create order service items (services)
@@ -2243,11 +2229,7 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
           ]
         );
 
-        // Remove from cart
-        await pool.query(
-          "DELETE FROM cart_service_items WHERE user_id = $1 AND service_id = $2",
-          [user.id, serviceItem.service_id]
-        );
+        // DO NOT clear cart here - will be done after payment succeeds
       }
 
       // Get order with items for response (products)
@@ -2590,6 +2572,97 @@ router.get("/orders/:id", isAuthenticated, async (req, res, next) => {
   }
 });
 
+// Retry payment for abandoned orders (customer only)
+router.post("/orders/:id/retry-payment", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "customer") {
+      return res.status(403).json({ success: false, message: "Only customers can retry payment" });
+    }
+
+    const orderResult = await pool.query(
+      `SELECT o.*, r.business_name as retailer_name
+       FROM orders o
+       JOIN retailers r ON o.retailer_id = r.id
+       WHERE o.id = $1 AND o.user_id = $2`,
+      [req.params.id, user.id]
+    );
+
+    if (orderResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+
+    const order = orderResult.rows[0];
+
+    // Check if payment is actually needed
+    if (order.stripe_payment_intent_id) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Payment already completed for this order" 
+      });
+    }
+
+    if (order.status !== 'awaiting_payment') {
+      return res.status(400).json({ 
+        success: false, 
+        message: `Order is not awaiting payment (current status: ${order.status})` 
+      });
+    }
+
+    // Check if retailer has Stripe Connect
+    const stripeAccount = await pool.query(
+      `SELECT sca.stripe_account_id, sca.charges_enabled
+       FROM stripe_connect_accounts sca
+       WHERE sca.retailer_id = $1 AND sca.charges_enabled = true`,
+      [order.retailer_id]
+    );
+
+    if (stripeAccount.rows.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Payment processing is not available for this retailer" 
+      });
+    }
+
+    // Create new checkout session
+    const backendUrl = process.env.BACKEND_URL || process.env.API_URL || `${req.protocol}://${req.get("host")}`;
+    const successUrl = `${backendUrl}/api/stripe/success?orderId=${order.id}`;
+    const cancelUrl = `${process.env.FRONTEND_URL || "http://localhost:5173"}/orders/${order.id}?canceled=true`;
+
+    const session = await stripeService.createCheckoutSession(
+      order.id,
+      order.retailer_id,
+      parseFloat(order.total),
+      'gbp',
+      successUrl,
+      cancelUrl,
+      user.email
+    );
+
+    if (!session || !session.url) {
+      return res.status(500).json({ 
+        success: false, 
+        message: "Failed to create checkout session" 
+      });
+    }
+
+    // Update order with new session ID
+    await pool.query(
+      'UPDATE orders SET stripe_session_id = $1 WHERE id = $2',
+      [session.id, order.id]
+    );
+
+    res.json({
+      success: true,
+      data: {
+        checkoutUrl: session.url,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Update order status (retailer only)
 router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
   try {
@@ -2599,7 +2672,7 @@ router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
     }
 
     const { status } = req.body;
-    const validStatuses = ["pending", "processing", "shipped", "delivered", "cancelled", "ready_for_pickup", "picked_up"];
+    const validStatuses = ["awaiting_payment", "pending", "processing", "shipped", "delivered", "cancelled", "ready_for_pickup", "picked_up"];
     
     if (!status || !validStatuses.includes(status)) {
       return res.status(400).json({
@@ -5528,6 +5601,67 @@ router.get("/retailer/:retailerId/user", async (req, res, next) => {
       },
     });
   } catch (error) {
+    next(error);
+  }
+});
+
+// Cleanup abandoned orders (orders in 'awaiting_payment' status for > 15 minutes)
+// This should be called via cron job or scheduled task
+router.post("/orders/cleanup-abandoned", async (req, res, next) => {
+  try {
+    // Optional: Require admin authentication or API key
+    // For now, allow unauthenticated but you should secure this in production
+    const apiKey = req.headers['x-api-key'];
+    const expectedApiKey = process.env.CLEANUP_API_KEY;
+    
+    if (expectedApiKey && apiKey !== expectedApiKey) {
+      return res.status(401).json({ 
+        success: false, 
+        message: "Unauthorized. Valid API key required." 
+      });
+    }
+
+    // Cancel orders that have been awaiting payment for more than 15 minutes
+    const result = await pool.query(
+      `UPDATE orders 
+       SET status = 'cancelled', 
+           updated_at = CURRENT_TIMESTAMP
+       WHERE status = 'awaiting_payment' 
+         AND stripe_payment_intent_id IS NULL
+         AND created_at < NOW() - INTERVAL '15 minutes'
+       RETURNING id, user_id`
+    );
+
+    const cancelledOrders = result.rows;
+    const cancelledCount = cancelledOrders.length;
+
+    console.log(`[Cleanup] Cancelled ${cancelledCount} abandoned orders`);
+
+    // Optionally: Delete order items for cancelled orders to free up resources
+    // (Order items are not needed if order is cancelled before payment)
+    if (cancelledCount > 0) {
+      const orderIds = cancelledOrders.map(o => o.id);
+      await pool.query(
+        `DELETE FROM order_items WHERE order_id = ANY($1::uuid[])`,
+        [orderIds]
+      );
+      await pool.query(
+        `DELETE FROM order_service_items WHERE order_id = ANY($1::uuid[])`,
+        [orderIds]
+      );
+      console.log(`[Cleanup] Deleted order items for ${cancelledCount} cancelled orders`);
+    }
+
+    res.json({
+      success: true,
+      message: `Cleaned up ${cancelledCount} abandoned orders`,
+      data: {
+        cancelledCount,
+        orderIds: cancelledOrders.map(o => o.id),
+      },
+    });
+  } catch (error) {
+    console.error('[Cleanup] Error cleaning up abandoned orders:', error);
     next(error);
   }
 });

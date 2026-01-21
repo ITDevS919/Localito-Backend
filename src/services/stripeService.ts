@@ -790,16 +790,20 @@ export class StripeService {
     const orderId = paymentIntent.metadata?.order_id;
     const retailerId = paymentIntent.metadata?.retailer_id;
     
-    if (!orderId || !retailerId) return;
+    if (!orderId || !retailerId) {
+      console.error(`[Stripe] Missing order_id or retailer_id in payment intent metadata`);
+      return;
+    }
 
     const commissionRate = await this.getCommissionRate();
     const totalAmount = paymentIntent.amount / 100;
     const platformCommission = totalAmount * commissionRate;
     const retailerAmount = totalAmount - platformCommission;
 
-    // Get user_id from order to award cashback
+    // Get order details - must be in 'awaiting_payment' status
     const orderResult = await pool.query(
-      'SELECT user_id, total FROM orders WHERE id = $1',
+      `SELECT user_id, total, status, points_used, discount_amount 
+       FROM orders WHERE id = $1`,
       [orderId]
     );
 
@@ -808,9 +812,29 @@ export class StripeService {
       return;
     }
 
-    const userId = orderResult.rows[0].user_id;
-    const orderTotal = parseFloat(orderResult.rows[0].total);
+    const order = orderResult.rows[0];
+    const userId = order.user_id;
+    const orderTotal = parseFloat(order.total);
 
+    // Only process orders that are awaiting payment
+    if (order.status !== 'awaiting_payment') {
+      console.log(`[Stripe] Order ${orderId} is not in 'awaiting_payment' status (current: ${order.status}). Skipping finalization.`);
+      // Still update payment info but don't finalize
+      await pool.query(
+        `UPDATE orders 
+         SET stripe_payment_intent_id = $1,
+             platform_commission = $2,
+             retailer_amount = $3,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = $4`,
+        [paymentIntent.id, platformCommission, retailerAmount, orderId]
+      );
+      return;
+    }
+
+    console.log(`[Stripe] Finalizing order ${orderId} after payment confirmation`);
+
+    // FINALIZE ORDER: Update status to 'processing' and payment info
     await pool.query(
       `UPDATE orders 
        SET stripe_payment_intent_id = $1,
@@ -829,13 +853,52 @@ export class StripeService {
       );
     }
 
+    // NOW deduct stock for products (this was deferred until payment succeeded)
+    const orderItemsResult = await pool.query(
+      `SELECT product_id, quantity FROM order_items WHERE order_id = $1`,
+      [orderId]
+    );
+
+    for (const item of orderItemsResult.rows) {
+      await pool.query(
+        `UPDATE products SET stock = stock - $1 WHERE id = $2`,
+        [item.quantity, item.product_id]
+      );
+      console.log(`[Stripe] Deducted ${item.quantity} units from product ${item.product_id}`);
+    }
+
+    // NOW clear cart (this was deferred until payment succeeded)
+    await pool.query(
+      `DELETE FROM cart_items WHERE user_id = $1`,
+      [userId]
+    );
+    await pool.query(
+      `DELETE FROM cart_service_items WHERE user_id = $1`,
+      [userId]
+    );
+    console.log(`[Stripe] Cleared cart for user ${userId}`);
+
+    // NOW redeem points if they were specified (this was deferred until payment succeeded)
+    if (order.points_used && parseFloat(order.points_used) > 0) {
+      try {
+        await rewardsService.redeemPoints(userId, orderId, parseFloat(order.points_used));
+        console.log(`[Stripe] Redeemed ${order.points_used} points for order ${orderId}`);
+      } catch (error: any) {
+        console.error(`[Stripe] Failed to redeem points for order ${orderId}:`, error);
+        // Don't throw - points redemption failure shouldn't fail the order
+      }
+    }
+
     // Award cashback points (1% of total order amount)
     try {
       await rewardsService.awardCashback(userId, orderId, orderTotal);
+      console.log(`[Stripe] Awarded cashback for order ${orderId}`);
     } catch (error: any) {
       console.error(`[Stripe] Failed to award cashback for order ${orderId}:`, error);
       // Don't throw - cashback is a bonus feature
     }
+
+    console.log(`[Stripe] Order ${orderId} finalized successfully`);
   }
 
   private async handleAccountUpdated(account: Stripe.Account) {
