@@ -178,34 +178,47 @@ export async function runMigrations() {
       END $$;
     `);
 
-    // Update orders status constraint to include BOPIS statuses for existing databases
+    // Update orders status constraint to include BOPIS statuses and awaiting_payment for existing databases
+    // First, try to drop the constraint if it exists (using multiple methods for compatibility)
     await client.query(`
       DO $$ 
       DECLARE
         constraint_name_var TEXT;
       BEGIN
-        -- Find the constraint name
+        -- Find the constraint name (try multiple possible names)
         SELECT constraint_name INTO constraint_name_var
         FROM information_schema.table_constraints 
         WHERE table_name = 'orders' 
         AND constraint_type = 'CHECK'
-        AND constraint_name LIKE '%status%'
+        AND (constraint_name LIKE '%status%' OR constraint_name = 'orders_status_check')
         LIMIT 1;
         
         -- Drop existing constraint if found
         IF constraint_name_var IS NOT NULL THEN
-          EXECUTE 'ALTER TABLE orders DROP CONSTRAINT ' || quote_ident(constraint_name_var);
+          BEGIN
+            EXECUTE 'ALTER TABLE orders DROP CONSTRAINT ' || quote_ident(constraint_name_var);
+          EXCEPTION
+            WHEN OTHERS THEN
+              -- Ignore errors if constraint doesn't exist
+              NULL;
+          END;
         END IF;
-        
-        -- Add new constraint with BOPIS statuses and awaiting_payment
-        ALTER TABLE orders 
-        ADD CONSTRAINT orders_status_check 
-        CHECK (status IN ('awaiting_payment', 'pending', 'processing', 'shipped', 'delivered', 'cancelled', 'ready_for_pickup', 'picked_up'));
       EXCEPTION
-        WHEN duplicate_object THEN
-          -- Constraint already exists, skip
+        WHEN OTHERS THEN
+          -- Ignore all errors in this block
           NULL;
       END $$;
+    `);
+    
+    // Now add the updated constraint (drop first to ensure clean state)
+    await client.query(`
+      ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_status_check;
+    `);
+    
+    await client.query(`
+      ALTER TABLE orders 
+      ADD CONSTRAINT orders_status_check 
+      CHECK (status IN ('awaiting_payment', 'pending', 'processing', 'shipped', 'delivered', 'cancelled', 'ready_for_pickup', 'picked_up'));
     `);
 
     // Create order_items table
