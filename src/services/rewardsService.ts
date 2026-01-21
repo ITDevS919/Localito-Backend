@@ -8,19 +8,7 @@ export class RewardsService {
    */
   async awardCashback(userId: string, orderId: string, orderTotal: number) {
     try {
-      console.log(`[Rewards] awardCashback called - userId: ${userId}, orderId: ${orderId}, orderTotal: ${orderTotal}`);
-      
-      // Validate inputs
-      if (!userId || !orderId) {
-        throw new Error(`Missing required parameters: userId=${userId}, orderId=${orderId}`);
-      }
-      
-      if (!orderTotal || isNaN(orderTotal) || orderTotal <= 0) {
-        throw new Error(`Invalid orderTotal: ${orderTotal}`);
-      }
-
       const cashbackAmount = orderTotal * CASHBACK_RATE;
-      console.log(`[Rewards] Calculated cashback amount: £${cashbackAmount} (1% of £${orderTotal})`);
 
       // Get or create user points record
       let pointsResult = await pool.query(
@@ -29,16 +17,12 @@ export class RewardsService {
       );
 
       if (pointsResult.rows.length === 0) {
-        console.log(`[Rewards] Creating new user_points record for userId: ${userId}`);
         await pool.query(
           `INSERT INTO user_points (user_id, balance, total_earned)
            VALUES ($1, $2, $2)`,
           [userId, cashbackAmount]
         );
-        console.log(`[Rewards] Created user_points record with balance: £${cashbackAmount}`);
       } else {
-        const oldBalance = parseFloat(pointsResult.rows[0].balance) || 0;
-        console.log(`[Rewards] Updating existing user_points. Old balance: £${oldBalance}, Adding: £${cashbackAmount}`);
         await pool.query(
           `UPDATE user_points 
            SET balance = balance + $1,
@@ -47,38 +31,24 @@ export class RewardsService {
            WHERE user_id = $2`,
           [cashbackAmount, userId]
         );
-        const newBalance = oldBalance + cashbackAmount;
-        console.log(`[Rewards] Updated user_points. New balance: £${newBalance}`);
       }
 
       // Record transaction
-      console.log(`[Rewards] Recording points transaction for order ${orderId}`);
       await pool.query(
         `INSERT INTO points_transactions (user_id, order_id, transaction_type, amount, description)
          VALUES ($1, $2, 'earned', $3, $4)`,
         [userId, orderId, cashbackAmount, `1% cashback on order ${orderId}`]
       );
-      console.log(`[Rewards] Points transaction recorded successfully`);
 
       // Update order with points earned
-      console.log(`[Rewards] Updating order ${orderId} with points_earned: £${cashbackAmount}`);
       await pool.query(
         'UPDATE orders SET points_earned = $1 WHERE id = $2',
         [cashbackAmount, orderId]
       );
-      console.log(`[Rewards] Order updated with points_earned`);
 
-      console.log(`[Rewards] Cashback award completed successfully. Amount: £${cashbackAmount}`);
       return cashbackAmount;
     } catch (error: any) {
       console.error('[Rewards] Failed to award cashback:', error);
-      console.error('[Rewards] Error details:', {
-        userId,
-        orderId,
-        orderTotal,
-        errorMessage: error.message,
-        errorStack: error.stack,
-      });
       throw error;
     }
   }
