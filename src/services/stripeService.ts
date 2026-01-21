@@ -638,11 +638,11 @@ export class StripeService {
       const platformCommission = amount * commissionRate;
       const retailerAmount = amount - platformCommission;
 
-      // Get Stripe instance for this retailer (uses their secret key if available)
-      const stripeInstance = await this.getStripeInstanceForRetailer(retailerId);
-
       // Payment goes to THIS retailer's specific account
-      const session = await stripeInstance.checkout.sessions.create({
+      // IMPORTANT: Use the platform Stripe instance to create the PaymentIntent so
+      // webhooks arrive on the platform account. Funds still flow to the retailer
+      // via transfer_data.destination.
+      const session = await this.stripe.checkout.sessions.create({
         payment_method_types: ["card"],
         line_items: [
           {
