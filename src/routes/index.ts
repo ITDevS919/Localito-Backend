@@ -5374,20 +5374,41 @@ router.get("/retailer/stripe/status", isAuthenticated, async (req, res, next) =>
 
 // Stripe webhook endpoint
 router.post("/stripe/webhook", express.raw({ type: 'application/json' }), async (req, res) => {
+  console.log('[Webhook] Received webhook request');
+  
   const sigHeader = req.headers['stripe-signature'];
   const sig = Array.isArray(sigHeader) ? sigHeader[0] : sigHeader;
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET || '';
 
+  console.log('[Webhook] Signature header present:', !!sig);
+  console.log('[Webhook] Webhook secret configured:', !!webhookSecret);
+
   if (!sig) {
+    console.error('[Webhook] Missing stripe-signature header');
     return res.status(400).send('Missing stripe-signature header');
   }
 
+  if (!webhookSecret) {
+    console.error('[Webhook] STRIPE_WEBHOOK_SECRET is not configured');
+    return res.status(500).send('Webhook secret not configured');
+  }
+
   try {
+    console.log('[Webhook] Attempting to construct webhook event...');
     const event = stripeService.constructWebhookEvent(req.body, sig, webhookSecret);
+    console.log('[Webhook] Event constructed successfully. Type:', event.type, 'ID:', event.id);
+    
     await stripeService.handleWebhook(event);
+    console.log('[Webhook] Webhook processed successfully');
     res.json({ received: true });
   } catch (err: any) {
-    console.error('Webhook signature verification failed:', err.message);
+    console.error('[Webhook] Webhook processing failed:', err.message);
+    console.error('[Webhook] Error stack:', err.stack);
+    console.error('[Webhook] Error details:', {
+      message: err.message,
+      type: err.type,
+      code: err.code,
+    });
     res.status(400).send(`Webhook Error: ${err.message}`);
   }
 });

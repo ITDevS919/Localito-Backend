@@ -743,14 +743,19 @@ export class StripeService {
 
   async handleWebhook(event: Stripe.Event) {
     try {
+      console.log(`[Stripe Webhook] Received event: ${event.type}, ID: ${event.id}`);
+      
       switch (event.type) {
         case "checkout.session.completed":
           const session = event.data.object as Stripe.Checkout.Session;
+          console.log(`[Stripe Webhook] Processing checkout.session.completed for session: ${session.id}`);
           await this.handleCheckoutCompleted(session);
           break;
 
         case "payment_intent.succeeded":
           const paymentIntent = event.data.object as Stripe.PaymentIntent;
+          console.log(`[Stripe Webhook] Processing payment_intent.succeeded for payment: ${paymentIntent.id}`);
+          console.log(`[Stripe Webhook] Payment metadata:`, paymentIntent.metadata);
           await this.handlePaymentSucceeded(paymentIntent);
           break;
 
@@ -760,10 +765,13 @@ export class StripeService {
           break;
 
         default:
-          console.log(`Unhandled event type: ${event.type}`);
+          console.log(`[Stripe Webhook] Unhandled event type: ${event.type}`);
       }
+      
+      console.log(`[Stripe Webhook] Successfully processed event: ${event.type}`);
     } catch (error: any) {
-      console.error("[Stripe] Webhook error:", error);
+      console.error(`[Stripe Webhook] Error processing event ${event.type}:`, error);
+      console.error(`[Stripe Webhook] Error stack:`, error.stack);
       throw error;
     }
   }
@@ -787,15 +795,24 @@ export class StripeService {
   }
 
   private async handlePaymentSucceeded(paymentIntent: Stripe.PaymentIntent) {
+    console.log(`[Stripe] handlePaymentSucceeded called for payment: ${paymentIntent.id}`);
+    
     const orderId = paymentIntent.metadata?.order_id;
     const retailerId = paymentIntent.metadata?.retailer_id;
     
-    if (!orderId || !retailerId) return;
+    console.log(`[Stripe] Payment metadata - orderId: ${orderId}, retailerId: ${retailerId}`);
+    
+    if (!orderId || !retailerId) {
+      console.error(`[Stripe] Missing metadata in payment intent ${paymentIntent.id}. orderId: ${orderId}, retailerId: ${retailerId}`);
+      return;
+    }
 
     const commissionRate = await this.getCommissionRate();
     const totalAmount = paymentIntent.amount / 100;
     const platformCommission = totalAmount * commissionRate;
     const retailerAmount = totalAmount - platformCommission;
+
+    console.log(`[Stripe] Processing payment for order ${orderId}. Amount: ${totalAmount}, Commission: ${platformCommission}, Retailer: ${retailerAmount}`);
 
     // Get user_id from order to award cashback
     const orderResult = await pool.query(
@@ -810,6 +827,18 @@ export class StripeService {
 
     const userId = orderResult.rows[0].user_id;
     const orderTotal = parseFloat(orderResult.rows[0].total);
+
+    console.log(`[Stripe] Order found. userId: ${userId}, orderTotal: ${orderTotal}`);
+
+    if (!userId) {
+      console.error(`[Stripe] Order ${orderId} has no user_id`);
+      return;
+    }
+
+    if (!orderTotal || isNaN(orderTotal) || orderTotal <= 0) {
+      console.error(`[Stripe] Invalid order total for order ${orderId}: ${orderTotal}`);
+      return;
+    }
 
     await pool.query(
       `UPDATE orders 
@@ -830,10 +859,13 @@ export class StripeService {
     }
 
     // Award cashback points (1% of total order amount)
+    console.log(`[Stripe] Attempting to award cashback for order ${orderId}, userId: ${userId}, orderTotal: ${orderTotal}`);
     try {
-      await rewardsService.awardCashback(userId, orderId, orderTotal);
+      const cashbackAmount = await rewardsService.awardCashback(userId, orderId, orderTotal);
+      console.log(`[Stripe] Successfully awarded cashback: £${cashbackAmount} for order ${orderId}`);
     } catch (error: any) {
       console.error(`[Stripe] Failed to award cashback for order ${orderId}:`, error);
+      console.error(`[Stripe] Cashback error stack:`, error.stack);
       // Don't throw - cashback is a bonus feature
     }
   }
