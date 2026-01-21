@@ -21,6 +21,27 @@ const httpServer = createServer(app);
 // This is critical for setting secure cookies correctly in production
 app.set('trust proxy', 1);
 
+// Log ALL incoming requests for debugging (especially webhooks)
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (req.path.includes('webhook') || req.path.includes('stripe')) {
+    console.log('========================================');
+    console.log('[Request Logger] Incoming request detected');
+    console.log('[Request Logger] Method:', req.method);
+    console.log('[Request Logger] Path:', req.path);
+    console.log('[Request Logger] URL:', req.url);
+    console.log('[Request Logger] Headers:', {
+      'content-type': req.headers['content-type'],
+      'stripe-signature': req.headers['stripe-signature'] ? 'PRESENT' : 'MISSING',
+      'user-agent': req.headers['user-agent'],
+      'host': req.headers['host'],
+    });
+    console.log('[Request Logger] IP:', req.ip);
+    console.log('[Request Logger] Protocol:', req.protocol);
+    console.log('========================================');
+  }
+  next();
+});
+
 // Middleware - CORS configuration
 // Support multiple origins (comma-separated) for production
 const allowedOrigins = process.env.FRONTEND_URL 
@@ -45,17 +66,33 @@ app.use(cors({
   exposedHeaders: ['Set-Cookie'],
 }));
 
+// Add middleware to log ALL POST requests to /api/stripe/webhook BEFORE the route handler
+app.use("/api/stripe/webhook", (req: Request, res: Response, next: NextFunction) => {
+  console.log('========================================');
+  console.log('[Webhook Middleware] Intercepted request to /api/stripe/webhook');
+  console.log('[Webhook Middleware] Method:', req.method);
+  console.log('[Webhook Middleware] Path:', req.path);
+  console.log('[Webhook Middleware] URL:', req.url);
+  console.log('[Webhook Middleware] Headers:', JSON.stringify(req.headers, null, 2));
+  console.log('[Webhook Middleware] Body type:', typeof req.body);
+  console.log('[Webhook Middleware] Body length:', req.body ? (typeof req.body === 'string' ? req.body.length : 'not string') : 'null');
+  console.log('========================================');
+  next();
+});
+
 // Stripe webhook endpoint - MUST be before JSON middleware to preserve raw body
 // This endpoint needs the raw body for signature verification
 // IMPORTANT: This route must be registered BEFORE express.json() middleware
 app.post("/api/stripe/webhook", express.raw({ type: 'application/json' }), async (req: Request, res: Response) => {
-  console.log('[Webhook] Received webhook request at /api/stripe/webhook');
-  console.log('[Webhook] Request method:', req.method);
-  console.log('[Webhook] Request path:', req.path);
-  console.log('[Webhook] Request headers:', {
+  console.log('[Webhook Handler] ===== WEBHOOK HANDLER CALLED =====');
+  console.log('[Webhook Handler] Received webhook request at /api/stripe/webhook');
+  console.log('[Webhook Handler] Request method:', req.method);
+  console.log('[Webhook Handler] Request path:', req.path);
+  console.log('[Webhook Handler] Request headers:', {
     'content-type': req.headers['content-type'],
     'stripe-signature': req.headers['stripe-signature'] ? 'present' : 'missing',
     'user-agent': req.headers['user-agent'],
+    'host': req.headers['host'],
   });
   
   const sigHeader = req.headers['stripe-signature'];
@@ -153,6 +190,17 @@ if (process.env.NODE_ENV !== "production" || process.env.DEBUG_COOKIES === "true
 
 // Request logging
 app.use(requestLogger);
+
+// Test endpoint to verify webhook URL is reachable
+app.get("/api/stripe/webhook/test", (req: Request, res: Response) => {
+  console.log('[Webhook Test] Test endpoint called');
+  res.json({ 
+    success: true, 
+    message: "Webhook endpoint is reachable",
+    timestamp: new Date().toISOString(),
+    webhookSecretConfigured: !!process.env.STRIPE_WEBHOOK_SECRET,
+  });
+});
 
 // API Routes
 app.use("/api", apiRoutes);
