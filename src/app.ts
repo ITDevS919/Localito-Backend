@@ -88,8 +88,40 @@ app.post("/api/stripe/webhook", express.raw({ type: 'application/json' }), async
 });
 
 // JSON body parser - MUST be after webhook route
-app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
+// Increase limit to 20MB to handle base64-encoded images (5MB image = ~6.7MB base64)
+app.use(express.json({ limit: '20mb' }));
+app.use(express.urlencoded({ extended: false, limit: '20mb' }));
+
+// Handle body parser errors (e.g., request entity too large) with CORS headers
+app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+  if (err instanceof SyntaxError || err.status === 413 || err.statusCode === 413) {
+    // JSON parse error or body too large
+    const origin = req.headers.origin;
+    if (origin) {
+      const allowedOrigins = process.env.FRONTEND_URL 
+        ? process.env.FRONTEND_URL.split(',').map(url => url.trim())
+        : ["http://localhost:5173"];
+      
+      if (allowedOrigins.includes(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+      }
+    }
+    
+    if (err.status === 413 || err.statusCode === 413 || err.message?.includes('request entity too large')) {
+      return res.status(413).json({
+        success: false,
+        message: 'Request entity too large. Maximum size is 20MB.',
+      });
+    }
+    
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid JSON in request body',
+    });
+  }
+  next(err);
+});
 
 // Determine if we should use secure cookies
 // In production, check if request is actually HTTPS (after trust proxy is set)

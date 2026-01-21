@@ -14,6 +14,20 @@ export function errorHandler(
     console.error("Error:", err);
   }
 
+  // Ensure CORS headers are set even on error responses
+  // This fixes CORS errors when body size limit is exceeded
+  const origin = req.headers.origin;
+  if (origin) {
+    const allowedOrigins = process.env.FRONTEND_URL 
+      ? process.env.FRONTEND_URL.split(',').map(url => url.trim())
+      : ["http://localhost:5173"];
+    
+    if (allowedOrigins.includes(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+    }
+  }
+
   res.status(status).json({
     success: false,
     message,
