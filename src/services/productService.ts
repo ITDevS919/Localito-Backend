@@ -325,21 +325,64 @@ export class ProductService {
     syncFromEpos?: boolean;
     squareItemId?: string;
   }): Promise<Product> {
+    let finalStock = product.stock;
+    let lastEposSyncAt: Date | null = null;
+    
+    // If EPOS sync is enabled, fetch stock from Square
+    if (product.syncFromEpos && product.squareItemId) {
+      try {
+        // Get retailer's Square credentials
+        const retailerResult = await pool.query(
+          `SELECT square_access_token, square_location_id, square_sync_enabled
+           FROM retailers WHERE id = $1`,
+          [product.retailerId]
+        );
+        
+        if (retailerResult.rows.length > 0) {
+          const retailer = retailerResult.rows[0];
+          
+          if (retailer.square_sync_enabled && 
+              retailer.square_access_token && 
+              retailer.square_location_id) {
+            
+            // Fetch stock from Square
+            const stock = await squareService.getItemStock(
+              retailer.square_access_token,
+              retailer.square_location_id,
+              product.squareItemId
+            );
+            
+            if (stock !== null) {
+              finalStock = stock;
+              lastEposSyncAt = new Date();
+              console.log(`[ProductService] Synced stock from Square: ${stock} for item ${product.squareItemId}`);
+            } else {
+              console.warn(`[ProductService] Failed to sync stock from Square for item ${product.squareItemId}, using provided stock: ${product.stock}`);
+            }
+          }
+        }
+      } catch (error: any) {
+        console.error(`[ProductService] Error syncing stock from Square during product creation:`, error);
+        // Continue with provided stock value on error
+      }
+    }
+    
     const result = await pool.query(
-      `INSERT INTO products (retailer_id, name, description, price, stock, category, images, is_approved, sync_from_epos, square_item_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      `INSERT INTO products (retailer_id, name, description, price, stock, category, images, is_approved, sync_from_epos, square_item_id, last_epos_sync_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING *`,
       [
         product.retailerId,
         product.name,
         product.description,
         product.price,
-        product.stock,
+        finalStock, // Use synced stock
         product.category,
         product.images || [],
         false, // Products need admin approval
         product.syncFromEpos || false,
         product.squareItemId || null,
+        lastEposSyncAt, // Set sync timestamp if syncing
       ]
     );
 
@@ -358,10 +401,90 @@ export class ProductService {
       updatedAt: row.updated_at,
       syncFromEpos: row.sync_from_epos || false,
       squareItemId: row.square_item_id || null,
+      lastEposSyncAt: row.last_epos_sync_at || null,
     };
   }
 
   async updateProduct(id: string, updates: Partial<Product>): Promise<Product> {
+    // Check if we need to sync stock from Square
+    // This happens when syncFromEpos is enabled and squareItemId is set/updated
+    let shouldSyncStock = false;
+    let squareItemId: string | null = null;
+    let syncFromEpos = false;
+    
+    // Get current product to check EPOS sync status
+    const currentProduct = await pool.query(
+      `SELECT p.sync_from_epos, p.square_item_id, p.retailer_id
+       FROM products p
+       WHERE p.id = $1`,
+      [id]
+    );
+    
+    if (currentProduct.rows.length > 0) {
+      const current = currentProduct.rows[0];
+      // Determine final values after update
+      const finalSyncFromEpos = updates.syncFromEpos !== undefined ? updates.syncFromEpos : current.sync_from_epos;
+      const finalSquareItemId = updates.squareItemId !== undefined ? (updates.squareItemId || null) : current.square_item_id;
+      
+      // Sync stock if EPOS sync is enabled and squareItemId is set
+      shouldSyncStock = finalSyncFromEpos && !!finalSquareItemId;
+      squareItemId = finalSquareItemId;
+      syncFromEpos = finalSyncFromEpos;
+    }
+    
+    let syncedStock: number | null = null;
+    let lastEposSyncAt: Date | null = null;
+    
+    // Sync stock from Square if needed
+    if (shouldSyncStock && squareItemId) {
+      try {
+        const currentProduct = await pool.query(
+          `SELECT p.retailer_id
+           FROM products p
+           WHERE p.id = $1`,
+          [id]
+        );
+        
+        if (currentProduct.rows.length > 0) {
+          const retailerId = currentProduct.rows[0].retailer_id;
+          
+          // Get retailer's Square credentials
+          const retailerResult = await pool.query(
+            `SELECT square_access_token, square_location_id, square_sync_enabled
+             FROM retailers WHERE id = $1`,
+            [retailerId]
+          );
+          
+          if (retailerResult.rows.length > 0) {
+            const retailer = retailerResult.rows[0];
+            
+            if (retailer.square_sync_enabled && 
+                retailer.square_access_token && 
+                retailer.square_location_id) {
+              
+              // Fetch stock from Square
+              const stock = await squareService.getItemStock(
+                retailer.square_access_token,
+                retailer.square_location_id,
+                squareItemId
+              );
+              
+              if (stock !== null) {
+                syncedStock = stock;
+                lastEposSyncAt = new Date();
+                console.log(`[ProductService] Synced stock from Square during update: ${stock} for item ${squareItemId}`);
+              } else {
+                console.warn(`[ProductService] Failed to sync stock from Square during update for item ${squareItemId}`);
+              }
+            }
+          }
+        }
+      } catch (error: any) {
+        console.error(`[ProductService] Error syncing stock from Square during product update:`, error);
+        // Continue with provided stock value on error
+      }
+    }
+    
     const fields: string[] = [];
     const values: any[] = [];
     let paramCount = 1;
@@ -378,7 +501,11 @@ export class ProductService {
       fields.push(`price = $${paramCount++}`);
       values.push(updates.price);
     }
-    if (updates.stock !== undefined) {
+    // Use synced stock if available, otherwise use provided stock
+    if (syncedStock !== null) {
+      fields.push(`stock = $${paramCount++}`);
+      values.push(syncedStock);
+    } else if (updates.stock !== undefined) {
       fields.push(`stock = $${paramCount++}`);
       values.push(updates.stock);
     }
@@ -397,6 +524,11 @@ export class ProductService {
     if (updates.squareItemId !== undefined) {
       fields.push(`square_item_id = $${paramCount++}`);
       values.push(updates.squareItemId || null);
+    }
+    // Update sync timestamp if we synced stock
+    if (lastEposSyncAt !== null) {
+      fields.push(`last_epos_sync_at = $${paramCount++}`);
+      values.push(lastEposSyncAt);
     }
 
     fields.push(`updated_at = CURRENT_TIMESTAMP`);
