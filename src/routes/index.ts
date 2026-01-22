@@ -7,6 +7,8 @@ import { createRequire } from "module";
 import { storage } from "../services/storage";
 import { isAuthenticated, getCurrentUser } from "../middleware/auth";
 import { insertUserSchema, loginSchema, User } from "../../shared/schema";
+import { OAuth2Client } from 'google-auth-library';
+
 // Using require to avoid TS module resolution issues in this runtime config
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 import { stripeService } from "../services/stripeService";
@@ -276,155 +278,115 @@ router.get("/auth/google/callback",
 );
 
 // Google OAuth for mobile (accepts ID token)
-router.post("/auth/google/mobile", async (req, res, next) => {
+router.post('/auth/google/mobile', async (req, res, next) => {
   try {
-    const { idToken, role, isLogin, platform } = req.body;
-    
-    if (!idToken) {
-      return res.status(400).json({ success: false, message: "ID token is required" });
+    const { code, role, isLogin, platform, redirectUri } = req.body;
+
+    if (!code || !redirectUri) {
+      return res.status(400).json({
+        success: false,
+        message: 'Authorization code and redirectUri are required',
+      });
     }
 
-    const userRole = role || "customer";
-
-    // Verify Google ID token
-    const { OAuth2Client } = require('google-auth-library');
-    
-    // Get platform-specific client IDs
     const androidClientId = process.env.GOOGLE_CLIENT_ID_ANDROID;
     const iosClientId = process.env.GOOGLE_CLIENT_ID_IOS;
-    
-    if (!androidClientId && !iosClientId) {
-      return res.status(500).json({ 
-        success: false, 
-        message: "Google Client IDs are not configured. Please set GOOGLE_CLIENT_ID_ANDROID and/or GOOGLE_CLIENT_ID_IOS" 
+    const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+
+    if (!clientSecret) {
+      return res.status(500).json({
+        success: false,
+        message: 'GOOGLE_CLIENT_SECRET is not configured',
       });
     }
 
-    // Determine which client ID(s) to use for verification
-    // For mobile apps, we need to verify against the correct client ID
-    // The token's audience will match one of the client IDs
-    let clientIds: string[] = [];
-    if (platform === 'android' && androidClientId) {
-      clientIds.push(androidClientId);
-    } else if (platform === 'ios' && iosClientId) {
-      clientIds.push(iosClientId);
-    } else {
-      // If platform not specified or unknown, try both
-      if (androidClientId) clientIds.push(androidClientId);
-      if (iosClientId) clientIds.push(iosClientId);
-    }
+    const clientId =
+      platform === 'android'
+        ? androidClientId
+        : platform === 'ios'
+        ? iosClientId
+        : null;
 
-    if (clientIds.length === 0) {
-      return res.status(500).json({ 
-        success: false, 
-        message: `No Google Client ID configured for platform: ${platform || 'unknown'}` 
+    if (!clientId) {
+      return res.status(400).json({
+        success: false,
+        message: `Invalid platform or missing client ID: ${platform}`,
       });
     }
 
-    // Try to verify with each client ID (token should match one of them)
-    let ticket;
-    let verified = false;
-    let lastError: any = null;
+    const oauthClient = new OAuth2Client({
+      clientId,
+      clientSecret,
+      redirectUri,
+    });
 
-    for (const clientId of clientIds) {
-      try {
-        const client = new OAuth2Client(clientId);
-        ticket = await client.verifyIdToken({
-          idToken,
-          audience: clientId,
-        });
-        verified = true;
-        break; // Successfully verified, exit loop
-      } catch (error: any) {
-        lastError = error;
-        // Continue to next client ID
-      }
-    }
+    // 🔹 Exchange code → tokens
+    const { tokens } = await oauthClient.getToken(code);
+    const idToken = tokens.id_token;
 
-    if (!verified || !ticket) {
-      return res.status(401).json({ 
-        success: false, 
-        message: "Invalid Google ID token. Token does not match configured client IDs." 
+    if (!idToken) {
+      return res.status(401).json({
+        success: false,
+        message: 'Failed to retrieve ID token from Google',
       });
     }
+
+    // 🔹 Verify ID token
+    const ticket = await oauthClient.verifyIdToken({
+      idToken,
+      audience: clientId,
+    });
 
     const payload = ticket.getPayload();
-    if (!payload) {
-      return res.status(401).json({ success: false, message: "Invalid token payload" });
+    if (!payload || !payload.email) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid Google token payload',
+      });
     }
 
     const googleId = payload.sub;
     const email = payload.email;
-    const displayName = payload.name || payload.given_name || "User";
+    const displayName = payload.name || payload.given_name || 'User';
+    const userRole = role || 'customer';
 
-    if (!email) {
-      return res.status(400).json({ success: false, message: "Email is required for Google authentication" });
-    }
-
-    // Check if user exists by Google ID
+    // 🔹 Your existing user logic
     let user = await storage.getUserByGoogleId(googleId);
-    
-    if (user) {
-      // User exists, log them in
-      req.login(user, (err) => {
-        if (err) {
-          return next(err);
-        }
-        const { password: _, ...publicUser } = user as any;
-        return res.json({
-          success: true,
-          message: "Login successful",
-          data: publicUser,
-        });
-      });
-      return;
-    }
 
-    // Check if user exists by email (for linking accounts)
-    user = await storage.getUserByEmail(email);
-    
-    if (user) {
-      // Link Google account to existing user
-      await storage.updateUserGoogleId(user.id, googleId);
-      req.login(user, (err) => {
-        if (err) {
-          return next(err);
-        }
-        const { password: _, ...publicUser } = user as any;
-        return res.json({
-          success: true,
-          message: "Login successful",
-          data: publicUser,
-        });
-      });
-      return;
-    }
-
-    // For login flows, don't auto-create retailer/admin accounts
-    if (isLogin === true && (userRole === "retailer" || userRole === "admin")) {
-      return res.status(404).json({ 
-        success: false, 
-        message: "Account not found. Please sign up first." 
-      });
-    }
-
-    // Create new user from Google profile
-    user = await storage.createUserFromGoogle(googleId, email, displayName, userRole);
-
-    // Log in the new user
-    req.login(user, (err) => {
-      if (err) {
-        return next(err);
+    if (!user) {
+      user = await storage.getUserByEmail(email);
+      if (user) {
+        await storage.updateUserGoogleId(user.id, googleId);
       }
-      const { password: _, ...publicUser } = user as any;
-      return res.json({
+    }
+
+    if (!user) {
+      if (isLogin && (userRole === 'retailer' || userRole === 'admin')) {
+        return res.status(404).json({
+          success: false,
+          message: 'Account not found. Please sign up first.',
+        });
+      }
+
+      user = await storage.createUserFromGoogle(
+        googleId,
+        email,
+        displayName,
+        userRole
+      );
+    }
+
+    req.login(user, (err) => {
+      if (err) return next(err);
+      const { password, ...publicUser } = user as any;
+      res.json({
         success: true,
-        message: "Account created and logged in successfully",
+        message: 'Authentication successful',
         data: publicUser,
       });
     });
-  } catch (error) {
-    next(error);
+  } catch (err) {
+    next(err);
   }
 });
 
