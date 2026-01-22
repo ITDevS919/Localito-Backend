@@ -524,6 +524,30 @@ export async function runMigrations() {
       END $$;
     `);
 
+    // Add retailer billing columns for per-retailer commission and trial periods
+    await client.query(`
+      DO $$ 
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='retailers' AND column_name='commission_rate_override') THEN
+          ALTER TABLE retailers ADD COLUMN commission_rate_override DECIMAL(5,4) NULL;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='retailers' AND column_name='trial_starts_at') THEN
+          ALTER TABLE retailers ADD COLUMN trial_starts_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='retailers' AND column_name='trial_ends_at') THEN
+          ALTER TABLE retailers ADD COLUMN trial_ends_at TIMESTAMP NULL;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='retailers' AND column_name='billing_status') THEN
+          ALTER TABLE retailers ADD COLUMN billing_status VARCHAR(20) DEFAULT 'trial' 
+            CHECK (billing_status IN ('trial', 'active', 'suspended'));
+        END IF;
+      END $$;
+    `);
+
     // Create retailer_payout_settings table
     await client.query(`
       CREATE TABLE IF NOT EXISTS retailer_payout_settings (

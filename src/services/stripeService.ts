@@ -103,8 +103,37 @@ export class StripeService {
     return account;
   }
 
-  private async getCommissionRate(): Promise<number> {
+  private async getCommissionRateForRetailer(retailerId: string): Promise<number> {
     try {
+      // First, check if retailer is in trial period
+      const retailerResult = await pool.query(
+        `SELECT commission_rate_override, trial_ends_at, billing_status 
+         FROM retailers WHERE id = $1`,
+        [retailerId]
+      );
+
+      if (retailerResult.rows.length > 0) {
+        const retailer = retailerResult.rows[0];
+        const now = new Date();
+        const trialEndsAt = retailer.trial_ends_at ? new Date(retailer.trial_ends_at) : null;
+
+        // If in trial period, return 0% commission
+        if (trialEndsAt && trialEndsAt > now) {
+          console.log(`[Stripe] Retailer ${retailerId} is in trial period (ends ${trialEndsAt.toISOString()}), using 0% commission`);
+          return 0;
+        }
+
+        // Check for retailer-specific commission override
+        if (retailer.commission_rate_override !== null && retailer.commission_rate_override !== undefined) {
+          const overrideRate = parseFloat(retailer.commission_rate_override);
+          if (!isNaN(overrideRate) && overrideRate >= 0 && overrideRate <= 1) {
+            console.log(`[Stripe] Using retailer-specific commission rate ${overrideRate} for retailer ${retailerId}`);
+            return overrideRate;
+          }
+        }
+      }
+
+      // Fallback to platform default commission rate
       const result = await pool.query(
         "SELECT setting_value FROM platform_settings WHERE setting_key = 'commission_rate'"
       );
@@ -634,7 +663,7 @@ export class StripeService {
         throw new Error("Retailer Stripe account is not ready to accept payments");
       }
 
-      const commissionRate = await this.getCommissionRate();
+      const commissionRate = await this.getCommissionRateForRetailer(retailerId);
       const platformCommission = amount * commissionRate;
       const retailerAmount = amount - platformCommission;
 
@@ -714,7 +743,7 @@ export class StripeService {
         throw new Error("Retailer Stripe account is not ready to accept payments");
       }
 
-      const commissionRate = await this.getCommissionRate();
+      const commissionRate = await this.getCommissionRateForRetailer(retailerId);
       const platformCommission = amount * commissionRate;
 
       const paymentIntent = await this.stripe.paymentIntents.create({
@@ -795,7 +824,7 @@ export class StripeService {
       return;
     }
 
-    const commissionRate = await this.getCommissionRate();
+    const commissionRate = await this.getCommissionRateForRetailer(retailerId);
     const totalAmount = paymentIntent.amount / 100;
     const platformCommission = totalAmount * commissionRate;
     const retailerAmount = totalAmount - platformCommission;

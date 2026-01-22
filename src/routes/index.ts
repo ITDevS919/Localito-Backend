@@ -278,7 +278,7 @@ router.get("/auth/google/callback",
 // Google OAuth for mobile (accepts ID token)
 router.post("/auth/google/mobile", async (req, res, next) => {
   try {
-    const { idToken, role, isLogin } = req.body;
+    const { idToken, role, isLogin, platform } = req.body;
     
     if (!idToken) {
       return res.status(400).json({ success: false, message: "ID token is required" });
@@ -288,21 +288,64 @@ router.post("/auth/google/mobile", async (req, res, next) => {
 
     // Verify Google ID token
     const { OAuth2Client } = require('google-auth-library');
-    // Use mobile client ID if available, otherwise fall back to regular client ID
-    const clientId = process.env.GOOGLE_CLIENT_MOBILE_ID;
-    if (!clientId) {
-      return res.status(500).json({ success: false, message: "Google Client ID is not configured" });
-    }
-    const client = new OAuth2Client(clientId);
-
-    let ticket;
-    try {
-      ticket = await client.verifyIdToken({
-        idToken,
-        audience: clientId,
+    
+    // Get platform-specific client IDs
+    const androidClientId = process.env.GOOGLE_CLIENT_ID_ANDROID;
+    const iosClientId = process.env.GOOGLE_CLIENT_ID_IOS;
+    
+    if (!androidClientId && !iosClientId) {
+      return res.status(500).json({ 
+        success: false, 
+        message: "Google Client IDs are not configured. Please set GOOGLE_CLIENT_ID_ANDROID and/or GOOGLE_CLIENT_ID_IOS" 
       });
-    } catch (error: any) {
-      return res.status(401).json({ success: false, message: "Invalid Google ID token" });
+    }
+
+    // Determine which client ID(s) to use for verification
+    // For mobile apps, we need to verify against the correct client ID
+    // The token's audience will match one of the client IDs
+    let clientIds: string[] = [];
+    if (platform === 'android' && androidClientId) {
+      clientIds.push(androidClientId);
+    } else if (platform === 'ios' && iosClientId) {
+      clientIds.push(iosClientId);
+    } else {
+      // If platform not specified or unknown, try both
+      if (androidClientId) clientIds.push(androidClientId);
+      if (iosClientId) clientIds.push(iosClientId);
+    }
+
+    if (clientIds.length === 0) {
+      return res.status(500).json({ 
+        success: false, 
+        message: `No Google Client ID configured for platform: ${platform || 'unknown'}` 
+      });
+    }
+
+    // Try to verify with each client ID (token should match one of them)
+    let ticket;
+    let verified = false;
+    let lastError: any = null;
+
+    for (const clientId of clientIds) {
+      try {
+        const client = new OAuth2Client(clientId);
+        ticket = await client.verifyIdToken({
+          idToken,
+          audience: clientId,
+        });
+        verified = true;
+        break; // Successfully verified, exit loop
+      } catch (error: any) {
+        lastError = error;
+        // Continue to next client ID
+      }
+    }
+
+    if (!verified || !ticket) {
+      return res.status(401).json({ 
+        success: false, 
+        message: "Invalid Google ID token. Token does not match configured client IDs." 
+      });
     }
 
     const payload = ticket.getPayload();
@@ -3501,6 +3544,266 @@ router.post("/retailers/:id/approve", isAuthenticated, async (req, res, next) =>
     );
 
     res.json({ success: true, message: "Retailer approved" });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Admin: Get all retailers with pagination and filters
+router.get("/admin/retailers", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ success: false, message: "Only admins can access this" });
+    }
+
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 20;
+    const offset = (page - 1) * limit;
+    const status = req.query.status as string || "all"; // pending, approved, all
+    const city = req.query.city as string;
+    const search = req.query.search as string;
+
+    let whereConditions: string[] = [];
+    let queryParams: any[] = [];
+    let paramIndex = 1;
+
+    // Status filter
+    if (status === "pending") {
+      whereConditions.push(`r.is_approved = false`);
+    } else if (status === "approved") {
+      whereConditions.push(`r.is_approved = true`);
+    }
+
+    // City filter
+    if (city) {
+      whereConditions.push(`r.city = $${paramIndex}`);
+      queryParams.push(city);
+      paramIndex++;
+    }
+
+    // Search filter (business name, email, username)
+    if (search) {
+      whereConditions.push(`(
+        r.business_name ILIKE $${paramIndex} OR 
+        u.email ILIKE $${paramIndex} OR 
+        u.username ILIKE $${paramIndex}
+      )`);
+      queryParams.push(`%${search}%`);
+      paramIndex++;
+    }
+
+    const whereClause = whereConditions.length > 0 
+      ? `WHERE ${whereConditions.join(" AND ")}`
+      : "";
+
+    // Get total count
+    const countQuery = `
+      SELECT COUNT(*) as total
+      FROM retailers r
+      JOIN users u ON r.user_id = u.id
+      ${whereClause}
+    `;
+    const countResult = await pool.query(countQuery, queryParams);
+    const total = parseInt(countResult.rows[0].total);
+
+    // Get retailers
+    const dataQuery = `
+      SELECT 
+        r.*,
+        u.username,
+        u.email,
+        CASE 
+          WHEN r.trial_ends_at IS NOT NULL AND r.trial_ends_at > NOW() THEN 'trial'
+          WHEN r.billing_status = 'suspended' THEN 'suspended'
+          ELSE 'active'
+        END as trial_status
+      FROM retailers r
+      JOIN users u ON r.user_id = u.id
+      ${whereClause}
+      ORDER BY r.created_at DESC
+      LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
+    `;
+    queryParams.push(limit, offset);
+    const dataResult = await pool.query(dataQuery, queryParams);
+
+    res.json({
+      success: true,
+      data: {
+        retailers: dataResult.rows,
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Admin: Get all users with pagination and filters
+router.get("/admin/users", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ success: false, message: "Only admins can access this" });
+    }
+
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 20;
+    const offset = (page - 1) * limit;
+    const role = req.query.role as string || "all"; // customer, retailer, admin, all
+    const search = req.query.search as string;
+
+    let whereConditions: string[] = [];
+    let queryParams: any[] = [];
+    let paramIndex = 1;
+
+    // Role filter
+    if (role !== "all") {
+      whereConditions.push(`u.role = $${paramIndex}`);
+      queryParams.push(role);
+      paramIndex++;
+    }
+
+    // Search filter (email, username)
+    if (search) {
+      whereConditions.push(`(
+        u.email ILIKE $${paramIndex} OR 
+        u.username ILIKE $${paramIndex}
+      )`);
+      queryParams.push(`%${search}%`);
+      paramIndex++;
+    }
+
+    const whereClause = whereConditions.length > 0 
+      ? `WHERE ${whereConditions.join(" AND ")}`
+      : "";
+
+    // Get total count
+    const countQuery = `
+      SELECT COUNT(*) as total
+      FROM users u
+      ${whereClause}
+    `;
+    const countResult = await pool.query(countQuery, queryParams);
+    const total = parseInt(countResult.rows[0].total);
+
+    // Get users (exclude password)
+    const dataQuery = `
+      SELECT 
+        u.id,
+        u.username,
+        u.email,
+        u.role,
+        u.created_at,
+        u.google_id
+      FROM users u
+      ${whereClause}
+      ORDER BY u.created_at DESC
+      LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
+    `;
+    queryParams.push(limit, offset);
+    const dataResult = await pool.query(dataQuery, queryParams);
+
+    res.json({
+      success: true,
+      data: {
+        users: dataResult.rows,
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Admin: Update retailer billing settings
+router.put("/admin/retailers/:id/billing", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ success: false, message: "Only admins can access this" });
+    }
+
+    const { commission_rate_override, trial_ends_at, billing_status } = req.body;
+    const retailerId = req.params.id;
+
+    // Validate commission_rate_override if provided
+    if (commission_rate_override !== undefined && commission_rate_override !== null) {
+      const rate = parseFloat(commission_rate_override);
+      if (isNaN(rate) || rate < 0 || rate > 1) {
+        return res.status(400).json({
+          success: false,
+          message: "Commission rate override must be a number between 0 and 1",
+        });
+      }
+    }
+
+    // Validate billing_status if provided
+    if (billing_status && !["trial", "active", "suspended"].includes(billing_status)) {
+      return res.status(400).json({
+        success: false,
+        message: "Billing status must be one of: trial, active, suspended",
+      });
+    }
+
+    // Build update query dynamically
+    const updates: string[] = [];
+    const params: any[] = [];
+    let paramIndex = 1;
+
+    if (commission_rate_override !== undefined) {
+      updates.push(`commission_rate_override = $${paramIndex}`);
+      params.push(commission_rate_override);
+      paramIndex++;
+    }
+
+    if (trial_ends_at !== undefined) {
+      updates.push(`trial_ends_at = $${paramIndex}`);
+      params.push(trial_ends_at ? new Date(trial_ends_at) : null);
+      paramIndex++;
+    }
+
+    if (billing_status !== undefined) {
+      updates.push(`billing_status = $${paramIndex}`);
+      params.push(billing_status);
+      paramIndex++;
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No fields to update",
+      });
+    }
+
+    params.push(retailerId);
+    const updateQuery = `
+      UPDATE retailers 
+      SET ${updates.join(", ")}
+      WHERE id = $${paramIndex}
+      RETURNING *
+    `;
+
+    const result = await pool.query(updateQuery, params);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Retailer not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Retailer billing settings updated successfully",
+      data: result.rows[0],
+    });
   } catch (error) {
     next(error);
   }
