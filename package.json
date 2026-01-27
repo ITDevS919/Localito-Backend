@@ -2,15 +2,21 @@
   "name": "marketplace-backend",
   "version": "1.0.0",
   "type": "module",
-  "main": "src/index.ts",
+  "main": "index.ts",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
-    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --packages=external --target=node20",
+    "dev": "tsx watch index.ts",
+    "build": "tsc",
     "start": "node dist/index.js",
     "type-check": "tsc --noEmit",
-    "create-admin": "tsx scripts/create-admin.ts"
+    "create-admin": "tsx scripts/create-admin.ts",
+    "update-categories": "tsx scripts/update-categories.ts",
+    "test:commission-tiers": "tsx scripts/test-commission-tiers.ts",
+    "test:stripe-connect": "tsx scripts/test-stripe-connect.ts"
+
   },
   "dependencies": {
+    "@react-email/components": "^1.0.6",
+    "@react-email/render": "^2.0.4",
     "@stripe/stripe-js": "^8.6.0",
     "@types/multer": "^2.0.0",
     "@types/nodemailer": "^7.0.4",
@@ -19,7 +25,6 @@
     "connect-pg-simple": "^10.0.0",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
-    "esbuild": "^0.19.0",
     "express": "^4.21.2",
     "express-session": "^1.18.1",
     "google-auth-library": "^10.5.0",
@@ -33,6 +38,9 @@
     "passport-local": "^1.0.0",
     "pg": "^8.16.3",
     "qrcode": "^1.5.4",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3",
+    "resend": "^6.8.0",
     "square": "^43.2.1",
     "stripe": "^20.1.0",
     "ws": "^8.18.0",

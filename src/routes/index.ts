@@ -3,13 +3,16 @@ import Stripe from "stripe";
 import passport from "passport";
 import crypto from "crypto";
 import QRCode from "qrcode";
+import path from "path";
+import fs from "fs";
+import { fileURLToPath } from "url";
 import { createRequire } from "module";
 import { storage } from "../services/storage";
 import { isAuthenticated, getCurrentUser } from "../middleware/auth";
 import { insertUserSchema, loginSchema, User } from "../../shared/schema";
 // Using require to avoid TS module resolution issues in this runtime config
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-import { stripeService } from "../services/stripeService";
+import { stripeService, COMMISSION_TIERS } from "../services/stripeService";
 import { rewardsService } from '../services/rewardsService';
 import { AvailabilityService } from '../services/availabilityService';
 import { emailService } from '../services/emailService';
@@ -31,12 +34,51 @@ const router = Router();
 
 
 // Health check endpoint
-router.get("/health", (_req, res) => {
-  res.json({ 
-    success: true, 
+router.get("/health", async (_req, res) => {
+  const health = {
+    success: true,
     message: "Server is running",
     timestamp: new Date().toISOString(),
-  });
+    services: {
+      database: "unknown",
+      stripe: "unknown",
+    },
+  };
+
+  // Check database
+  try {
+    await pool.query("SELECT 1");
+    health.services.database = "connected";
+  } catch (error) {
+    health.services.database = "disconnected";
+  }
+
+  // Check Stripe
+  if (process.env.STRIPE_SECRET_KEY) {
+    const keyType = process.env.STRIPE_SECRET_KEY.startsWith('sk_live_') ? 'live' : 'test';
+    health.services.stripe = `configured (${keyType})`;
+  } else {
+    health.services.stripe = "not configured";
+  }
+
+  res.json(health);
+});
+
+// Get __dirname for ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Serve logo for emails (accessible at /api/logo.png)
+router.get("/logo.png", (req, res) => {
+  const logoPath = path.resolve(__dirname, "..", "..", "client", "public", "logo.png");
+  
+  if (fs.existsSync(logoPath)) {
+    res.setHeader("Content-Type", "image/png");
+    res.setHeader("Cache-Control", "public, max-age=31536000"); // Cache for 1 year
+    res.sendFile(logoPath);
+  } else {
+    res.status(404).json({ success: false, message: "Logo not found" });
+  }
 });
 
 // Get Stripe publishable key (for mobile app)
@@ -69,7 +111,7 @@ router.post("/auth/signup", async (req, res, next) => {
       });
     }
 
-    const { username, email, password, role, retailerData } = validationResult.data;
+    const { username, email, password, role, businessData } = validationResult.data;
 
     // Check if user already exists
     const existingUser = await storage.getUserByUsername(username) ||
@@ -82,13 +124,13 @@ router.post("/auth/signup", async (req, res, next) => {
       });
     }
 
-    // Create user with role and retailer data if applicable
+    // Create user with role and business data if applicable
     const user = await storage.createUser({ 
       username, 
       email, 
       password, 
       role: role || "customer",
-      retailerData: role === "retailer" ? retailerData : undefined
+      businessData: role === "business" ? businessData : undefined
     });
 
     // Auto-login after signup
@@ -259,8 +301,8 @@ router.get("/auth/google/callback",
         console.log(`[Google Auth] Request origin: ${req.headers.origin}`);
         console.log(`[Google Auth] Request host: ${req.headers.host}`);
         
-        if (user.role === "retailer") {
-          res.redirect(`${frontendUrl}/retailer/dashboard`);
+        if (user.role === "business") {
+          res.redirect(`${frontendUrl}/business/dashboard`);
         } else if (user.role === "admin") {
           res.redirect(`${frontendUrl}/admin/dashboard`);
         } else {
@@ -276,14 +318,18 @@ router.get("/auth/google/callback",
 );
 
 // Google OAuth for mobile (accepts ID token)
-// Uses Expo AuthSession with WEB Client ID (browser-based OAuth)
-// Workflow: App → System Browser → Google → Expo Auth Proxy → App
+// Uses Expo AuthSession with platform-specific Client IDs
+// Frontend sends ID token directly from response.authentication.idToken
 router.post("/auth/google/mobile", async (req, res, next) => {
   try {
+    console.log("[Google Auth] Mobile login request received");
     const { idToken, role, isLogin } = req.body;
     
     if (!idToken) {
-      return res.status(400).json({ success: false, message: "ID token is required" });
+      return res.status(400).json({ 
+        success: false, 
+        message: "ID token is required" 
+      });
     }
 
     const userRole = role || "customer";
@@ -291,14 +337,15 @@ router.post("/auth/google/mobile", async (req, res, next) => {
     // Verify Google ID token
     const { OAuth2Client } = require('google-auth-library');
     
-    // Use WEB Client ID for Expo AuthSession (same as web applications)
-    // Expo AuthSession uses browser-based OAuth, not native SDKs
-    const clientId = process.env.GOOGLE_CLIENT_ID_MOBILE || process.env.GOOGLE_CLIENT_ID;
+    // Use WEB Client ID for verification (works for all platforms with Expo AuthSession)
+    // The frontend uses webClientId, androidClientId, and iosClientId, but all generate
+    // ID tokens that can be verified with the Web Client ID
+    const clientId = process.env.GOOGLE_CLIENT_ID_MOBILE;
     
     if (!clientId) {
       return res.status(500).json({ 
         success: false, 
-        message: "Google Client ID not configured. Please set GOOGLE_CLIENT_ID_MOBILE (WEB Client ID for Expo AuthSession)." 
+        message: "Google Client ID not configured. Please set GOOGLE_CLIENT_ID_MOBILE or GOOGLE_CLIENT_ID." 
       });
     }
 
@@ -311,6 +358,7 @@ router.post("/auth/google/mobile", async (req, res, next) => {
         audience: clientId,
       });
     } catch (error: any) {
+      console.error('[Google Auth] Token verification error:', error);
       return res.status(401).json({ 
         success: false, 
         message: "Invalid Google ID token. Token verification failed." 
@@ -369,8 +417,8 @@ router.post("/auth/google/mobile", async (req, res, next) => {
       return;
     }
 
-    // For login flows, don't auto-create retailer/admin accounts
-    if (isLogin === true && (userRole === "retailer" || userRole === "admin")) {
+    // For login flows, don't auto-create business/admin accounts
+    if (isLogin === true && (userRole === "business" || userRole === "admin")) {
       return res.status(404).json({ 
         success: false, 
         message: "Account not found. Please sign up first." 
@@ -425,7 +473,7 @@ import { pool } from "../db/connection";
 router.get("/products", async (req, res, next) => {
   try {
     console.log(`[Products API] Request received with query params:`, req.query);
-    const { category, search, retailerId, location, latitude, longitude, radiusKm, page, limit } = req.query;
+    const { category, search, businessId, location, latitude, longitude, radiusKm, page, limit } = req.query;
     
     let lat: number | undefined;
     let lon: number | undefined;
@@ -445,7 +493,7 @@ router.get("/products", async (req, res, next) => {
       }
     } else if (location) {
       // Always use text-based search for location (postcode/city filter)
-      // No geocoding, directly search retailers.postcode and retailers.city
+      // No geocoding, directly search businesses.postcode and businesses.city
       console.log(`[Products API] Using text-based search for location: "${location}" (no geocoding)`);
       radius = undefined; // Ensure no radius search
     }
@@ -467,7 +515,7 @@ router.get("/products", async (req, res, next) => {
       useTextSearch,
       search: search as string,
       category: category as string,
-      retailerId: retailerId as string,
+      businessId: businessId as string,
     });
     
     // Log what will be passed to productService
@@ -484,7 +532,7 @@ router.get("/products", async (req, res, next) => {
     const result = await productService.getProducts({
       category: category as string,
       search: search as string,
-      retailerId: retailerId as string,
+      businessId: businessId as string,
       location: locationForSearch, // Use text search only if no coordinates or radius is 0
       latitude: lat,
       longitude: lon,
@@ -517,11 +565,11 @@ router.get("/products/pending", isAuthenticated, async (req, res, next) => {
       return res.status(403).json({ success: false, message: "Only admins can access this" });
     }
 
-    // Get pending products with retailer information
+    // Get pending products with business information
     const result = await pool.query(
-      `SELECT p.*, r.business_name as retailer_name, r.postcode, r.city
+      `SELECT p.*, b.business_name as business_name, b.postcode, b.city
        FROM products p
-       JOIN retailers r ON p.retailer_id = r.id
+       JOIN businesses b ON p.business_id = b.id
        WHERE p.is_approved = false
        ORDER BY p.created_at DESC`
     );
@@ -535,7 +583,7 @@ router.get("/products/pending", isAuthenticated, async (req, res, next) => {
       category: row.category,
       images: row.images || [],
       isApproved: row.is_approved,
-      retailer_name: row.retailer_name,
+      business_name: row.business_name,
       created_at: row.created_at,
     }));
 
@@ -558,22 +606,22 @@ router.get("/products/:id", async (req, res, next) => {
   }
 });
 
-// Create product (retailer only)
+// Create product (business only)
 router.post("/products", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can create products" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can create products" });
     }
 
-    const retailerId = await productService.getRetailerIdByUserId(user.id);
-    if (!retailerId) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    const businessId = await productService.getBusinessIdByUserId(user.id);
+    if (!businessId) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
     const { name, description, price, stock, category, images, syncFromEpos, squareItemId } = req.body;
     const product = await productService.createProduct({
-      retailerId,
+      businessId,
       name,
       description,
       price,
@@ -590,23 +638,23 @@ router.post("/products", isAuthenticated, async (req, res, next) => {
   }
 });
 
-// Get retailer's products
-router.get("/retailer/products", isAuthenticated, async (req, res, next) => {
+// Get business's products
+router.get("/business/products", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can access this" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can access this" });
     }
 
-    const retailerId = await productService.getRetailerIdByUserId(user.id);
-    if (!retailerId) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    const businessId = await productService.getBusinessIdByUserId(user.id);
+    if (!businessId) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    // Get all products for retailer (no pagination needed for retailer view)
+    // Get all products for business (no pagination needed for business view)
     const result = await productService.getProducts({ 
-      retailerId,
-      limit: 1000, // Get all products for retailer
+      businessId,
+      limit: 1000, // Get all products for business
       page: 1,
     });
     
@@ -617,25 +665,25 @@ router.get("/retailer/products", isAuthenticated, async (req, res, next) => {
   }
 });
 
-// Get retailer dashboard stats
-// Get retailer profile
-router.get("/retailer/profile", isAuthenticated, async (req, res, next) => {
+// Get business dashboard stats
+// Get business profile
+router.get("/business/profile", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can access this" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can access this" });
     }
 
     const result = await pool.query(
-      `SELECT r.*, u.email
-       FROM retailers r
-       JOIN users u ON r.user_id = u.id
-       WHERE r.user_id = $1`,
+      `SELECT b.*, u.email
+       FROM businesses b
+       JOIN users u ON b.user_id = u.id
+       WHERE b.user_id = $1`,
       [user.id]
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
     res.json({ success: true, data: result.rows[0] });
@@ -644,12 +692,12 @@ router.get("/retailer/profile", isAuthenticated, async (req, res, next) => {
   }
 });
 
-// Update retailer settings
-router.put("/retailer/settings", isAuthenticated, async (req, res, next) => {
+// Update business settings
+router.put("/business/settings", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can update settings" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can update settings" });
     }
 
     const { businessName, businessAddress, postcode, city, phone, sameDayPickupAllowed, cutoffTime } = req.body;
@@ -658,17 +706,17 @@ router.put("/retailer/settings", isAuthenticated, async (req, res, next) => {
       return res.status(400).json({ success: false, message: "Business name is required" });
     }
 
-    // Get retailer ID
-    const retailerResult = await pool.query(
-      "SELECT id FROM retailers WHERE user_id = $1",
+    // Get business ID
+    const businessResult = await pool.query(
+      "SELECT id FROM businesses WHERE user_id = $1",
       [user.id]
     );
 
-    if (retailerResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    const retailerId = retailerResult.rows[0].id;
+    const businessId = businessResult.rows[0].id;
 
     // Geocode address if postcode or city is provided
     let latitude: number | null = null;
@@ -703,9 +751,9 @@ router.put("/retailer/settings", isAuthenticated, async (req, res, next) => {
       validatedCutoffTime = `${parts[0]}:${parts[1]}:${parts[2] || '00'}`;
     }
 
-    // Update retailer profile
+    // Update business profile
     const updateResult = await pool.query(
-      `UPDATE retailers 
+      `UPDATE businesses 
        SET business_name = $1, 
            business_address = $2, 
            postcode = $3, 
@@ -727,7 +775,7 @@ router.put("/retailer/settings", isAuthenticated, async (req, res, next) => {
         longitude,
         sameDayPickupAllowed !== undefined ? sameDayPickupAllowed : true,
         validatedCutoffTime,
-        retailerId
+        businessId
       ]
     );
 
@@ -744,11 +792,11 @@ router.put("/retailer/settings", isAuthenticated, async (req, res, next) => {
 // Square integration endpoints
 
 // Connect Square account
-router.post("/retailer/square/connect", isAuthenticated, async (req, res, next) => {
+router.post("/business/square/connect", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can connect Square" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can connect Square" });
     }
 
     const { accessToken, locationId } = req.body;
@@ -763,28 +811,28 @@ router.post("/retailer/square/connect", isAuthenticated, async (req, res, next) 
       return res.status(400).json({ success: false, message: "Invalid Square credentials or location ID" });
     }
 
-    // Get retailer ID
-    const retailerResult = await pool.query(
-      "SELECT id FROM retailers WHERE user_id = $1",
+    // Get business ID
+    const businessResult = await pool.query(
+      "SELECT id FROM businesses WHERE user_id = $1",
       [user.id]
     );
 
-    if (retailerResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    const retailerId = retailerResult.rows[0].id;
+    const businessId = businessResult.rows[0].id;
 
-    // Update retailer with Square credentials
+    // Update business with Square credentials
     const updateResult = await pool.query(
-      `UPDATE retailers 
+      `UPDATE businesses 
        SET square_access_token = $1,
            square_location_id = $2,
            square_connected_at = CURRENT_TIMESTAMP,
            square_sync_enabled = true
        WHERE id = $3
        RETURNING id, square_sync_enabled, square_connected_at`,
-      [accessToken, locationId, retailerId]
+      [accessToken, locationId, businessId]
     );
 
     res.json({
@@ -798,33 +846,33 @@ router.post("/retailer/square/connect", isAuthenticated, async (req, res, next) 
 });
 
 // Get Square connection status
-router.get("/retailer/square/status", isAuthenticated, async (req, res, next) => {
+router.get("/business/square/status", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can check Square status" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can check Square status" });
     }
 
-    const retailerResult = await pool.query(
+    const businessResult = await pool.query(
       `SELECT square_access_token, square_location_id, square_sync_enabled, square_connected_at
-       FROM retailers WHERE user_id = $1`,
+       FROM businesses WHERE user_id = $1`,
       [user.id]
     );
 
-    if (retailerResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    const retailer = retailerResult.rows[0];
-    const isConnected = !!(retailer.square_access_token && retailer.square_location_id);
+    const business = businessResult.rows[0];
+    const isConnected = !!(business.square_access_token && business.square_location_id);
 
     res.json({
       success: true,
       data: {
         connected: isConnected,
-        syncEnabled: retailer.square_sync_enabled || false,
-        connectedAt: retailer.square_connected_at,
-        locationId: retailer.square_location_id || null,
+        syncEnabled: business.square_sync_enabled || false,
+        connectedAt: business.square_connected_at,
+        locationId: business.square_location_id || null,
       },
     });
   } catch (error) {
@@ -833,41 +881,41 @@ router.get("/retailer/square/status", isAuthenticated, async (req, res, next) =>
 });
 
 // Disconnect Square account
-router.delete("/retailer/square/disconnect", isAuthenticated, async (req, res, next) => {
+router.delete("/business/square/disconnect", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can disconnect Square" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can disconnect Square" });
     }
 
-    const retailerResult = await pool.query(
-      "SELECT id FROM retailers WHERE user_id = $1",
+    const businessResult = await pool.query(
+      "SELECT id FROM businesses WHERE user_id = $1",
       [user.id]
     );
 
-    if (retailerResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    const retailerId = retailerResult.rows[0].id;
+    const businessId = businessResult.rows[0].id;
 
     // Clear Square credentials and disable sync
     await pool.query(
-      `UPDATE retailers 
+      `UPDATE businesses 
        SET square_access_token = NULL,
            square_location_id = NULL,
            square_connected_at = NULL,
            square_sync_enabled = false
        WHERE id = $1`,
-      [retailerId]
+      [businessId]
     );
 
     // Also disable EPOS sync for all products
     await pool.query(
       `UPDATE products 
        SET sync_from_epos = false
-       WHERE retailer_id = $1`,
-      [retailerId]
+       WHERE business_id = $1`,
+      [businessId]
     );
 
     res.json({
@@ -880,32 +928,32 @@ router.delete("/retailer/square/disconnect", isAuthenticated, async (req, res, n
 });
 
 // Test Square connection
-router.post("/retailer/square/test", isAuthenticated, async (req, res, next) => {
+router.post("/business/square/test", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can test Square connection" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can test Square connection" });
     }
 
-    const retailerResult = await pool.query(
+    const businessResult = await pool.query(
       `SELECT square_access_token, square_location_id
-       FROM retailers WHERE user_id = $1`,
+       FROM businesses WHERE user_id = $1`,
       [user.id]
     );
 
-    if (retailerResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    const retailer = retailerResult.rows[0];
+    const business = businessResult.rows[0];
 
-    if (!retailer.square_access_token || !retailer.square_location_id) {
+    if (!business.square_access_token || !business.square_location_id) {
       return res.status(400).json({ success: false, message: "Square account not connected" });
     }
 
     const isValid = await squareService.validateConnection(
-      retailer.square_access_token,
-      retailer.square_location_id
+      business.square_access_token,
+      business.square_location_id
     );
 
     res.json({
@@ -920,24 +968,24 @@ router.post("/retailer/square/test", isAuthenticated, async (req, res, next) => 
   }
 });
 
-router.get("/retailer/stats", isAuthenticated, async (req, res, next) => {
+router.get("/business/stats", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can access this" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can access this" });
     }
 
-    const retailerId = await productService.getRetailerIdByUserId(user.id);
-    if (!retailerId) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    const businessId = await productService.getBusinessIdByUserId(user.id);
+    if (!businessId) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    // Get total revenue from orders (net to retailer, excluding pending orders)
+    // Get total revenue from orders (net to business, excluding pending orders)
     const revenueResult = await pool.query(
-      `SELECT COALESCE(SUM(COALESCE(retailer_amount, total)), 0) as total_revenue
+      `SELECT COALESCE(SUM(COALESCE(business_amount, total)), 0) as total_revenue
        FROM orders
-       WHERE retailer_id = $1 AND status NOT IN ('cancelled', 'pending')`,
-      [retailerId]
+       WHERE business_id = $1 AND status NOT IN ('cancelled', 'pending')`,
+      [businessId]
     );
     const totalRevenue = parseFloat(revenueResult.rows[0].total_revenue) || 0;
 
@@ -946,8 +994,8 @@ router.get("/retailer/stats", isAuthenticated, async (req, res, next) => {
       `SELECT COUNT(*) as total_orders,
               COUNT(*) FILTER (WHERE status = 'pending') as pending_orders
        FROM orders
-       WHERE retailer_id = $1`,
-      [retailerId]
+       WHERE business_id = $1`,
+      [businessId]
     );
     const totalOrders = parseInt(ordersCountResult.rows[0].total_orders) || 0;
     const pendingOrders = parseInt(ordersCountResult.rows[0].pending_orders) || 0;
@@ -958,8 +1006,8 @@ router.get("/retailer/stats", isAuthenticated, async (req, res, next) => {
               COUNT(*) FILTER (WHERE is_approved = true) as approved_products,
               COUNT(*) FILTER (WHERE stock < 10 AND stock > 0) as low_stock_count
        FROM products
-       WHERE retailer_id = $1`,
-      [retailerId]
+       WHERE business_id = $1`,
+      [businessId]
     );
     const totalProducts = parseInt(productsResult.rows[0].total_products) || 0;
     const approvedProducts = parseInt(productsResult.rows[0].approved_products) || 0;
@@ -971,10 +1019,10 @@ router.get("/retailer/stats", isAuthenticated, async (req, res, next) => {
               (SELECT COUNT(*) FROM order_items WHERE order_id = o.id) as item_count
        FROM orders o
        JOIN users u ON o.user_id = u.id
-       WHERE o.retailer_id = $1
+       WHERE o.business_id = $1
        ORDER BY o.created_at DESC
        LIMIT 5`,
-      [retailerId]
+      [businessId]
     );
 
     // Get top products by order count (last 30 days)
@@ -986,12 +1034,12 @@ router.get("/retailer/stats", isAuthenticated, async (req, res, next) => {
        LEFT JOIN order_items oi ON p.id = oi.product_id
        LEFT JOIN orders o ON oi.order_id = o.id 
          AND o.created_at >= NOW() - INTERVAL '30 days'
-       WHERE p.retailer_id = $1
+       WHERE p.business_id = $1
        GROUP BY p.id, p.name, p.images, p.price
        HAVING COUNT(oi.id) > 0
        ORDER BY order_count DESC
        LIMIT 3`,
-      [retailerId]
+      [businessId]
     );
 
     res.json({
@@ -1012,25 +1060,25 @@ router.get("/retailer/stats", isAuthenticated, async (req, res, next) => {
   }
 });
 
-// Update product (retailer only - can only update their own products)
+// Update product (business only - can only update their own products)
 router.put("/products/:id", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can update products" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can update products" });
     }
 
-    const retailerId = await productService.getRetailerIdByUserId(user.id);
-    if (!retailerId) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    const businessId = await productService.getBusinessIdByUserId(user.id);
+    if (!businessId) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    // Verify product belongs to this retailer
+    // Verify product belongs to this business
     const product = await productService.getProductById(req.params.id);
     if (!product) {
       return res.status(404).json({ success: false, message: "Product not found" });
     }
-    if (product.retailerId !== retailerId) {
+    if (product.businessId !== businessId) {
       return res.status(403).json({ success: false, message: "You can only update your own products" });
     }
 
@@ -1052,20 +1100,20 @@ router.put("/products/:id", isAuthenticated, async (req, res, next) => {
   }
 });
 
-// Delete product (retailer only - can only delete their own products)
+// Delete product (business only - can only delete their own products)
 router.delete("/products/:id", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can delete products" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can delete products" });
     }
 
-    const retailerId = await productService.getRetailerIdByUserId(user.id);
-    if (!retailerId) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    const businessId = await productService.getBusinessIdByUserId(user.id);
+    if (!businessId) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    await productService.deleteProduct(req.params.id, retailerId);
+    await productService.deleteProduct(req.params.id, businessId);
     res.json({ success: true, message: "Product deleted successfully" });
   } catch (error: any) {
     if (error.message?.includes("not found") || error.message?.includes("permission")) {
@@ -1099,10 +1147,10 @@ router.get("/cart", isAuthenticated, async (req, res, next) => {
     }
 
     const result = await pool.query(
-      `SELECT ci.*, p.name, p.price, p.images, p.stock, p.retailer_id, r.business_name as retailer_name
+      `SELECT ci.*, p.name, p.price, p.images, p.stock, p.business_id, b.business_name as business_name
        FROM cart_items ci
        JOIN products p ON ci.product_id = p.id
-       JOIN retailers r ON p.retailer_id = r.id
+       JOIN businesses b ON p.business_id = b.id
        WHERE ci.user_id = $1
        ORDER BY ci.created_at DESC`,
       [user.id]
@@ -1232,12 +1280,12 @@ router.delete("/cart/:productId", isAuthenticated, async (req, res, next) => {
 // Get all services (public)
 router.get("/services", async (req, res, next) => {
   try {
-    const { category, retailerId, search } = req.query;
+    const { category, businessId, search } = req.query;
     let query = `
-      SELECT s.*, r.business_name as retailer_name, r.business_address, r.city
+      SELECT s.*, b.business_name as business_name, b.business_address, b.city
       FROM services s
-      JOIN retailers r ON s.retailer_id = r.id
-      WHERE s.is_approved = true AND r.is_approved = true
+      JOIN businesses b ON s.business_id = b.id
+      WHERE s.is_approved = true AND b.is_approved = true
     `;
     const params: any[] = [];
     let paramCount = 0;
@@ -1248,10 +1296,10 @@ router.get("/services", async (req, res, next) => {
       params.push(category);
     }
 
-    if (retailerId) {
+    if (businessId) {
       paramCount++;
-      query += ` AND s.retailer_id = $${paramCount}`;
-      params.push(retailerId);
+      query += ` AND s.business_id = $${paramCount}`;
+      params.push(businessId);
     }
 
     if (search) {
@@ -1277,11 +1325,11 @@ router.get("/services/pending", isAuthenticated, async (req, res, next) => {
       return res.status(403).json({ success: false, message: "Only admins can access this" });
     }
 
-    // Get pending services with retailer information
+    // Get pending services with business information
     const result = await pool.query(
-      `SELECT s.*, r.business_name as retailer_name, r.postcode, r.city
+      `SELECT s.*, b.business_name as business_name, b.postcode, b.city
        FROM services s
-       JOIN retailers r ON s.retailer_id = r.id
+       JOIN businesses b ON s.business_id = b.id
        WHERE s.is_approved = false
        ORDER BY s.created_at DESC`
     );
@@ -1298,7 +1346,7 @@ router.get("/services/pending", isAuthenticated, async (req, res, next) => {
       locationType: row.location_type,
       requiresStaff: row.requires_staff,
       isApproved: row.is_approved,
-      retailer_name: row.retailer_name,
+      business_name: row.business_name,
       created_at: row.created_at,
     }));
 
@@ -1312,9 +1360,9 @@ router.get("/services/pending", isAuthenticated, async (req, res, next) => {
 router.get("/services/:id", async (req, res, next) => {
   try {
     const result = await pool.query(
-      `SELECT s.*, r.business_name as retailer_name, r.business_address, r.city, r.postcode
+      `SELECT s.*, b.business_name as business_name, b.business_address, b.city, b.postcode
        FROM services s
-       JOIN retailers r ON s.retailer_id = r.id
+       JOIN businesses b ON s.business_id = b.id
        WHERE s.id = $1 AND s.is_approved = true`,
       [req.params.id]
     );
@@ -1329,17 +1377,17 @@ router.get("/services/:id", async (req, res, next) => {
   }
 });
 
-// Create service (retailer only)
+// Create service (business only)
 router.post("/services", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can create services" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can create services" });
     }
 
-    const retailerId = await productService.getRetailerIdByUserId(user.id);
-    if (!retailerId) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    const businessId = await productService.getBusinessIdByUserId(user.id);
+    if (!businessId) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
     const { name, description, price, category, images, durationMinutes, maxParticipants, requiresStaff, locationType } = req.body;
@@ -1352,11 +1400,11 @@ router.post("/services", isAuthenticated, async (req, res, next) => {
     }
 
     const result = await pool.query(
-      `INSERT INTO services (retailer_id, name, description, price, category, images, duration_minutes, max_participants, requires_staff, location_type)
+      `INSERT INTO services (business_id, name, description, price, category, images, duration_minutes, max_participants, requires_staff, location_type)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        RETURNING *`,
       [
-        retailerId,
+        businessId,
         name,
         description || null,
         price,
@@ -1375,23 +1423,23 @@ router.post("/services", isAuthenticated, async (req, res, next) => {
   }
 });
 
-// Update service (retailer only)
+// Update service (business only)
 router.put("/services/:id", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can update services" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can update services" });
     }
 
-    const retailerId = await productService.getRetailerIdByUserId(user.id);
-    if (!retailerId) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    const businessId = await productService.getBusinessIdByUserId(user.id);
+    if (!businessId) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    // Verify service belongs to this retailer
+    // Verify service belongs to this business
     const serviceCheck = await pool.query(
-      "SELECT id FROM services WHERE id = $1 AND retailer_id = $2",
-      [req.params.id, retailerId]
+      "SELECT id FROM services WHERE id = $1 AND business_id = $2",
+      [req.params.id, businessId]
     );
 
     if (serviceCheck.rows.length === 0) {
@@ -1434,23 +1482,23 @@ router.put("/services/:id", isAuthenticated, async (req, res, next) => {
   }
 });
 
-// Delete service (retailer only)
+// Delete service (business only)
 router.delete("/services/:id", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can delete services" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can delete services" });
     }
 
-    const retailerId = await productService.getRetailerIdByUserId(user.id);
-    if (!retailerId) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    const businessId = await productService.getBusinessIdByUserId(user.id);
+    if (!businessId) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    // Verify service belongs to this retailer
+    // Verify service belongs to this business
     const serviceCheck = await pool.query(
-      "SELECT id FROM services WHERE id = $1 AND retailer_id = $2",
-      [req.params.id, retailerId]
+      "SELECT id FROM services WHERE id = $1 AND business_id = $2",
+      [req.params.id, businessId]
     );
 
     if (serviceCheck.rows.length === 0) {
@@ -1465,22 +1513,22 @@ router.delete("/services/:id", isAuthenticated, async (req, res, next) => {
   }
 });
 
-// Get retailer's services (retailer only)
-router.get("/retailer/services", isAuthenticated, async (req, res, next) => {
+// Get business's services (business only)
+router.get("/business/services", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can access this" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can access this" });
     }
 
-    const retailerId = await productService.getRetailerIdByUserId(user.id);
-    if (!retailerId) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    const businessId = await productService.getBusinessIdByUserId(user.id);
+    if (!businessId) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
     const result = await pool.query(
-      "SELECT * FROM services WHERE retailer_id = $1 ORDER BY created_at DESC",
-      [retailerId]
+      "SELECT * FROM services WHERE business_id = $1 ORDER BY created_at DESC",
+      [businessId]
     );
 
     res.json({ success: true, data: result.rows });
@@ -1517,10 +1565,10 @@ router.post("/services/:id/approve", isAuthenticated, async (req, res, next) => 
 
 // ==================== AVAILABILITY ROUTES ====================
 
-// Get available time slots for a retailer
-router.get("/retailers/:retailerId/availability", async (req, res, next) => {
+// Get available time slots for a business
+router.get("/businesses/:businessId/availability", async (req, res, next) => {
   try {
-    const { retailerId } = req.params;
+    const { businessId } = req.params;
     const { startDate, endDate, durationMinutes, slotIntervalMinutes } = req.query;
 
     if (!startDate || !endDate) {
@@ -1531,7 +1579,7 @@ router.get("/retailers/:retailerId/availability", async (req, res, next) => {
     }
 
     const slots = await availabilityService.getAvailableSlots(
-      retailerId,
+      businessId,
       new Date(startDate as string),
       new Date(endDate as string),
       durationMinutes ? parseInt(durationMinutes as string) : 60,
@@ -1544,37 +1592,37 @@ router.get("/retailers/:retailerId/availability", async (req, res, next) => {
   }
 });
 
-// Get weekly schedule (retailer only)
-router.get("/retailer/availability/schedule", isAuthenticated, async (req, res, next) => {
+// Get weekly schedule (business only)
+router.get("/business/availability/schedule", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can access this" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can access this" });
     }
 
-    const retailerId = await productService.getRetailerIdByUserId(user.id);
-    if (!retailerId) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    const businessId = await productService.getBusinessIdByUserId(user.id);
+    if (!businessId) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    const schedule = await availabilityService.getWeeklySchedule(retailerId);
+    const schedule = await availabilityService.getWeeklySchedule(businessId);
     res.json({ success: true, data: schedule });
   } catch (error) {
     next(error);
   }
 });
 
-// Update weekly schedule (retailer only)
-router.put("/retailer/availability/schedule", isAuthenticated, async (req, res, next) => {
+// Update weekly schedule (business only)
+router.put("/business/availability/schedule", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can update schedule" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can update schedule" });
     }
 
-    const retailerId = await productService.getRetailerIdByUserId(user.id);
-    if (!retailerId) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    const businessId = await productService.getBusinessIdByUserId(user.id);
+    if (!businessId) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
     const { schedule } = req.body; // Array of { dayOfWeek, startTime, endTime, isAvailable }
@@ -1595,8 +1643,8 @@ router.put("/retailer/availability/schedule", isAuthenticated, async (req, res, 
 
     // Delete existing schedule
     await pool.query(
-      "DELETE FROM retailer_availability_schedules WHERE retailer_id = $1",
-      [retailerId]
+      "DELETE FROM business_availability_schedules WHERE business_id = $1",
+      [businessId]
     );
 
     // Insert new schedule
@@ -1606,51 +1654,51 @@ router.put("/retailer/availability/schedule", isAuthenticated, async (req, res, 
         if (day.isAvailable && day.startTime && day.endTime) {
           // Save available day with times
           await pool.query(
-            `INSERT INTO retailer_availability_schedules (retailer_id, day_of_week, start_time, end_time, is_available)
+            `INSERT INTO business_availability_schedules (business_id, day_of_week, start_time, end_time, is_available)
              VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (retailer_id, day_of_week) 
+             ON CONFLICT (business_id, day_of_week) 
              DO UPDATE SET start_time = $3, end_time = $4, is_available = $5, updated_at = CURRENT_TIMESTAMP`,
-            [retailerId, day.dayOfWeek, day.startTime, day.endTime, true]
+            [businessId, day.dayOfWeek, day.startTime, day.endTime, true]
           );
         } else {
           // Save unavailable day (or day without times) as unavailable
           await pool.query(
-            `INSERT INTO retailer_availability_schedules (retailer_id, day_of_week, start_time, end_time, is_available)
+            `INSERT INTO business_availability_schedules (business_id, day_of_week, start_time, end_time, is_available)
              VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (retailer_id, day_of_week) 
+             ON CONFLICT (business_id, day_of_week) 
              DO UPDATE SET start_time = $3, end_time = $4, is_available = $5, updated_at = CURRENT_TIMESTAMP`,
-            [retailerId, day.dayOfWeek, null, null, false]
+            [businessId, day.dayOfWeek, null, null, false]
           );
         }
       }
     }
 
-    const updatedSchedule = await availabilityService.getWeeklySchedule(retailerId);
+    const updatedSchedule = await availabilityService.getWeeklySchedule(businessId);
     res.json({ success: true, data: updatedSchedule });
   } catch (error) {
     next(error);
   }
 });
 
-// Get availability blocks (retailer only)
-router.get("/retailer/availability/blocks", isAuthenticated, async (req, res, next) => {
+// Get availability blocks (business only)
+router.get("/business/availability/blocks", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can access this" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can access this" });
     }
 
-    const retailerId = await productService.getRetailerIdByUserId(user.id);
-    if (!retailerId) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    const businessId = await productService.getBusinessIdByUserId(user.id);
+    if (!businessId) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
     const { startDate, endDate } = req.query;
     let query = `
-      SELECT * FROM retailer_availability_blocks
-      WHERE retailer_id = $1
+      SELECT * FROM business_availability_blocks
+      WHERE business_id = $1
     `;
-    const params: any[] = [retailerId];
+    const params: any[] = [businessId];
 
     if (startDate && endDate) {
       query += ` AND block_date BETWEEN $2 AND $3`;
@@ -1666,17 +1714,17 @@ router.get("/retailer/availability/blocks", isAuthenticated, async (req, res, ne
   }
 });
 
-// Create availability block (retailer only)
-router.post("/retailer/availability/blocks", isAuthenticated, async (req, res, next) => {
+// Create availability block (business only)
+router.post("/business/availability/blocks", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can create blocks" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can create blocks" });
     }
 
-    const retailerId = await productService.getRetailerIdByUserId(user.id);
-    if (!retailerId) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    const businessId = await productService.getBusinessIdByUserId(user.id);
+    if (!businessId) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
     const { blockDate, startTime, endTime, reason, isAllDay } = req.body;
@@ -1686,10 +1734,10 @@ router.post("/retailer/availability/blocks", isAuthenticated, async (req, res, n
     }
 
     const result = await pool.query(
-      `INSERT INTO retailer_availability_blocks (retailer_id, block_date, start_time, end_time, reason, is_all_day)
+      `INSERT INTO business_availability_blocks (business_id, block_date, start_time, end_time, reason, is_all_day)
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING *`,
-      [retailerId, blockDate, startTime || null, endTime || null, reason || null, isAllDay || false]
+      [businessId, blockDate, startTime || null, endTime || null, reason || null, isAllDay || false]
     );
 
     res.status(201).json({ success: true, data: result.rows[0] });
@@ -1698,30 +1746,30 @@ router.post("/retailer/availability/blocks", isAuthenticated, async (req, res, n
   }
 });
 
-// Delete availability block (retailer only)
-router.delete("/retailer/availability/blocks/:id", isAuthenticated, async (req, res, next) => {
+// Delete availability block (business only)
+router.delete("/business/availability/blocks/:id", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can delete blocks" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can delete blocks" });
     }
 
-    const retailerId = await productService.getRetailerIdByUserId(user.id);
-    if (!retailerId) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    const businessId = await productService.getBusinessIdByUserId(user.id);
+    if (!businessId) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    // Verify block belongs to this retailer
+    // Verify block belongs to this business
     const blockCheck = await pool.query(
-      "SELECT id FROM retailer_availability_blocks WHERE id = $1 AND retailer_id = $2",
-      [req.params.id, retailerId]
+      "SELECT id FROM business_availability_blocks WHERE id = $1 AND business_id = $2",
+      [req.params.id, businessId]
     );
 
     if (blockCheck.rows.length === 0) {
       return res.status(404).json({ success: false, message: "Block not found or access denied" });
     }
 
-    await pool.query("DELETE FROM retailer_availability_blocks WHERE id = $1", [req.params.id]);
+    await pool.query("DELETE FROM business_availability_blocks WHERE id = $1", [req.params.id]);
 
     res.json({ success: true, message: "Block deleted successfully" });
   } catch (error) {
@@ -1737,16 +1785,16 @@ router.post("/bookings/lock", isAuthenticated, async (req, res, next) => {
       return res.status(401).json({ success: false, message: "Not authenticated" });
     }
 
-    const { retailerId, date, time } = req.body;
+    const { businessId, date, time } = req.body;
 
-    if (!retailerId || !date || !time) {
+    if (!businessId || !date || !time) {
       return res.status(400).json({
         success: false,
-        message: "retailerId, date, and time are required",
+        message: "businessId, date, and time are required",
       });
     }
 
-    const locked = await availabilityService.lockSlot(retailerId, date, time, user.id);
+    const locked = await availabilityService.lockSlot(businessId, date, time, user.id);
 
     if (!locked) {
       return res.status(400).json({
@@ -1769,16 +1817,16 @@ router.post("/bookings/unlock", isAuthenticated, async (req, res, next) => {
       return res.status(401).json({ success: false, message: "Not authenticated" });
     }
 
-    const { retailerId, date, time } = req.body;
+    const { businessId, date, time } = req.body;
 
-    if (!retailerId || !date || !time) {
+    if (!businessId || !date || !time) {
       return res.status(400).json({
         success: false,
-        message: "retailerId, date, and time are required",
+        message: "businessId, date, and time are required",
       });
     }
 
-    await availabilityService.releaseLock(retailerId, date, time);
+    await availabilityService.releaseLock(businessId, date, time);
 
     res.json({ success: true, message: "Slot unlocked successfully" });
   } catch (error) {
@@ -1844,11 +1892,11 @@ router.get("/cart/services", isAuthenticated, async (req, res, next) => {
     }
 
     const result = await pool.query(
-      `SELECT csi.*, s.name, s.price, s.images, s.category, s.duration_minutes, s.retailer_id,
-              r.business_name as retailer_name
+      `SELECT csi.*, s.name, s.price, s.images, s.category, s.duration_minutes, s.business_id,
+              b.business_name as business_name
        FROM cart_service_items csi
        JOIN services s ON csi.service_id = s.id
-       JOIN retailers r ON s.retailer_id = r.id
+       JOIN businesses b ON s.business_id = b.id
        WHERE csi.user_id = $1
        ORDER BY csi.created_at DESC`,
       [user.id]
@@ -1889,27 +1937,27 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
       return res.status(403).json({ success: false, message: "Only customers can create orders" });
     }
 
-    // Get cart items with product and retailer info
+    // Get cart items with product and business info
     const cartResult = await pool.query(
-      `SELECT ci.*, p.name, p.price, p.stock, p.retailer_id, 
-              r.business_name as retailer_name, r.business_address, r.postcode, r.city
+      `SELECT ci.*, p.name, p.price, p.stock, p.business_id, 
+              b.business_name as business_name, b.business_address, b.postcode, b.city
        FROM cart_items ci
        JOIN products p ON ci.product_id = p.id
-       JOIN retailers r ON p.retailer_id = r.id
+       JOIN businesses b ON p.business_id = b.id
        WHERE ci.user_id = $1
-       ORDER BY p.retailer_id, ci.created_at`,
+       ORDER BY p.business_id, ci.created_at`,
       [user.id]
     );
 
-    // Get cart service items with service and retailer info
+    // Get cart service items with service and business info
     const cartServiceResult = await pool.query(
-      `SELECT csi.*, s.name, s.price, s.duration_minutes, s.retailer_id,
-              r.business_name as retailer_name, r.business_address, r.postcode, r.city
+      `SELECT csi.*, s.name, s.price, s.duration_minutes, s.business_id,
+              b.business_name, b.business_address, b.postcode, b.city
        FROM cart_service_items csi
        JOIN services s ON csi.service_id = s.id
-       JOIN retailers r ON s.retailer_id = r.id
+       JOIN businesses b ON s.business_id = b.id
        WHERE csi.user_id = $1
-       ORDER BY s.retailer_id, csi.created_at`,
+       ORDER BY s.business_id, csi.created_at`,
       [user.id]
     );
 
@@ -1918,25 +1966,25 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
     }
 
     // Get booking information from request body (for services)
-    // Support both single booking (backward compatibility) and per-retailer bookings
-    const { bookingDate, bookingTime, retailerBookings } = req.body;
+    // Support both single booking (backward compatibility) and per-business bookings
+    const { bookingDate, bookingTime, businessBookings } = req.body;
     
     // Validate booking info if services are in cart
     if (cartServiceResult.rows.length > 0) {
-      // If retailerBookings is provided, use per-retailer bookings
-      if (retailerBookings && typeof retailerBookings === 'object') {
-        // Validate each retailer's booking
+      // If businessBookings is provided, use per-business bookings
+      if (businessBookings && typeof businessBookings === 'object') {
+        // Validate each business's booking
         for (const serviceItem of cartServiceResult.rows) {
-          const retailerBooking = retailerBookings[serviceItem.retailer_id];
-          if (!retailerBooking || !retailerBooking.date || !retailerBooking.time) {
+          const businessBooking = businessBookings[serviceItem.business_id];
+          if (!businessBooking || !businessBooking.date || !businessBooking.time) {
             return res.status(400).json({
               success: false,
-              message: `Booking date and time are required for services from ${serviceItem.retailer_name || 'this retailer'}`,
+              message: `Booking date and time are required for services from ${serviceItem.business_name || 'this business'}`,
             });
           }
 
           // Validate cutoff rules for same-day service bookings
-          const bookingDateObj = new Date(retailerBooking.date);
+          const bookingDateObj = new Date(businessBooking.date);
           const today = new Date();
           today.setHours(0, 0, 0, 0);
           const bookingDateOnly = new Date(bookingDateObj);
@@ -1944,19 +1992,19 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
           const isSameDay = bookingDateOnly.getTime() === today.getTime();
 
           if (isSameDay) {
-            const cutoffCheck = await availabilityService.isSameDayPickupAllowed(serviceItem.retailer_id);
+            const cutoffCheck = await availabilityService.isSameDayPickupAllowed(serviceItem.business_id);
             if (!cutoffCheck.allowed) {
               return res.status(400).json({
                 success: false,
-                message: cutoffCheck.reason || "Same-day booking is not available for this retailer. Please select tomorrow or later.",
+                message: cutoffCheck.reason || "Same-day booking is not available for this business. Please select tomorrow or later.",
               });
             }
           }
 
           const locked = await availabilityService.lockSlot(
-            serviceItem.retailer_id,
-            retailerBooking.date,
-            retailerBooking.time,
+            serviceItem.business_id,
+            businessBooking.date,
+            businessBooking.time,
             user.id
           );
 
@@ -1968,7 +2016,7 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
           }
         }
       } else {
-        // Backward compatibility: single booking for all services (assumes same retailer)
+        // Backward compatibility: single booking for all services (assumes same business)
         if (!bookingDate || !bookingTime) {
           return res.status(400).json({
             success: false,
@@ -1976,9 +2024,9 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
           });
         }
 
-        // Validate cutoff rules for same-day service bookings (check first service's retailer)
-        const firstServiceRetailerId = cartServiceResult.rows[0]?.retailer_id;
-        if (firstServiceRetailerId) {
+        // Validate cutoff rules for same-day service bookings (check first service's business)
+        const firstServiceBusinessId = cartServiceResult.rows[0]?.business_id;
+        if (firstServiceBusinessId) {
           const bookingDateObj = new Date(bookingDate);
           const today = new Date();
           today.setHours(0, 0, 0, 0);
@@ -1987,11 +2035,11 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
           const isSameDay = bookingDateOnly.getTime() === today.getTime();
 
           if (isSameDay) {
-            const cutoffCheck = await availabilityService.isSameDayPickupAllowed(firstServiceRetailerId);
+            const cutoffCheck = await availabilityService.isSameDayPickupAllowed(firstServiceBusinessId);
             if (!cutoffCheck.allowed) {
               return res.status(400).json({
                 success: false,
-                message: cutoffCheck.reason || "Same-day booking is not available for this retailer. Please select tomorrow or later.",
+                message: cutoffCheck.reason || "Same-day booking is not available for this business. Please select tomorrow or later.",
               });
             }
           }
@@ -2000,7 +2048,7 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
         // Validate and lock booking slots for each service
         for (const serviceItem of cartServiceResult.rows) {
           const locked = await availabilityService.lockSlot(
-            serviceItem.retailer_id,
+            serviceItem.business_id,
             bookingDate,
             bookingTime,
             user.id
@@ -2018,25 +2066,25 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
 
     // Validate cutoff rules for product orders (same-day pickup)
     if (cartResult.rows.length > 0) {
-      const retailerCutoffChecks = new Map<string, { allowed: boolean; reason?: string }>();
+      const businessCutoffChecks = new Map<string, { allowed: boolean; reason?: string }>();
       
       for (const item of cartResult.rows) {
-        if (!retailerCutoffChecks.has(item.retailer_id)) {
-          const cutoffCheck = await availabilityService.isSameDayPickupAllowed(item.retailer_id);
-          retailerCutoffChecks.set(item.retailer_id, cutoffCheck);
+        if (!businessCutoffChecks.has(item.business_id)) {
+          const cutoffCheck = await availabilityService.isSameDayPickupAllowed(item.business_id);
+          businessCutoffChecks.set(item.business_id, cutoffCheck);
           
           if (!cutoffCheck.allowed) {
             return res.status(400).json({
               success: false,
-              message: cutoffCheck.reason || "Same-day pickup is not available for this retailer.",
+              message: cutoffCheck.reason || "Same-day pickup is not available for this business.",
             });
           }
         }
       }
     }
 
-    // Validate stock and group by retailer (products)
-    const retailerGroups = new Map<string, typeof cartResult.rows>();
+    // Validate stock and group by business (products)
+    const businessGroups = new Map<string, typeof cartResult.rows>();
     const stockErrors: string[] = [];
 
     for (const item of cartResult.rows) {
@@ -2046,22 +2094,22 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
         continue;
       }
 
-      // Group by retailer
-      const retailerId = item.retailer_id;
-      if (!retailerGroups.has(retailerId)) {
-        retailerGroups.set(retailerId, []);
+      // Group by business
+      const businessId = item.business_id;
+      if (!businessGroups.has(businessId)) {
+        businessGroups.set(businessId, []);
       }
-      retailerGroups.get(retailerId)!.push(item);
+      businessGroups.get(businessId)!.push(item);
     }
 
-    // Group services by retailer
-    const serviceRetailerGroups = new Map<string, typeof cartServiceResult.rows>();
+    // Group services by business
+    const serviceBusinessGroups = new Map<string, typeof cartServiceResult.rows>();
     for (const serviceItem of cartServiceResult.rows) {
-      const retailerId = serviceItem.retailer_id;
-      if (!serviceRetailerGroups.has(retailerId)) {
-        serviceRetailerGroups.set(retailerId, []);
+      const businessId = serviceItem.business_id;
+      if (!serviceBusinessGroups.has(businessId)) {
+        serviceBusinessGroups.set(businessId, []);
       }
-      serviceRetailerGroups.get(retailerId)!.push(serviceItem);
+      serviceBusinessGroups.get(businessId)!.push(serviceItem);
     }
 
     if (stockErrors.length > 0) {
@@ -2114,41 +2162,41 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
       }
     }
 
-    // Combine all retailers (products + services)
-    const allRetailerIds = new Set([
-      ...Array.from(retailerGroups.keys()),
-      ...Array.from(serviceRetailerGroups.keys()),
+    // Combine all businesses (products + services)
+    const allBusinessIds = new Set([
+      ...Array.from(businessGroups.keys()),
+      ...Array.from(serviceBusinessGroups.keys()),
     ]);
-    const totalRetailers = allRetailerIds.size;
+    const totalBusinesses = allBusinessIds.size;
 
-    // Create orders for each retailer
+    // Create orders for each business
     const createdOrders = [];
 
-    for (const retailerId of allRetailerIds) {
-      const items = retailerGroups.get(retailerId) || [];
-      const serviceItems = serviceRetailerGroups.get(retailerId) || [];
+    for (const businessId of allBusinessIds) {
+      const items = businessGroups.get(businessId) || [];
+      const serviceItems = serviceBusinessGroups.get(businessId) || [];
 
-      // Calculate total for this retailer's order (products + services)
+      // Calculate total for this business's order (products + services)
       const productsTotal = items.reduce((sum, item) => sum + parseFloat(item.price) * item.quantity, 0);
       const servicesTotal = serviceItems.reduce((sum, item) => sum + parseFloat(item.price) * item.quantity, 0);
       let total = productsTotal + servicesTotal;
       
-      // Apply discount proportionally (if multiple retailers, split discount)
-      const retailerDiscount = totalRetailers > 1 
-        ? (discountAmount / totalRetailers) 
+      // Apply discount proportionally (if multiple businesses, split discount)
+      const businessDiscount = totalBusinesses > 1 
+        ? (discountAmount / totalBusinesses) 
         : discountAmount;
-      const retailerPoints = totalRetailers > 1
-        ? (pointsRedeemed / totalRetailers)
+      const businessPoints = totalBusinesses > 1
+        ? (pointsRedeemed / totalBusinesses)
         : pointsRedeemed;
       
-      total = Math.max(0, total - retailerDiscount - retailerPoints);
+      total = Math.max(0, total - businessDiscount - businessPoints);
 
-      // Build pickup location from retailer address
-      const retailer = items[0] || serviceItems[0];
+      // Build pickup location from business address
+      const business = items[0] || serviceItems[0];
       const pickupLocationParts: string[] = [];
-      if (retailer.business_address) pickupLocationParts.push(retailer.business_address);
-      if (retailer.postcode) pickupLocationParts.push(retailer.postcode);
-      if (retailer.city) pickupLocationParts.push(retailer.city);
+      if (business.business_address) pickupLocationParts.push(business.business_address);
+      if (business.postcode) pickupLocationParts.push(business.postcode);
+      if (business.city) pickupLocationParts.push(business.city);
       const pickupLocation = pickupLocationParts.length > 0 ? pickupLocationParts.join(", ") : null;
 
       // Get pickup instructions from request body if provided
@@ -2160,39 +2208,39 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
         ? serviceItems[0].duration_minutes
         : null;
 
-      // Get booking date/time for this retailer
-      let retailerBookingDate: string | null = null;
-      let retailerBookingTime: string | null = null;
+      // Get booking date/time for this business
+      let businessBookingDate: string | null = null;
+      let businessBookingTime: string | null = null;
       
       if (isServiceOrder) {
-        if (retailerBookings && typeof retailerBookings === 'object' && retailerBookings[retailerId]) {
-          // Use per-retailer booking
-          retailerBookingDate = retailerBookings[retailerId].date;
-          retailerBookingTime = retailerBookings[retailerId].time;
+        if (businessBookings && typeof businessBookings === 'object' && businessBookings[businessId]) {
+          // Use per-business booking
+          businessBookingDate = businessBookings[businessId].date;
+          businessBookingTime = businessBookings[businessId].time;
         } else if (bookingDate && bookingTime) {
           // Backward compatibility: use single booking
-          retailerBookingDate = bookingDate;
-          retailerBookingTime = bookingTime;
+          businessBookingDate = bookingDate;
+          businessBookingTime = bookingTime;
         }
       }
 
       // Create order with status 'awaiting_payment' - payment must be confirmed before finalizing
       // Stock will NOT be deducted and cart will NOT be cleared until payment succeeds
       const orderResult = await pool.query(
-        `INSERT INTO orders (user_id, retailer_id, status, total, pickup_location, pickup_instructions, discount_amount, points_used, booking_date, booking_time, booking_duration_minutes, booking_status)
+        `INSERT INTO orders (user_id, business_id, status, total, pickup_location, pickup_instructions, discount_amount, points_used, booking_date, booking_time, booking_duration_minutes, booking_status)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
          RETURNING *`,
         [
           user.id,
-          retailerId,
+          businessId,
           "awaiting_payment", // Order is reserved, awaiting payment confirmation
           total,
           pickupLocation,
           pickupInstructions || null,
-          retailerDiscount,
-          retailerPoints,
-          retailerBookingDate,
-          retailerBookingTime,
+          businessDiscount,
+          businessPoints,
+          businessBookingDate,
+          businessBookingTime,
           bookingDuration,
           isServiceOrder ? 'confirmed' : null,
         ]
@@ -2201,7 +2249,7 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
       const order = orderResult.rows[0];
 
       // Apply discount code to order if provided (this is OK to do now)
-      if (discountCode && retailerDiscount > 0) {
+      if (discountCode && businessDiscount > 0) {
         try {
           await rewardsService.applyDiscountCode(order.id, discountCode);
         } catch (err) {
@@ -2235,8 +2283,8 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
             serviceItem.service_id,
             serviceItem.quantity,
             serviceItem.price,
-            retailerBookingDate,
-            retailerBookingTime,
+            businessBookingDate,
+            businessBookingTime,
             serviceItem.duration_minutes,
           ]
         );
@@ -2264,13 +2312,13 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
 
       createdOrders.push({
         ...order,
-        retailer_name: (items[0] || serviceItems[0]).retailer_name,
+        business_name: (items[0] || serviceItems[0]).business_name,
         items: itemsResult.rows,
         serviceItems: serviceItemsResult.rows,
       });
 
       // Send booking confirmation emails if this is a service order
-      if (isServiceOrder && retailerBookingDate && retailerBookingTime) {
+      if (isServiceOrder && businessBookingDate && businessBookingTime) {
         try {
           // Get customer details
           const customerResult = await pool.query(
@@ -2279,17 +2327,17 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
           );
           const customer = customerResult.rows[0];
 
-          // Get retailer details
-          const retailerResult = await pool.query(
-            `SELECT r.business_name, u.email as retailer_email
-             FROM retailers r
-             JOIN users u ON r.user_id = u.id
-             WHERE r.id = $1`,
-            [retailerId]
+          // Get business details
+          const businessResult = await pool.query(
+            `SELECT b.business_name, u.email as business_email
+             FROM businesses b
+             JOIN users u ON b.user_id = u.id
+             WHERE b.id = $1`,
+            [businessId]
           );
-          const retailer = retailerResult.rows[0];
+          const business = businessResult.rows[0];
 
-          if (customer && retailer) {
+          if (customer && business) {
             // Prepare service details
             const serviceDetails = serviceItemsResult.rows.map((item: any) => ({
               name: item.service_name,
@@ -2303,9 +2351,9 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
               customer.username,
               {
                 orderId: order.id,
-                retailerName: retailer.business_name,
-                bookingDate: retailerBookingDate,
-                bookingTime: retailerBookingTime,
+                businessName: business.business_name,
+                bookingDate: businessBookingDate,
+                bookingTime: businessBookingTime,
                 duration: bookingDuration || 60,
                 services: serviceDetails,
                 total: parseFloat(order.total),
@@ -2314,16 +2362,16 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
               }
             );
 
-            // Send retailer notification email
-            await emailService.sendBookingNotificationToRetailer(
-              retailer.retailer_email,
-              retailer.business_name,
+            // Send business notification email
+            await emailService.sendBookingNotificationToBusiness(
+              business.business_email,
+              business.business_name,
               {
                 orderId: order.id,
                 customerName: customer.username,
                 customerEmail: customer.email,
-                bookingDate: retailerBookingDate,
-                bookingTime: retailerBookingTime,
+                bookingDate: businessBookingDate,
+                bookingTime: businessBookingTime,
                 duration: bookingDuration || 60,
                 services: serviceDetails,
                 total: parseFloat(order.total),
@@ -2347,12 +2395,12 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
     const paymentIntents = [];
 
     for (const order of createdOrders) {
-      // Check if retailer has Stripe Connect
+      // Check if business has Stripe Connect
       const stripeAccount = await pool.query(
         `SELECT sca.stripe_account_id, sca.charges_enabled
          FROM stripe_connect_accounts sca
-         WHERE sca.retailer_id = $1 AND sca.charges_enabled = true`,
-        [order.retailer_id]
+         WHERE sca.business_id = $1 AND sca.charges_enabled = true`,
+        [order.business_id]
       );
 
       if (stripeAccount.rows.length > 0) {
@@ -2361,7 +2409,7 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
             // For mobile: Create Payment Intent for native Stripe checkout
             const paymentIntent = await stripeService.createPaymentIntent(
               order.id,
-              order.retailer_id,
+              order.business_id,
               parseFloat(order.total),
               'gbp',
               user.email
@@ -2391,7 +2439,7 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
 
             const session = await stripeService.createCheckoutSession(
               order.id,
-              order.retailer_id,
+              order.business_id,
               parseFloat(order.total),
               'gbp',
               successUrl,
@@ -2421,7 +2469,7 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
           // but log the error and potentially notify the user
         }
       } else {
-        console.warn(`[Order] Retailer ${order.retailer_id} does not have Stripe Connect enabled. Order ${order.id} created without payment.`);
+        console.warn(`[Order] Business ${order.business_id} does not have Stripe Connect enabled. Order ${order.id} created without payment.`);
       }
     }
 
@@ -2459,11 +2507,11 @@ router.get("/orders", isAuthenticated, async (req, res, next) => {
     }
 
     let query = `
-      SELECT o.*, r.business_name as retailer_name,
+      SELECT o.*, b.business_name as business_name,
              u.username as customer_name, u.email as customer_email,
              (SELECT COUNT(*) FROM order_items WHERE order_id = o.id) as item_count
       FROM orders o
-      JOIN retailers r ON o.retailer_id = r.id
+      JOIN businesses b ON o.business_id = b.id
       JOIN users u ON o.user_id = u.id
       WHERE 1=1
     `;
@@ -2473,11 +2521,11 @@ router.get("/orders", isAuthenticated, async (req, res, next) => {
     if (user.role === "customer") {
       query += ` AND o.user_id = $1`;
       params = [user.id];
-    } else if (user.role === "retailer") {
-      const retailerId = await productService.getRetailerIdByUserId(user.id);
-      if (retailerId) {
-        query += ` AND o.retailer_id = $1`;
-        params = [retailerId];
+        } else if (user.role === "business") {
+      const businessId = await productService.getBusinessIdByUserId(user.id);
+      if (businessId) {
+        query += ` AND o.business_id = $1`;
+        params = [businessId];
       } else {
         return res.json({ success: true, data: [] });
       }
@@ -2527,10 +2575,10 @@ router.get("/orders/:id", isAuthenticated, async (req, res, next) => {
     }
 
     const orderResult = await pool.query(
-      `SELECT o.*, r.business_name as retailer_name,
+      `SELECT o.*, b.business_name as business_name,
               u.username as customer_name, u.email as customer_email
        FROM orders o
-       JOIN retailers r ON o.retailer_id = r.id
+       JOIN businesses b ON o.business_id = b.id
        JOIN users u ON o.user_id = u.id
        WHERE o.id = $1`,
       [req.params.id]
@@ -2547,9 +2595,9 @@ router.get("/orders/:id", isAuthenticated, async (req, res, next) => {
       return res.status(403).json({ success: false, message: "Access denied" });
     }
 
-    if (user.role === "retailer") {
-      const retailerId = await productService.getRetailerIdByUserId(user.id);
-      if (!retailerId || order.retailer_id !== retailerId) {
+    if (user.role === "business") {
+      const businessId = await productService.getBusinessIdByUserId(user.id);
+      if (!businessId || order.business_id !== businessId) {
         return res.status(403).json({ success: false, message: "Access denied" });
       }
     }
@@ -2593,9 +2641,9 @@ router.post("/orders/:id/retry-payment", isAuthenticated, async (req, res, next)
     }
 
     const orderResult = await pool.query(
-      `SELECT o.*, r.business_name as retailer_name
+      `SELECT o.*, b.business_name as business_name
        FROM orders o
-       JOIN retailers r ON o.retailer_id = r.id
+       JOIN businesses b ON o.business_id = b.id
        WHERE o.id = $1 AND o.user_id = $2`,
       [req.params.id, user.id]
     );
@@ -2621,18 +2669,18 @@ router.post("/orders/:id/retry-payment", isAuthenticated, async (req, res, next)
       });
     }
 
-    // Check if retailer has Stripe Connect
+    // Check if business has Stripe Connect
     const stripeAccount = await pool.query(
       `SELECT sca.stripe_account_id, sca.charges_enabled
        FROM stripe_connect_accounts sca
-       WHERE sca.retailer_id = $1 AND sca.charges_enabled = true`,
-      [order.retailer_id]
+       WHERE sca.business_id = $1 AND sca.charges_enabled = true`,
+      [order.business_id]
     );
 
     if (stripeAccount.rows.length === 0) {
       return res.status(400).json({ 
         success: false, 
-        message: "Payment processing is not available for this retailer" 
+        message: "Payment processing is not available for this business" 
       });
     }
 
@@ -2643,7 +2691,7 @@ router.post("/orders/:id/retry-payment", isAuthenticated, async (req, res, next)
 
     const session = await stripeService.createCheckoutSession(
       order.id,
-      order.retailer_id,
+      order.business_id,
       parseFloat(order.total),
       'gbp',
       successUrl,
@@ -2675,12 +2723,12 @@ router.post("/orders/:id/retry-payment", isAuthenticated, async (req, res, next)
   }
 });
 
-// Update order status (retailer only)
+// Update order status (business only)
 router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can update order status" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can update order status" });
     }
 
     const { status } = req.body;
@@ -2693,15 +2741,15 @@ router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
       });
     }
 
-    const retailerId = await productService.getRetailerIdByUserId(user.id);
-    if (!retailerId) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    const businessId = await productService.getBusinessIdByUserId(user.id);
+    if (!businessId) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    // Verify order belongs to this retailer
+    // Verify order belongs to this business
     const orderResult = await pool.query(
-      "SELECT * FROM orders WHERE id = $1 AND retailer_id = $2",
-      [req.params.id, retailerId]
+      "SELECT * FROM orders WHERE id = $1 AND business_id = $2",
+      [req.params.id, businessId]
     );
 
     if (orderResult.rows.length === 0) {
@@ -2716,8 +2764,8 @@ router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
     let paramCount = 1;
 
     // If order status is being changed from 'pending' to a non-pending status,
-    // and retailer_amount is not set, calculate and set it
-    if (existingOrder.status === 'pending' && status !== 'pending' && status !== 'cancelled' && !existingOrder.retailer_amount) {
+    // and business_amount is not set, calculate and set it
+    if (existingOrder.status === 'pending' && status !== 'pending' && status !== 'cancelled' && !existingOrder.business_amount) {
       // Get commission rate
       const DEFAULT_COMMISSION_RATE = parseFloat(process.env.PLATFORM_COMMISSION_RATE || "0.10");
       let commissionRate = DEFAULT_COMMISSION_RATE;
@@ -2738,10 +2786,10 @@ router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
 
       const orderTotal = parseFloat(existingOrder.total);
       const platformCommission = orderTotal * commissionRate;
-      const retailerAmount = orderTotal - platformCommission;
+      const businessAmount = orderTotal - platformCommission;
 
-      updateQuery += `, platform_commission = $${++paramCount}, retailer_amount = $${++paramCount}`;
-      updateParams.push(platformCommission, retailerAmount);
+      updateQuery += `, platform_commission = $${++paramCount}, business_amount = $${++paramCount}`;
+      updateParams.push(platformCommission, businessAmount);
     }
 
     // Set timestamps for BOPIS statuses
@@ -2782,7 +2830,7 @@ router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
 
 // QR Code routes for orders
 
-// Generate QR code for order (customer can view, retailer can scan)
+// Generate QR code for order (customer can view, business can scan)
 router.get("/orders/:id/qr-code", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
@@ -2794,10 +2842,10 @@ router.get("/orders/:id/qr-code", isAuthenticated, async (req, res, next) => {
 
     // Verify order exists and user has access
     const orderResult = await pool.query(
-      `SELECT o.*, r.business_name as retailer_name
+      `SELECT o.*, b.business_name as business_name
        FROM orders o
-       JOIN retailers r ON o.retailer_id = r.id
-       WHERE o.id = $1 AND (o.user_id = $2 OR o.retailer_id = (SELECT id FROM retailers WHERE user_id = $2))`,
+       JOIN businesses b ON o.business_id = b.id
+       WHERE o.id = $1 AND (o.user_id = $2 OR o.business_id = (SELECT id FROM businesses WHERE user_id = $2))`,
       [orderId, user.id]
     );
 
@@ -2842,14 +2890,14 @@ router.get("/orders/:id/qr-code", isAuthenticated, async (req, res, next) => {
   }
 });
 
-// Verify and scan QR code (retailer only)
+// Verify and scan QR code (business only)
 router.post("/orders/verify-qr", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
+    if (!user || user.role !== "business") {
       return res.status(403).json({ 
         success: false, 
-        message: "Only retailers can verify QR codes" 
+        message: "Only businesses can verify QR codes" 
       });
     }
 
@@ -2882,36 +2930,36 @@ router.post("/orders/verify-qr", isAuthenticated, async (req, res, next) => {
       });
     }
 
-    // Get retailer ID
-    const retailerResult = await pool.query(
-      "SELECT id FROM retailers WHERE user_id = $1",
+    // Get business ID
+    const businessResult = await pool.query(
+      "SELECT id FROM businesses WHERE user_id = $1",
       [user.id]
     );
 
-    if (retailerResult.rows.length === 0) {
+    if (businessResult.rows.length === 0) {
       return res.status(404).json({ 
         success: false, 
-        message: "Retailer profile not found" 
+        message: "Business profile not found" 
       });
     }
 
-    const retailerId = retailerResult.rows[0].id;
+    const businessId = businessResult.rows[0].id;
 
-    // Verify order exists and belongs to this retailer
+    // Verify order exists and belongs to this business
     const orderResult = await pool.query(
       `SELECT o.*, 
               u.username as customer_name, 
               u.email as customer_email
        FROM orders o
        JOIN users u ON o.user_id = u.id
-       WHERE o.id = $1 AND o.retailer_id = $2`,
-      [orderId, retailerId]
+       WHERE o.id = $1 AND o.business_id = $2`,
+      [orderId, businessId]
     );
 
     if (orderResult.rows.length === 0) {
       return res.status(404).json({ 
         success: false, 
-        message: "Order not found or does not belong to this retailer" 
+        message: "Order not found or does not belong to this business" 
       });
     }
 
@@ -3011,14 +3059,14 @@ router.post("/orders/verify-qr", isAuthenticated, async (req, res, next) => {
   }
 });
 
-// Decode QR code from image (retailer only)
+// Decode QR code from image (business only)
 router.post("/orders/decode-qr-image", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
+    if (!user || user.role !== "business") {
       return res.status(403).json({ 
         success: false, 
-        message: "Only retailers can decode QR codes from images" 
+        message: "Only businesses can decode QR codes from images" 
       });
     }
 
@@ -3291,12 +3339,12 @@ router.get("/wishlist", isAuthenticated, async (req, res, next) => {
 
     const result = await pool.query(
       `SELECT w.*, p.name, p.price, p.images, p.category, 
-              r.business_name as retailer_name,
+              b.business_name as business_name,
               COALESCE(p.review_count, 0) as review_count,
               COALESCE(p.average_rating, 0) as average_rating
        FROM wishlist_items w
        JOIN products p ON w.product_id = p.id
-       JOIN retailers r ON p.retailer_id = r.id
+       JOIN businesses b ON p.business_id = b.id
        WHERE w.user_id = $1
        ORDER BY w.created_at DESC`,
       [user.id]
@@ -3410,12 +3458,6 @@ router.delete("/wishlist/:productId", isAuthenticated, async (req, res, next) =>
 
 // Image upload endpoint
 import multer from "multer";
-import path from "path";
-import fs from "fs";
-import { fileURLToPath } from "url";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 // Configure multer storage
 const multerStorage = multer.diskStorage({
@@ -3478,8 +3520,8 @@ router.post("/upload/image", isAuthenticated, upload.single("image"), async (req
   }
 });
 
-// Retailer approval (admin only)
-router.get("/retailers/pending", isAuthenticated, async (req, res, next) => {
+// Business approval (admin only)
+router.get("/businesses/pending", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
     if (!user || user.role !== "admin") {
@@ -3487,11 +3529,11 @@ router.get("/retailers/pending", isAuthenticated, async (req, res, next) => {
     }
 
     const result = await pool.query(
-      `SELECT r.*, u.username, u.email
-       FROM retailers r
-       JOIN users u ON r.user_id = u.id
-       WHERE r.is_approved = false
-       ORDER BY r.created_at DESC`
+      `SELECT b.*, u.username, u.email
+       FROM businesses b
+       JOIN users u ON b.user_id = u.id
+       WHERE b.is_approved = false
+       ORDER BY b.created_at DESC`
     );
 
     res.json({ success: true, data: result.rows });
@@ -3500,26 +3542,26 @@ router.get("/retailers/pending", isAuthenticated, async (req, res, next) => {
   }
 });
 
-router.post("/retailers/:id/approve", isAuthenticated, async (req, res, next) => {
+router.post("/businesses/:id/approve", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
     if (!user || user.role !== "admin") {
-      return res.status(403).json({ success: false, message: "Only admins can approve retailers" });
+      return res.status(403).json({ success: false, message: "Only admins can approve businesses" });
     }
 
     await pool.query(
-      "UPDATE retailers SET is_approved = true WHERE id = $1",
+      "UPDATE businesses SET is_approved = true WHERE id = $1",
       [req.params.id]
     );
 
-    res.json({ success: true, message: "Retailer approved" });
+    res.json({ success: true, message: "Business approved" });
   } catch (error) {
     next(error);
   }
 });
 
-// Admin: Get all retailers with pagination and filters
-router.get("/admin/retailers", isAuthenticated, async (req, res, next) => {
+// Admin: Get all businesses with pagination and filters
+router.get("/admin/businesses", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
     if (!user || user.role !== "admin") {
@@ -3539,14 +3581,14 @@ router.get("/admin/retailers", isAuthenticated, async (req, res, next) => {
 
     // Status filter
     if (status === "pending") {
-      whereConditions.push(`r.is_approved = false`);
+      whereConditions.push(`b.is_approved = false`);
     } else if (status === "approved") {
-      whereConditions.push(`r.is_approved = true`);
+      whereConditions.push(`b.is_approved = true`);
     }
 
     // City filter
     if (city) {
-      whereConditions.push(`r.city = $${paramIndex}`);
+      whereConditions.push(`b.city = $${paramIndex}`);
       queryParams.push(city);
       paramIndex++;
     }
@@ -3554,7 +3596,7 @@ router.get("/admin/retailers", isAuthenticated, async (req, res, next) => {
     // Search filter (business name, email, username)
     if (search) {
       whereConditions.push(`(
-        r.business_name ILIKE $${paramIndex} OR 
+        b.business_name ILIKE $${paramIndex} OR 
         u.email ILIKE $${paramIndex} OR 
         u.username ILIKE $${paramIndex}
       )`);
@@ -3569,28 +3611,28 @@ router.get("/admin/retailers", isAuthenticated, async (req, res, next) => {
     // Get total count
     const countQuery = `
       SELECT COUNT(*) as total
-      FROM retailers r
-      JOIN users u ON r.user_id = u.id
+      FROM businesses b
+      JOIN users u ON b.user_id = u.id
       ${whereClause}
     `;
     const countResult = await pool.query(countQuery, queryParams);
     const total = parseInt(countResult.rows[0].total);
 
-    // Get retailers
+    // Get businesses
     const dataQuery = `
       SELECT 
-        r.*,
+        b.*,
         u.username,
         u.email,
         CASE 
-          WHEN r.trial_ends_at IS NOT NULL AND r.trial_ends_at > NOW() THEN 'trial'
-          WHEN r.billing_status = 'suspended' THEN 'suspended'
+          WHEN b.trial_ends_at IS NOT NULL AND b.trial_ends_at > NOW() THEN 'trial'
+          WHEN b.billing_status = 'suspended' THEN 'suspended'
           ELSE 'active'
         END as trial_status
-      FROM retailers r
-      JOIN users u ON r.user_id = u.id
+      FROM businesses b
+      JOIN users u ON b.user_id = u.id
       ${whereClause}
-      ORDER BY r.created_at DESC
+      ORDER BY b.created_at DESC
       LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
     `;
     queryParams.push(limit, offset);
@@ -3599,7 +3641,7 @@ router.get("/admin/retailers", isAuthenticated, async (req, res, next) => {
     res.json({
       success: true,
       data: {
-        retailers: dataResult.rows,
+        businesses: dataResult.rows,
         total,
         page,
         limit,
@@ -3622,7 +3664,7 @@ router.get("/admin/users", isAuthenticated, async (req, res, next) => {
     const page = parseInt(req.query.page as string) || 1;
     const limit = parseInt(req.query.limit as string) || 20;
     const offset = (page - 1) * limit;
-    const role = req.query.role as string || "all"; // customer, retailer, admin, all
+    const role = req.query.role as string || "all"; // customer, business, admin, all
     const search = req.query.search as string;
 
     let whereConditions: string[] = [];
@@ -3691,8 +3733,8 @@ router.get("/admin/users", isAuthenticated, async (req, res, next) => {
   }
 });
 
-// Admin: Update retailer billing settings
-router.put("/admin/retailers/:id/billing", isAuthenticated, async (req, res, next) => {
+// Admin: Update business billing settings
+router.put("/admin/businesses/:id/billing", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
     if (!user || user.role !== "admin") {
@@ -3700,7 +3742,7 @@ router.put("/admin/retailers/:id/billing", isAuthenticated, async (req, res, nex
     }
 
     const { commission_rate_override, trial_ends_at, billing_status } = req.body;
-    const retailerId = req.params.id;
+    const businessId = req.params.id;
 
     // Validate commission_rate_override if provided
     if (commission_rate_override !== undefined && commission_rate_override !== null) {
@@ -3751,9 +3793,9 @@ router.put("/admin/retailers/:id/billing", isAuthenticated, async (req, res, nex
       });
     }
 
-    params.push(retailerId);
+    params.push(businessId);
     const updateQuery = `
-      UPDATE retailers 
+      UPDATE businesses 
       SET ${updates.join(", ")}
       WHERE id = $${paramIndex}
       RETURNING *
@@ -3764,13 +3806,13 @@ router.put("/admin/retailers/:id/billing", isAuthenticated, async (req, res, nex
     if (result.rows.length === 0) {
       return res.status(404).json({
         success: false,
-        message: "Retailer not found",
+        message: "Business not found",
       });
     }
 
     res.json({
       success: true,
-      message: "Retailer billing settings updated successfully",
+      message: "Business billing settings updated successfully",
       data: result.rows[0],
     });
   } catch (error) {
@@ -3883,11 +3925,11 @@ router.get("/admin/orders", isAuthenticated, async (req, res, next) => {
 
     const { status } = req.query;
     let query = `
-      SELECT o.*, r.business_name as retailer_name,
+      SELECT o.*, b.business_name as business_name,
              u.username as customer_name, u.email as customer_email,
              (SELECT COUNT(*) FROM order_items WHERE order_id = o.id) as item_count
       FROM orders o
-      JOIN retailers r ON o.retailer_id = r.id
+      JOIN businesses b ON o.business_id = b.id
       JOIN users u ON o.user_id = u.id
       WHERE 1=1
     `;
@@ -3934,10 +3976,10 @@ router.get("/admin/orders/:id", isAuthenticated, async (req, res, next) => {
     }
 
     const orderResult = await pool.query(
-      `SELECT o.*, r.business_name as retailer_name,
+      `SELECT o.*, b.business_name as business_name,
               u.username as customer_name, u.email as customer_email
        FROM orders o
-       JOIN retailers r ON o.retailer_id = r.id
+       JOIN businesses b ON o.business_id = b.id
        JOIN users u ON o.user_id = u.id
        WHERE o.id = $1`,
       [req.params.id]
@@ -3970,7 +4012,73 @@ router.get("/admin/orders/:id", isAuthenticated, async (req, res, next) => {
   }
 });
 
-// Admin: Get/Update commission settings
+// Admin: Get commission tiers configuration
+router.get("/admin/settings/commission-tiers", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ success: false, message: "Only admins can access this" });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        tiers: COMMISSION_TIERS.map(tier => ({
+          name: tier.name,
+          minTurnover: tier.minTurnover,
+          maxTurnover: tier.maxTurnover,
+          commissionRate: tier.commissionRate,
+          commissionPercentage: (tier.commissionRate * 100).toFixed(1),
+        })),
+        turnoverPeriod: "30-day rolling",
+        currency: "GBP",
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Admin: Get business commission tier information
+router.get("/admin/businesses/:businessId/commission-tier", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ success: false, message: "Only admins can access this" });
+    }
+
+    const { businessId } = req.params;
+    const { tier, turnover } = await stripeService.getCommissionTierForBusiness(businessId);
+
+    // Get business name
+    const businessResult = await pool.query(
+      "SELECT business_name FROM businesses WHERE id = $1",
+      [businessId]
+    );
+
+    res.json({
+      success: true,
+      data: {
+        businessId,
+        businessName: businessResult.rows[0]?.business_name || "Unknown",
+        currentTier: {
+          name: tier.name,
+          commissionRate: tier.commissionRate,
+          commissionPercentage: (tier.commissionRate * 100).toFixed(1),
+        },
+        turnover: {
+          current: turnover,
+          period: "30-day rolling",
+          currency: "GBP",
+        },
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Admin: Get/Update commission settings (legacy - kept for backward compatibility)
 router.get("/admin/settings/commission", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
@@ -3988,6 +4096,7 @@ router.get("/admin/settings/commission", isAuthenticated, async (req, res, next)
       success: true,
       data: {
         commissionRate: parseFloat(commissionRate),
+        note: "This is the legacy default rate. Businesses now use tier-based commissions based on turnover.",
       },
     });
   } catch (error) {
@@ -4263,32 +4372,32 @@ router.delete("/admin/reviews/:id", isAuthenticated, async (req, res, next) => {
 });
 
 // Get Square catalog items
-router.get("/retailer/square/items", isAuthenticated, async (req, res, next) => {
+router.get("/business/square/items", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can access this" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can access this" });
     }
 
-    const retailerResult = await pool.query(
+    const businessResult = await pool.query(
       `SELECT square_access_token, square_location_id
-       FROM retailers WHERE user_id = $1`,
+       FROM businesses WHERE user_id = $1`,
       [user.id]
     );
 
-    if (retailerResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    const retailer = retailerResult.rows[0];
+    const business = businessResult.rows[0];
 
-    if (!retailer.square_access_token || !retailer.square_location_id) {
+    if (!business.square_access_token || !business.square_location_id) {
       return res.status(400).json({ success: false, message: "Square account not connected" });
     }
 
     const items = await squareService.getCatalogItems(
-      retailer.square_access_token,
-      retailer.square_location_id
+      business.square_access_token,
+      business.square_location_id
     );
 
     res.json({
@@ -4301,32 +4410,32 @@ router.get("/retailer/square/items", isAuthenticated, async (req, res, next) => 
 });
 
 // Get Square item details (price, stock)
-router.get("/retailer/square/items/:itemId/details", isAuthenticated, async (req, res, next) => {
+router.get("/business/square/items/:itemId/details", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can access this" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can access this" });
     }
 
-    const retailerResult = await pool.query(
+    const businessResult = await pool.query(
       `SELECT square_access_token, square_location_id
-       FROM retailers WHERE user_id = $1`,
+       FROM businesses WHERE user_id = $1`,
       [user.id]
     );
 
-    if (retailerResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    const retailer = retailerResult.rows[0];
+    const business = businessResult.rows[0];
 
-    if (!retailer.square_access_token || !retailer.square_location_id) {
+    if (!business.square_access_token || !business.square_location_id) {
       return res.status(400).json({ success: false, message: "Square account not connected" });
     }
 
     const details = await squareService.getItemDetails(
-      retailer.square_access_token,
-      retailer.square_location_id,
+      business.square_access_token,
+      business.square_location_id,
       req.params.itemId
     );
 
@@ -4339,26 +4448,26 @@ router.get("/retailer/square/items/:itemId/details", isAuthenticated, async (req
   }
 });
 
-// ==================== RETAILER POSTS ====================
+// ==================== BUSINESS POSTS ====================
 
-// Create retailer post
-router.post("/retailer/posts", isAuthenticated, async (req, res, next) => {
+// Create business post
+router.post("/business/posts", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can create posts" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can create posts" });
     }
 
-    const retailerResult = await pool.query(
-      "SELECT id FROM retailers WHERE user_id = $1",
+    const businessResult = await pool.query(
+      "SELECT id FROM businesses WHERE user_id = $1",
       [user.id]
     );
 
-    if (retailerResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    const retailerId = retailerResult.rows[0].id;
+    const businessId = businessResult.rows[0].id;
     const { content, images } = req.body;
 
     if (!content || content.trim().length === 0) {
@@ -4366,10 +4475,10 @@ router.post("/retailer/posts", isAuthenticated, async (req, res, next) => {
     }
 
     const result = await pool.query(
-      `INSERT INTO retailer_posts (retailer_id, content, images)
+      `INSERT INTO business_posts (business_id, content, images)
        VALUES ($1, $2, $3)
        RETURNING *`,
-      [retailerId, content.trim(), images || []]
+      [businessId, content.trim(), images || []]
     );
 
     res.status(201).json({ success: true, data: result.rows[0] });
@@ -4378,30 +4487,30 @@ router.post("/retailer/posts", isAuthenticated, async (req, res, next) => {
   }
 });
 
-// Get retailer's own posts
-router.get("/retailer/posts", isAuthenticated, async (req, res, next) => {
+// Get business's own posts
+router.get("/business/posts", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can access this" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can access this" });
     }
 
-    const retailerResult = await pool.query(
-      "SELECT id FROM retailers WHERE user_id = $1",
+    const businessResult = await pool.query(
+      "SELECT id FROM businesses WHERE user_id = $1",
       [user.id]
     );
 
-    if (retailerResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    const retailerId = retailerResult.rows[0].id;
+    const businessId = businessResult.rows[0].id;
 
     const result = await pool.query(
-      `SELECT * FROM retailer_posts 
-       WHERE retailer_id = $1 
+      `SELECT * FROM business_posts 
+       WHERE business_id = $1 
        ORDER BY created_at DESC`,
-      [retailerId]
+      [businessId]
     );
 
     res.json({ success: true, data: result.rows });
@@ -4410,18 +4519,18 @@ router.get("/retailer/posts", isAuthenticated, async (req, res, next) => {
   }
 });
 
-// Get public retailer posts
-router.get("/retailer/:retailerId/posts", async (req, res, next) => {
+// Get public business posts
+router.get("/business/:businessId/posts", async (req, res, next) => {
   try {
-    const { retailerId } = req.params;
+    const { businessId } = req.params;
 
     const result = await pool.query(
-      `SELECT p.*, r.business_name as retailer_name, r.banner_image as retailer_banner_image
-       FROM retailer_posts p
-       JOIN retailers r ON p.retailer_id = r.id
-       WHERE p.retailer_id = $1 AND r.is_approved = true
+      `SELECT p.*, b.business_name as business_name, b.banner_image as business_banner_image
+       FROM business_posts p
+       JOIN businesses b ON p.business_id = b.id
+       WHERE p.business_id = $1 AND b.is_approved = true
        ORDER BY p.created_at DESC`,
-      [retailerId]
+      [businessId]
     );
 
     res.json({ success: true, data: result.rows });
@@ -4430,29 +4539,29 @@ router.get("/retailer/:retailerId/posts", async (req, res, next) => {
   }
 });
 
-// Update retailer post
-router.put("/retailer/posts/:postId", isAuthenticated, async (req, res, next) => {
+// Update business post
+router.put("/business/posts/:postId", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can update posts" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can update posts" });
     }
 
-    const retailerResult = await pool.query(
-      "SELECT id FROM retailers WHERE user_id = $1",
+    const businessResult = await pool.query(
+      "SELECT id FROM businesses WHERE user_id = $1",
       [user.id]
     );
 
-    if (retailerResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    const retailerId = retailerResult.rows[0].id;
+    const businessId = businessResult.rows[0].id;
     const { content, images } = req.body;
 
-    // Verify post belongs to retailer
+    // Verify post belongs to business
     const postCheck = await pool.query(
-      "SELECT retailer_id FROM retailer_posts WHERE id = $1",
+      "SELECT business_id FROM business_posts WHERE id = $1",
       [req.params.postId]
     );
 
@@ -4460,12 +4569,12 @@ router.put("/retailer/posts/:postId", isAuthenticated, async (req, res, next) =>
       return res.status(404).json({ success: false, message: "Post not found" });
     }
 
-    if (postCheck.rows[0].retailer_id !== retailerId) {
+    if (postCheck.rows[0].business_id !== businessId) {
       return res.status(403).json({ success: false, message: "You can only update your own posts" });
     }
 
     const result = await pool.query(
-      `UPDATE retailer_posts 
+      `UPDATE business_posts 
        SET content = $1, images = $2, updated_at = CURRENT_TIMESTAMP
        WHERE id = $3
        RETURNING *`,
@@ -4478,28 +4587,28 @@ router.put("/retailer/posts/:postId", isAuthenticated, async (req, res, next) =>
   }
 });
 
-// Delete retailer post
-router.delete("/retailer/posts/:postId", isAuthenticated, async (req, res, next) => {
+// Delete business post
+router.delete("/business/posts/:postId", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can delete posts" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can delete posts" });
     }
 
-    const retailerResult = await pool.query(
-      "SELECT id FROM retailers WHERE user_id = $1",
+    const businessResult = await pool.query(
+      "SELECT id FROM businesses WHERE user_id = $1",
       [user.id]
     );
 
-    if (retailerResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    const retailerId = retailerResult.rows[0].id;
+    const businessId = businessResult.rows[0].id;
 
-    // Verify post belongs to retailer
+    // Verify post belongs to business
     const postCheck = await pool.query(
-      "SELECT retailer_id FROM retailer_posts WHERE id = $1",
+      "SELECT business_id FROM business_posts WHERE id = $1",
       [req.params.postId]
     );
 
@@ -4507,11 +4616,11 @@ router.delete("/retailer/posts/:postId", isAuthenticated, async (req, res, next)
       return res.status(404).json({ success: false, message: "Post not found" });
     }
 
-    if (postCheck.rows[0].retailer_id !== retailerId) {
+    if (postCheck.rows[0].business_id !== businessId) {
       return res.status(403).json({ success: false, message: "You can only delete your own posts" });
     }
 
-    await pool.query("DELETE FROM retailer_posts WHERE id = $1", [req.params.postId]);
+    await pool.query("DELETE FROM business_posts WHERE id = $1", [req.params.postId]);
 
     res.json({ success: true, message: "Post deleted successfully" });
   } catch (error) {
@@ -4519,78 +4628,78 @@ router.delete("/retailer/posts/:postId", isAuthenticated, async (req, res, next)
   }
 });
 
-// ==================== RETAILER FOLLOWERS ====================
+// ==================== BUSINESS FOLLOWERS ====================
 
-// Follow retailer
-router.post("/retailer/:retailerId/follow", isAuthenticated, async (req, res, next) => {
+// Follow business
+router.post("/business/:businessId/follow", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
     if (!user) {
       return res.status(401).json({ success: false, message: "Not authenticated" });
     }
 
-    const { retailerId } = req.params;
+    const { businessId } = req.params;
 
-    // Check if retailer exists and is approved
-    const retailerCheck = await pool.query(
-      "SELECT id FROM retailers WHERE id = $1 AND is_approved = true",
-      [retailerId]
+    // Check if business exists and is approved
+    const businessCheck = await pool.query(
+      "SELECT id FROM businesses WHERE id = $1 AND is_approved = true",
+      [businessId]
     );
 
-    if (retailerCheck.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer not found" });
+    if (businessCheck.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business not found" });
     }
 
     // Check if already following
     const existing = await pool.query(
-      "SELECT id FROM retailer_followers WHERE retailer_id = $1 AND user_id = $2",
-      [retailerId, user.id]
+      "SELECT id FROM business_followers WHERE business_id = $1 AND user_id = $2",
+      [businessId, user.id]
     );
 
     if (existing.rows.length > 0) {
-      return res.status(400).json({ success: false, message: "Already following this retailer" });
+      return res.status(400).json({ success: false, message: "Already following this business" });
     }
 
     await pool.query(
-      "INSERT INTO retailer_followers (retailer_id, user_id) VALUES ($1, $2)",
-      [retailerId, user.id]
+      "INSERT INTO business_followers (business_id, user_id) VALUES ($1, $2)",
+      [businessId, user.id]
     );
 
-    res.json({ success: true, message: "Successfully followed retailer" });
+    res.json({ success: true, message: "Successfully followed business" });
   } catch (error) {
     next(error);
   }
 });
 
-// Unfollow retailer
-router.delete("/retailer/:retailerId/follow", isAuthenticated, async (req, res, next) => {
+// Unfollow business
+router.delete("/business/:businessId/follow", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
     if (!user) {
       return res.status(401).json({ success: false, message: "Not authenticated" });
     }
 
-    const { retailerId } = req.params;
+    const { businessId } = req.params;
 
     await pool.query(
-      "DELETE FROM retailer_followers WHERE retailer_id = $1 AND user_id = $2",
-      [retailerId, user.id]
+      "DELETE FROM business_followers WHERE business_id = $1 AND user_id = $2",
+      [businessId, user.id]
     );
 
-    res.json({ success: true, message: "Successfully unfollowed retailer" });
+    res.json({ success: true, message: "Successfully unfollowed business" });
   } catch (error) {
     next(error);
   }
 });
 
-// Get retailer followers count
-router.get("/retailer/:retailerId/followers/count", async (req, res, next) => {
+// Get business followers count
+router.get("/business/:businessId/followers/count", async (req, res, next) => {
   try {
-    const { retailerId } = req.params;
+    const { businessId } = req.params;
 
     const result = await pool.query(
-      "SELECT COUNT(*) as count FROM retailer_followers WHERE retailer_id = $1",
-      [retailerId]
+      "SELECT COUNT(*) as count FROM business_followers WHERE business_id = $1",
+      [businessId]
     );
 
     res.json({ success: true, data: { count: parseInt(result.rows[0].count) } });
@@ -4599,19 +4708,19 @@ router.get("/retailer/:retailerId/followers/count", async (req, res, next) => {
   }
 });
 
-// Check if user is following retailer
-router.get("/retailer/:retailerId/follow", isAuthenticated, async (req, res, next) => {
+// Check if user is following business
+router.get("/business/:businessId/follow", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
     if (!user) {
       return res.json({ success: true, data: { isFollowing: false } });
     }
 
-    const { retailerId } = req.params;
+    const { businessId } = req.params;
 
     const result = await pool.query(
-      "SELECT id FROM retailer_followers WHERE retailer_id = $1 AND user_id = $2",
-      [retailerId, user.id]
+      "SELECT id FROM business_followers WHERE business_id = $1 AND user_id = $2",
+      [businessId, user.id]
     );
 
     res.json({ success: true, data: { isFollowing: result.rows.length > 0 } });
@@ -4620,7 +4729,7 @@ router.get("/retailer/:retailerId/follow", isAuthenticated, async (req, res, nex
   }
 });
 
-// Get retailers user follows
+// Get businesses user follows
 router.get("/user/following", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
@@ -4629,10 +4738,10 @@ router.get("/user/following", isAuthenticated, async (req, res, next) => {
     }
 
     const result = await pool.query(
-      `SELECT r.*, rf.created_at as followed_at
-       FROM retailers r
-       JOIN retailer_followers rf ON r.id = rf.retailer_id
-       WHERE rf.user_id = $1 AND r.is_approved = true
+      `SELECT b.*, rf.created_at as followed_at
+       FROM businesses b
+       JOIN business_followers rf ON b.id = rf.business_id
+       WHERE rf.user_id = $1 AND b.is_approved = true
        ORDER BY rf.created_at DESC`,
       [user.id]
     );
@@ -4643,32 +4752,32 @@ router.get("/user/following", isAuthenticated, async (req, res, next) => {
   }
 });
 
-// Get public retailer profile with follower count
-router.get("/retailer/:retailerId/public", async (req, res, next) => {
+// Get public business profile with follower count
+router.get("/business/:businessId/public", async (req, res, next) => {
   try {
-    const { retailerId } = req.params;
+    const { businessId } = req.params;
     const user = getCurrentUser(req);
 
     const result = await pool.query(
-      `SELECT r.*, 
-       (SELECT COUNT(*) FROM retailer_followers WHERE retailer_id = r.id) as follower_count
-       FROM retailers r
-       WHERE r.id = $1 AND r.is_approved = true`,
-      [retailerId]
+      `SELECT b.*, 
+       (SELECT COUNT(*) FROM business_followers WHERE business_id = b.id) as follower_count
+       FROM businesses b
+       WHERE b.id = $1 AND b.is_approved = true`,
+      [businessId]
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer not found" });
+      return res.status(404).json({ success: false, message: "Business not found" });
     }
 
-    const retailer = result.rows[0];
+    const business = result.rows[0];
 
     // Check if user is following (if authenticated)
     let isFollowing = false;
     if (user) {
       const followCheck = await pool.query(
-        "SELECT id FROM retailer_followers WHERE retailer_id = $1 AND user_id = $2",
-        [retailerId, user.id]
+        "SELECT id FROM business_followers WHERE business_id = $1 AND user_id = $2",
+        [businessId, user.id]
       );
       isFollowing = followCheck.rows.length > 0;
     }
@@ -4676,7 +4785,7 @@ router.get("/retailer/:retailerId/public", async (req, res, next) => {
     res.json({
       success: true,
       data: {
-        ...retailer,
+        ...business,
         isFollowing,
       },
     });
@@ -4685,30 +4794,30 @@ router.get("/retailer/:retailerId/public", async (req, res, next) => {
   }
 });
 
-// ==================== RETAILER PAYOUTS ====================
+// ==================== BUSINESS PAYOUTS ====================
 
 // Get or create payout settings
-router.get("/retailer/payout-settings", isAuthenticated, async (req, res, next) => {
+router.get("/business/payout-settings", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can access this" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can access this" });
     }
 
-    const retailerResult = await pool.query(
-      "SELECT id FROM retailers WHERE user_id = $1",
+    const businessResult = await pool.query(
+      "SELECT id FROM businesses WHERE user_id = $1",
       [user.id]
     );
 
-    if (retailerResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    const retailerId = retailerResult.rows[0].id;
+    const businessId = businessResult.rows[0].id;
 
     const result = await pool.query(
-      "SELECT * FROM retailer_payout_settings WHERE retailer_id = $1",
-      [retailerId]
+      "SELECT * FROM business_payout_settings WHERE business_id = $1",
+      [businessId]
     );
 
     if (result.rows.length === 0) {
@@ -4720,7 +4829,7 @@ router.get("/retailer/payout-settings", isAuthenticated, async (req, res, next) 
         success: true,
         data: {
           id: settings.id,
-          retailerId: settings.retailer_id,
+          businessId: settings.business_id,
           payoutMethod: settings.payout_method,
           isVerified: settings.is_verified,
           createdAt: settings.created_at,
@@ -4736,23 +4845,23 @@ router.get("/retailer/payout-settings", isAuthenticated, async (req, res, next) 
 });
 
 // Create or update payout settings
-router.put("/retailer/payout-settings", isAuthenticated, async (req, res, next) => {
+router.put("/business/payout-settings", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can update payout settings" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can update payout settings" });
     }
 
-    const retailerResult = await pool.query(
-      "SELECT id FROM retailers WHERE user_id = $1",
+    const businessResult = await pool.query(
+      "SELECT id FROM businesses WHERE user_id = $1",
       [user.id]
     );
 
-    if (retailerResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    const retailerId = retailerResult.rows[0].id;
+    const businessId = businessResult.rows[0].id;
     const { payoutMethod, accountDetails } = req.body;
 
     if (!payoutMethod || !['bank', 'paypal', 'stripe'].includes(payoutMethod)) {
@@ -4767,8 +4876,8 @@ router.put("/retailer/payout-settings", isAuthenticated, async (req, res, next) 
 
     // Check if settings exist
     const existing = await pool.query(
-      "SELECT id, account_details FROM retailer_payout_settings WHERE retailer_id = $1",
-      [retailerId]
+      "SELECT id, account_details FROM business_payout_settings WHERE business_id = $1",
+      [businessId]
     );
 
     let finalAccountDetails = accountDetails || {};
@@ -4799,19 +4908,19 @@ router.put("/retailer/payout-settings", isAuthenticated, async (req, res, next) 
     if (existing.rows.length > 0) {
       // Update existing
       result = await pool.query(
-        `UPDATE retailer_payout_settings 
+        `UPDATE business_payout_settings 
          SET payout_method = $1, account_details = $2, updated_at = CURRENT_TIMESTAMP
-         WHERE retailer_id = $3
+         WHERE business_id = $3
          RETURNING *`,
-        [payoutMethod, JSON.stringify(finalAccountDetails), retailerId]
+        [payoutMethod, JSON.stringify(finalAccountDetails), businessId]
       );
     } else {
       // Create new
       result = await pool.query(
-        `INSERT INTO retailer_payout_settings (retailer_id, payout_method, account_details)
+        `INSERT INTO business_payout_settings (business_id, payout_method, account_details)
          VALUES ($1, $2, $3)
          RETURNING *`,
-        [retailerId, payoutMethod, JSON.stringify(finalAccountDetails)]
+        [businessId, payoutMethod, JSON.stringify(finalAccountDetails)]
       );
     }
 
@@ -4820,7 +4929,7 @@ router.put("/retailer/payout-settings", isAuthenticated, async (req, res, next) 
       message: "Payout settings saved successfully",
       data: {
         id: result.rows[0].id,
-        retailerId: result.rows[0].retailer_id,
+        businessId: result.rows[0].business_id,
         payoutMethod: result.rows[0].payout_method,
         isVerified: result.rows[0].is_verified,
       },
@@ -4830,29 +4939,29 @@ router.put("/retailer/payout-settings", isAuthenticated, async (req, res, next) 
   }
 });
 
-// Request verification (Retailer can request, admin must approve)
-router.post("/retailer/payout-settings/request-verification", isAuthenticated, async (req, res, next) => {
+// Request verification (Business can request, admin must approve)
+router.post("/business/payout-settings/request-verification", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can request verification" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can request verification" });
     }
 
-    const retailerResult = await pool.query(
-      "SELECT id FROM retailers WHERE user_id = $1",
+    const businessResult = await pool.query(  
+      "SELECT id FROM businesses WHERE user_id = $1",
       [user.id]
     );
 
-    if (retailerResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    const retailerId = retailerResult.rows[0].id;
+    const businessId = businessResult.rows[0].id;
 
     // Check if settings exist
     const existing = await pool.query(
-      "SELECT id, payout_method, account_details, is_verified FROM retailer_payout_settings WHERE retailer_id = $1",
-      [retailerId]
+      "SELECT id, payout_method, account_details, is_verified FROM business_payout_settings WHERE business_id = $1",
+      [businessId]
     );
 
     if (existing.rows.length === 0) {
@@ -4898,17 +5007,17 @@ router.post("/retailer/payout-settings/request-verification", isAuthenticated, a
 });
 
 // Verify payout account (Admin only)
-router.post("/retailer/payout-settings/verify", isAuthenticated, async (req, res, next) => {
+router.post("/business/payout-settings/verify", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
     if (!user || user.role !== "admin") {
       return res.status(403).json({ success: false, message: "Only admins can verify payout accounts" });
     }
 
-    const { retailerId, verified } = req.body;
+    const { businessId, verified } = req.body;
 
-    if (!retailerId) {
-      return res.status(400).json({ success: false, message: "Retailer ID is required" });
+    if (!businessId) {
+      return res.status(400).json({ success: false, message: "Business ID is required" });
     }
 
     if (typeof verified !== "boolean") {
@@ -4917,21 +5026,21 @@ router.post("/retailer/payout-settings/verify", isAuthenticated, async (req, res
 
     // Check if settings exist
     const existing = await pool.query(
-      "SELECT id FROM retailer_payout_settings WHERE retailer_id = $1",
-      [retailerId]
+      "SELECT id FROM business_payout_settings WHERE business_id = $1",
+      [businessId]
     );
 
     if (existing.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Payout settings not found for this retailer" });
+      return res.status(404).json({ success: false, message: "Payout settings not found for this business" });
     }
 
     // Update verification status
     const result = await pool.query(
-      `UPDATE retailer_payout_settings 
+      `UPDATE business_payout_settings 
        SET is_verified = $1, updated_at = CURRENT_TIMESTAMP
-       WHERE retailer_id = $2
+       WHERE business_id = $2
        RETURNING *`,
-      [verified, retailerId]
+      [verified, businessId]
     );
 
     res.json({
@@ -4939,7 +5048,7 @@ router.post("/retailer/payout-settings/verify", isAuthenticated, async (req, res
       message: verified ? "Payout account verified successfully" : "Payout account verification removed",
       data: {
         id: result.rows[0].id,
-        retailerId: result.rows[0].retailer_id,
+        businessId: result.rows[0].business_id,
         payoutMethod: result.rows[0].payout_method,
         isVerified: result.rows[0].is_verified,
       },
@@ -4949,7 +5058,7 @@ router.post("/retailer/payout-settings/verify", isAuthenticated, async (req, res
   }
 });
 
-// Get all retailers with payout settings (Admin only)
+// Get all businesses with payout settings (Admin only)
 router.get("/admin/payout-verifications", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
@@ -4959,9 +5068,9 @@ router.get("/admin/payout-verifications", isAuthenticated, async (req, res, next
 
     const result = await pool.query(
       `SELECT 
-        r.id as retailer_id,
-        r.business_name,
-        r.user_id,
+        b.id as business_id,
+        b.business_name,
+        b.user_id,
         u.email,
         u.username,
         ps.id as settings_id,
@@ -4970,16 +5079,16 @@ router.get("/admin/payout-verifications", isAuthenticated, async (req, res, next
         ps.is_verified,
         ps.created_at as settings_created_at,
         ps.updated_at as settings_updated_at
-      FROM retailers r
-      LEFT JOIN users u ON r.user_id = u.id
-      LEFT JOIN retailer_payout_settings ps ON r.id = ps.retailer_id
-      ORDER BY r.business_name ASC`
+      FROM businesses b
+      LEFT JOIN users u ON b.user_id = u.id
+      LEFT JOIN business_payout_settings ps ON b.id = ps.business_id
+      ORDER BY b.business_name ASC`
     );
 
     res.json({
       success: true,
       data: result.rows.map((row) => ({
-        retailerId: row.retailer_id,
+        businessId: row.business_id,
         businessName: row.business_name,
         email: row.email,
         username: row.username,
@@ -4999,30 +5108,30 @@ router.get("/admin/payout-verifications", isAuthenticated, async (req, res, next
 });
 
 // Get payout history
-router.get("/retailer/payouts", isAuthenticated, async (req, res, next) => {
+router.get("/business/payouts", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can access this" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can access this" });
     }
 
-    const retailerResult = await pool.query(
-      "SELECT id FROM retailers WHERE user_id = $1",
+    const businessResult = await pool.query(
+      "SELECT id FROM businesses WHERE user_id = $1",
       [user.id]
     );
 
-    if (retailerResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    const retailerId = retailerResult.rows[0].id;
+    const businessId = businessResult.rows[0].id;
 
     const result = await pool.query(
       `SELECT * FROM payouts 
-       WHERE retailer_id = $1 
+       WHERE business_id = $1 
        ORDER BY created_at DESC
        LIMIT 50`,
-      [retailerId]
+      [businessId]
     );
 
     res.json({ success: true, data: result.rows });
@@ -5032,28 +5141,28 @@ router.get("/retailer/payouts", isAuthenticated, async (req, res, next) => {
 });
 
 // Request payout
-router.post("/retailer/payouts/request", isAuthenticated, async (req, res, next) => {
+router.post("/business/payouts/request", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can request payouts" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can request payouts" });
     }
 
-    const retailerResult = await pool.query(
-      "SELECT id FROM retailers WHERE user_id = $1",
+    const businessResult = await pool.query(
+      "SELECT id FROM businesses WHERE user_id = $1",
       [user.id]
     );
 
-    if (retailerResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    const retailerId = retailerResult.rows[0].id;
+    const businessId = businessResult.rows[0].id;
 
     // Check payout settings
     const settingsResult = await pool.query(
-      "SELECT * FROM retailer_payout_settings WHERE retailer_id = $1",
-      [retailerId]
+      "SELECT * FROM business_payout_settings WHERE business_id = $1",
+      [businessId]
     );
 
     if (settingsResult.rows.length === 0) {
@@ -5091,29 +5200,29 @@ router.post("/retailer/payouts/request", isAuthenticated, async (req, res, next)
     const amountBase = toBaseCurrency(amount, payoutCurrency);
 
     // Calculate available balance in base currency (GBP):
-    // - use retailer_amount when present (excludes platform commission), fall back to total
+    // - use business_amount when present (excludes platform commission), fall back to total
     // - only count orders that are beyond "pending" and not cancelled
     // - subtract both completed and in-flight payouts to avoid double requesting
     const revenueResult = await pool.query(
-      `SELECT COALESCE(SUM(COALESCE(retailer_amount, total)), 0) AS total_revenue
+      `SELECT COALESCE(SUM(COALESCE(business_amount, total)), 0) AS total_revenue
        FROM orders 
-       WHERE retailer_id = $1 
+       WHERE business_id = $1 
          AND status NOT IN ('cancelled', 'pending')`,
-      [retailerId]
+      [businessId]
     );
 
     const completedPayoutsResult = await pool.query(
       `SELECT COALESCE(SUM(COALESCE(amount_base, amount)), 0) AS total_payouts
        FROM payouts 
-       WHERE retailer_id = $1 AND status = 'completed'`,
-      [retailerId]
+       WHERE business_id = $1 AND status = 'completed'`,
+      [businessId]
     );
 
     const pendingPayoutsResult = await pool.query(
       `SELECT COALESCE(SUM(COALESCE(amount_base, amount)), 0) AS pending_payouts
        FROM payouts 
-       WHERE retailer_id = $1 AND status IN ('pending', 'processing')`,
-      [retailerId]
+       WHERE business_id = $1 AND status IN ('pending', 'processing')`,
+      [businessId]
     );
 
     const totalRevenue = parseFloat(revenueResult.rows[0].total_revenue);
@@ -5130,10 +5239,10 @@ router.post("/retailer/payouts/request", isAuthenticated, async (req, res, next)
 
     // Record payout
     const result = await pool.query(
-      `INSERT INTO payouts (retailer_id, amount, currency, amount_base, payout_method, notes)
+      `INSERT INTO payouts (business_id, amount, currency, amount_base, payout_method, notes)
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING *`,
-      [retailerId, amount, payoutCurrency, amountBase, payoutMethod, notes || null]
+      [businessId, amount, payoutCurrency, amountBase, payoutMethod, notes || null]
     );
 
     const payoutRow = result.rows[0];
@@ -5142,7 +5251,7 @@ router.post("/retailer/payouts/request", isAuthenticated, async (req, res, next)
     // Since we use destination charges, money is already in the connected account
     // We create a payout FROM the connected account (not a transfer TO it)
     console.log("[Payout Request] Processing Stripe payout:", {
-      retailerId: retailerId,
+      businessId: businessId,
       payoutId: payoutRow.id,
       amount: amountBase,
       currency: payoutCurrency,
@@ -5154,12 +5263,12 @@ router.post("/retailer/payouts/request", isAuthenticated, async (req, res, next)
 
     try {
       const result = await stripeService.createPayoutFromConnectedAccount({
-        retailerId,
+        businessId,
         amountBase,
         currency: BASE_CURRENCY,
         metadata: {
           payout_id: payoutRow.id,
-          retailer_id: retailerId,
+          business_id: businessId,
         },
       });
       
@@ -5193,7 +5302,7 @@ router.post("/retailer/payouts/request", isAuthenticated, async (req, res, next)
         error: err.message,
         errorType: err.type,
         errorCode: err.code,
-        retailerId: retailerId,
+        businessId: businessId,
         payoutId: payoutRow.id,
         amount: amountBase,
         currency: payoutCurrency,
@@ -5243,48 +5352,48 @@ router.post("/retailer/payouts/request", isAuthenticated, async (req, res, next)
   }
 });
 
-// Get retailer earnings summary
-router.get("/retailer/earnings", isAuthenticated, async (req, res, next) => {
+// Get business earnings summary
+router.get("/business/earnings", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can access this" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can access this" });
     }
 
-    const retailerResult = await pool.query(
-      "SELECT id FROM retailers WHERE user_id = $1",
+    const businessResult = await pool.query(
+      "SELECT id FROM businesses WHERE user_id = $1",
       [user.id]
     );
 
-    if (retailerResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    const retailerId = retailerResult.rows[0].id;
+    const businessId = businessResult.rows[0].id;
 
-    // Total revenue (net to retailer)
+    // Total revenue (net to business)
     const revenueResult = await pool.query(
-      `SELECT COALESCE(SUM(COALESCE(retailer_amount, total)), 0) AS total_revenue
+      `SELECT COALESCE(SUM(COALESCE(business_amount, total)), 0) AS total_revenue
        FROM orders 
-       WHERE retailer_id = $1 
+       WHERE business_id = $1 
          AND status NOT IN ('cancelled', 'pending')`,
-      [retailerId]
+      [businessId]
     );
 
     // Completed payouts
     const completedPayoutsResult = await pool.query(
       `SELECT COALESCE(SUM(COALESCE(amount_base, amount)), 0) AS total_payouts
        FROM payouts 
-       WHERE retailer_id = $1 AND status = 'completed'`,
-      [retailerId]
+       WHERE business_id = $1 AND status = 'completed'`,
+      [businessId]
     );
 
     // Pending payouts
     const pendingPayoutsResult = await pool.query(
       `SELECT COALESCE(SUM(COALESCE(amount_base, amount)), 0) AS pending_payouts
        FROM payouts 
-       WHERE retailer_id = $1 AND status IN ('pending', 'processing')`,
-      [retailerId]
+       WHERE business_id = $1 AND status IN ('pending', 'processing')`,
+      [businessId]
     );
 
     const totalRevenue = parseFloat(revenueResult.rows[0].total_revenue);
@@ -5306,33 +5415,33 @@ router.get("/retailer/earnings", isAuthenticated, async (req, res, next) => {
   }
 });
 
-// Update retailer banner image
-router.put("/retailer/banner", isAuthenticated, async (req, res, next) => {
+// Update business banner image
+router.put("/business/banner", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can update banner" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can update banner" });
     }
 
     const { bannerImage } = req.body;
 
-    const retailerResult = await pool.query(
-      "SELECT id FROM retailers WHERE user_id = $1",
+    const businessResult = await pool.query(
+      "SELECT id FROM businesses WHERE user_id = $1",
       [user.id]
     );
 
-    if (retailerResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    const retailerId = retailerResult.rows[0].id;
+    const businessId = businessResult.rows[0].id;
 
     const result = await pool.query(
-      `UPDATE retailers 
+      `UPDATE businesses 
        SET banner_image = $1
        WHERE id = $2
        RETURNING *`,
-      [bannerImage || null, retailerId]
+      [bannerImage || null, businessId]
     );
 
     res.json({
@@ -5348,28 +5457,28 @@ router.put("/retailer/banner", isAuthenticated, async (req, res, next) => {
 // ==================== STRIPE CONNECT ====================
 
 // Create Stripe Connect account (legacy) – now a no-op that returns existing mapping
-router.post("/retailer/stripe/connect", isAuthenticated, async (req, res, next) => {
+router.post("/business/stripe/connect", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can connect Stripe" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can connect Stripe" });
     }
 
-    const retailerResult = await pool.query(
-      "SELECT id, business_name FROM retailers WHERE user_id = $1",
+    const businessResult = await pool.query(
+      "SELECT id, business_name FROM businesses WHERE user_id = $1",
       [user.id]
     );
 
-    if (retailerResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    const retailer = retailerResult.rows[0];
+    const business = businessResult.rows[0];
 
     // Check if already connected
     const existing = await pool.query(
-      "SELECT stripe_account_id, charges_enabled, payouts_enabled FROM stripe_connect_accounts WHERE retailer_id = $1",
-      [retailer.id]
+      "SELECT stripe_account_id, charges_enabled, payouts_enabled FROM stripe_connect_accounts WHERE business_id = $1",
+      [business.id]
     );
 
     if (existing.rows.length > 0) {
@@ -5392,29 +5501,34 @@ router.post("/retailer/stripe/connect", isAuthenticated, async (req, res, next) 
   }
 });
 
-// Get Stripe Connect OAuth link (replaces onboarding link)
-router.get("/retailer/stripe/onboarding-link", isAuthenticated, async (req, res, next) => {
+// Get Stripe Connect onboarding link (Express accounts via Account Links)
+// This is the Stripe-recommended approach for marketplaces
+router.get("/business/stripe/onboarding-link", isAuthenticated, async (req, res, next) => {
+  const user = getCurrentUser(req);
+  let business: any = null;
+  let businessId: string | null = null;
+
   try {
-    const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can access this" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can access this" });
     }
 
-    const retailerResult = await pool.query(
-      "SELECT id FROM retailers WHERE user_id = $1",
+    const businessResult = await pool.query(
+      "SELECT id, business_name, address, city, postcode FROM businesses WHERE user_id = $1",
       [user.id]
     );
 
-    if (retailerResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    const retailerId = retailerResult.rows[0].id;
+    business = businessResult.rows[0];
+    businessId = business.id;
 
-    // If already connected, short-circuit
+    // Check if already connected and fully onboarded
     const existing = await pool.query(
-      "SELECT stripe_account_id, charges_enabled, payouts_enabled, details_submitted FROM stripe_connect_accounts WHERE retailer_id = $1",
-      [retailerId]
+      "SELECT stripe_account_id, charges_enabled, payouts_enabled, details_submitted FROM stripe_connect_accounts WHERE business_id = $1",
+      [businessId]
     );
 
     if (existing.rows.length > 0 && existing.rows[0].charges_enabled && existing.rows[0].payouts_enabled) {
@@ -5424,34 +5538,107 @@ router.get("/retailer/stripe/onboarding-link", isAuthenticated, async (req, res,
       });
     }
 
-    // Use BACKEND_URL environment variable for consistent redirect URI
-    // This must match exactly what's registered in Stripe OAuth settings
-    const backendUrl = process.env.BACKEND_URL || process.env.API_URL || `${req.protocol}://${req.get("host")}`;
-    const redirectUri = `${backendUrl}/api/retailer/stripe/oauth/callback`;
-    const state = Buffer.from(JSON.stringify({ retailerId, userId: user.id, ts: Date.now() })).toString("base64");
+    let accountId: string;
 
-    const retailer = retailerResult.rows[0];
-    
-    try {
-      const authorizeUrl = stripeService.getOAuthAuthorizeUrl({
-        retailerId,
-        email: user.email,
-        businessName: retailer.business_name,
-        redirectUri,
-        state,
-      });
-
-      res.json({ success: true, data: { url: authorizeUrl } });
-    } catch (error: any) {
-      // If STRIPE_CLIENT_ID is not set, suggest using manual linking instead
-      if (error.message && error.message.includes("STRIPE_CLIENT_ID")) {
-        return res.status(400).json({
-          success: false,
-          message: "OAuth flow requires STRIPE_CLIENT_ID. For demo/testing, please use the 'Link Test Account Manually' option instead.",
-        });
-      }
-      throw error;
+    // Create Express account if it doesn't exist
+    if (existing.rows.length === 0) {
+      // Determine country from business address (default to GB for UK)
+      // UK postcodes indicate UK business
+      const country = 'GB'; // Localito is UK-focused for MVP
+      
+      const account = await stripeService.createExpressAccount(
+        business.id,
+        user.email,
+        country
+      );
+      accountId = account.id;
+    } else {
+      // Account exists but not fully onboarded - use existing account ID
+      accountId = existing.rows[0].stripe_account_id;
     }
+
+    // Create Account Link for onboarding (Stripe-hosted onboarding flow)
+    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+    
+    const accountLink = await stripeService.createAccountLink(
+      accountId,
+      `${frontendUrl}/business/payouts?stripe=onboarded`, // return_url - where to go after success
+      `${frontendUrl}/business/payouts?stripe=refresh`    // refresh_url - where to go if link expires
+    );
+
+    res.json({ 
+      success: true, 
+      data: { url: accountLink.url } 
+    });
+  } catch (error: any) {
+    console.error("[Stripe Onboarding] Error:", {
+      userId: user?.id,
+      businessId: business?.id,
+      error: error.message,
+      type: error.type,
+      code: error.code,
+    });
+    
+    // Provide user-friendly error messages
+    if (error.message?.includes('account')) {
+      return res.status(400).json({
+        success: false,
+        message: "Failed to set up Stripe account. Please try again or contact support.",
+      });
+    }
+    
+    next(error);
+  }
+});
+
+// Get Express Dashboard login link (for businesses to access their Stripe dashboard)
+router.get("/business/stripe/dashboard-link", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can access this" });
+    }
+
+    const businessResult = await pool.query(
+      "SELECT id FROM businesses WHERE user_id = $1",
+      [user.id]
+    );
+
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
+    }
+
+    const businessId = businessResult.rows[0].id;
+
+    // Get Stripe account ID
+    const accountResult = await pool.query(
+      "SELECT stripe_account_id, charges_enabled, payouts_enabled FROM stripe_connect_accounts WHERE business_id = $1",
+      [businessId]
+    );
+
+    if (accountResult.rows.length === 0 || !accountResult.rows[0].stripe_account_id) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "Stripe account not found. Please complete onboarding first." 
+      });
+    }
+
+    const stripeAccount = accountResult.rows[0];
+
+    // Check if account is fully onboarded
+    if (!stripeAccount.charges_enabled || !stripeAccount.payouts_enabled) {
+      return res.status(400).json({
+        success: false,
+        message: "Please complete Stripe onboarding before accessing the dashboard.",
+      });
+    }
+
+    const loginLink = await stripeService.createExpressDashboardLoginLink(stripeAccount.stripe_account_id);
+
+    res.json({ 
+      success: true, 
+      data: { url: loginLink.url } 
+    });
   } catch (error) {
     next(error);
   }
@@ -5469,7 +5656,7 @@ router.get("/stripe/success", async (req, res) => {
     // Note: Payment verification is handled by Stripe webhook
     // This endpoint just redirects to the appropriate page
 
-    // Check if there are more orders to pay for (multi-retailer scenario)
+    // Check if there are more orders to pay for (multi-business scenario)
     // We'll pass this info to the frontend so it can handle sequential payments
     const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
     
@@ -5610,7 +5797,7 @@ router.get("/stripe/success", async (req, res) => {
 });
 
 // OAuth callback for Stripe Connect
-router.get("/retailer/stripe/oauth/callback", async (req, res) => {
+router.get("/business/stripe/oauth/callback", async (req, res) => {
   try {
     const { code, state, error, error_description } = req.query as Record<string, string | undefined>;
 
@@ -5623,16 +5810,16 @@ router.get("/retailer/stripe/oauth/callback", async (req, res) => {
     }
 
     const parsedState = JSON.parse(Buffer.from(state, "base64").toString());
-    const retailerId = parsedState?.retailerId as string;
-    if (!retailerId) {
+    const businessId = parsedState?.businessId as string;
+    if (!businessId) {
       return res.status(400).send("Invalid state");
     }
 
-    const account = await stripeService.exchangeOAuthCode(code, retailerId);
+    const account = await stripeService.exchangeOAuthCode(code, businessId);
 
     // Redirect back to frontend payouts page with status
     const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
-    const redirectUrl = `${frontendUrl}/retailer/payouts?stripe=connected&acct=${account.id}`;
+    const redirectUrl = `${frontendUrl}/business/payouts?stripe=connected&acct=${account.id}`;
     return res.redirect(302, redirectUrl);
   } catch (err: any) {
     console.error("Stripe OAuth callback error:", err?.message || err);
@@ -5642,11 +5829,11 @@ router.get("/retailer/stripe/oauth/callback", async (req, res) => {
 
 // Get Stripe account status
 // Manually link Stripe Connect account (for test accounts/demo)
-router.post("/retailer/stripe/link-account", isAuthenticated, async (req, res, next) => {
+router.post("/business/stripe/link-account", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can link Stripe accounts" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can link Stripe accounts" });
     }
 
     const { accountId, secretKey } = req.body;
@@ -5660,19 +5847,19 @@ router.post("/retailer/stripe/link-account", isAuthenticated, async (req, res, n
       return res.status(400).json({ success: false, message: "Stripe secret key must be a string if provided" });
     }
 
-    const retailerResult = await pool.query(
-      "SELECT id FROM retailers WHERE user_id = $1",
+    const businessResult = await pool.query(
+      "SELECT id FROM businesses WHERE user_id = $1",
       [user.id]
     );
 
-    if (retailerResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    const retailerId = retailerResult.rows[0].id;
+    const businessId = businessResult.rows[0].id;
 
     // Link the account (with optional secret key)
-    const account = await stripeService.linkStripeAccountManually(retailerId, accountId, secretKey);
+    const account = await stripeService.linkStripeAccountManually(businessId, accountId, secretKey);
 
     res.json({
       success: true,
@@ -5693,23 +5880,82 @@ router.post("/retailer/stripe/link-account", isAuthenticated, async (req, res, n
   }
 });
 
-router.get("/retailer/stripe/status", isAuthenticated, async (req, res, next) => {
+// Business: Get commission tier and turnover information
+router.get("/business/commission-tier", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user || user.role !== "retailer") {
-      return res.status(403).json({ success: false, message: "Only retailers can access this" });
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can access this" });
     }
 
-    const retailerResult = await pool.query(
-      "SELECT id FROM retailers WHERE user_id = $1",
+    const businessResult = await pool.query(
+      "SELECT id FROM businesses WHERE user_id = $1",
       [user.id]
     );
 
-    if (retailerResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer profile not found" });
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business not found" });
     }
 
-    const status = await stripeService.getAccountStatus(retailerResult.rows[0].id);
+    const businessId = businessResult.rows[0].id;
+    const { tier, turnover } = await stripeService.getCommissionTierForBusiness(businessId);
+
+    // Get next tier information
+    const currentTierIndex = COMMISSION_TIERS.findIndex(t => t.name === tier.name);
+    const nextTier = currentTierIndex < COMMISSION_TIERS.length - 1 
+      ? COMMISSION_TIERS[currentTierIndex + 1] 
+      : null;
+
+    const turnoverToNextTier = nextTier 
+      ? Math.max(0, nextTier.minTurnover - turnover)
+      : null;
+
+    res.json({
+      success: true,
+      data: {
+        currentTier: {
+          name: tier.name,
+          commissionRate: tier.commissionRate,
+          commissionPercentage: (tier.commissionRate * 100).toFixed(1),
+          minTurnover: tier.minTurnover,
+          maxTurnover: tier.maxTurnover,
+        },
+        turnover: {
+          current: turnover,
+          period: "30-day rolling",
+          currency: "GBP",
+        },
+        nextTier: nextTier ? {
+          name: nextTier.name,
+          commissionRate: nextTier.commissionRate,
+          commissionPercentage: (nextTier.commissionRate * 100).toFixed(1),
+          minTurnover: nextTier.minTurnover,
+          turnoverNeeded: turnoverToNextTier,
+        } : null,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/business/stripe/status", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can access this" });
+    }
+
+    const businessResult = await pool.query(
+      "SELECT id FROM businesses WHERE user_id = $1",
+      [user.id]
+    );
+
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
+    }
+
+    const status = await stripeService.getAccountStatus(businessResult.rows[0].id);
 
     res.json({ success: true, data: status });
   } catch (error) {
@@ -5849,20 +6095,20 @@ router.get("/admin/discount-codes", isAuthenticated, async (req, res, next) => {
   }
 });
 
-// Get retailer user ID by retailer ID (for starting chats)
-router.get("/retailer/:retailerId/user", async (req, res, next) => {
+// Get business user ID by business ID (for starting chats)
+router.get("/business/:businessId/user", async (req, res, next) => {
   try {
-    const { retailerId } = req.params;
+    const { businessId } = req.params;
     
     const result = await pool.query(
       `SELECT user_id, business_name 
-       FROM retailers 
+       FROM businesses 
        WHERE id = $1 AND is_approved = true`,
-      [retailerId]
+      [businessId]
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Retailer not found" });
+      return res.status(404).json({ success: false, message: "Business not found" });
     }
 
     res.json({

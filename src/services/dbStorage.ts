@@ -1,4 +1,4 @@
-import { type User, type InsertUser, type Retailer } from "../../shared/schema";
+import { type User, type InsertUser, type Business } from "../../shared/schema";
 import { pool } from "../db/connection";
 import bcrypt from "bcrypt";
 import { geocodingService } from "./geocodingService";
@@ -89,11 +89,11 @@ export class DbStorage {
 
     const row = result.rows[0];
     
-    // If user is a retailer, create retailer record with provided data
-    if (row.role === "retailer") {
-      const retailerData = insertUser.retailerData;
-      if (!retailerData) {
-        throw new Error("Retailer data is required for retailer signup");
+    // If user is a business, create business record with provided data
+    if (row.role === "business") {
+      const businessData = insertUser.businessData;
+      if (!businessData) {
+        throw new Error("Business data is required for business signup");
       }
 
       // Geocode the address to get latitude and longitude
@@ -101,56 +101,56 @@ export class DbStorage {
       let longitude: number | null = null;
 
       try {
-        console.log(`[Retailer Signup] Starting geocoding for: ${retailerData.businessName}`);
-        console.log(`[Retailer Signup] Address data:`, {
-          businessAddress: retailerData.businessAddress,
-          postcode: retailerData.postcode,
-          city: retailerData.city,
+        console.log(`[Business Signup] Starting geocoding for: ${businessData.businessName}`);
+        console.log(`[Business Signup] Address data:`, {
+          businessAddress: businessData.businessAddress,
+          postcode: businessData.postcode,
+          city: businessData.city,
         });
 
         // Build full address for geocoding
         const addressParts: string[] = [];
-        if (retailerData.businessAddress) addressParts.push(retailerData.businessAddress);
-        if (retailerData.postcode) addressParts.push(retailerData.postcode);
-        if (retailerData.city) addressParts.push(retailerData.city);
+        if (businessData.businessAddress) addressParts.push(businessData.businessAddress);
+        if (businessData.postcode) addressParts.push(businessData.postcode);
+        if (businessData.city) addressParts.push(businessData.city);
 
         const fullAddress = addressParts.length > 0 ? addressParts.join(", ") : undefined;
         
-        if (!fullAddress && !retailerData.postcode && !retailerData.city) {
-          console.warn(`[Retailer Signup] No address data provided for geocoding: ${retailerData.businessName}`);
+        if (!fullAddress && !businessData.postcode && !businessData.city) {
+          console.warn(`[Business Signup] No address data provided for geocoding: ${businessData.businessName}`);
         } else {
           const geocodeResult = await geocodingService.geocodeAddress(
-            retailerData.postcode,
-            retailerData.city,
+            businessData.postcode,
+            businessData.city,
             fullAddress
           );
 
           if (geocodeResult) {
             latitude = geocodeResult.latitude;
             longitude = geocodeResult.longitude;
-            console.log(`[Retailer Signup] ✓ Successfully geocoded ${retailerData.businessName}: ${latitude}, ${longitude}`);
+            console.log(`[Business Signup] ✓ Successfully geocoded ${businessData.businessName}: ${latitude}, ${longitude}`);
           } else {
-            console.warn(`[Retailer Signup] ✗ Failed to geocode address for ${retailerData.businessName}`);
-            console.warn(`[Retailer Signup] Retailer will be created without coordinates`);
+            console.warn(`[Business Signup] ✗ Failed to geocode address for ${businessData.businessName}`);
+            console.warn(`[Business Signup] Business will be created without coordinates`);
           }
         }
       } catch (error: any) {
-        console.error("[Retailer Signup] Error during geocoding:", error);
-        console.error("[Retailer Signup] Error details:", error?.message);
-        console.error("[Retailer Signup] Error stack:", error?.stack);
+        console.error("[Business Signup] Error during geocoding:", error);
+        console.error("[Business Signup] Error details:", error?.message);
+        console.error("[Business Signup] Error stack:", error?.stack);
         // Continue without coordinates - not critical for signup
       }
 
       await pool.query(
-        `INSERT INTO retailers (user_id, business_name, business_address, postcode, city, phone, latitude, longitude, is_approved) 
+        `INSERT INTO businesses (user_id, business_name, business_address, postcode, city, phone, latitude, longitude, is_approved) 
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
         [
           row.id,
-          retailerData.businessName,
-          retailerData.businessAddress || null,
-          retailerData.postcode || null,
-          retailerData.city || null,
-          retailerData.phone || null,
+          businessData.businessName,
+          businessData.businessAddress || null,
+          businessData.postcode || null,
+          businessData.city || null,
+          businessData.phone || null,
           latitude,
           longitude,
           false
@@ -234,11 +234,11 @@ export class DbStorage {
 
     const row = result.rows[0];
     
-    // If user is a retailer, create a minimal retailer record
-    // Note: Business details will need to be completed later via retailer settings
-    if (row.role === "retailer") {
+    // If user is a business, create a minimal business record
+    // Note: Business details will need to be completed later via business settings
+    if (row.role === "business") {
       await pool.query(
-        `INSERT INTO retailers (user_id, business_name, is_approved) 
+        `INSERT INTO businesses (user_id, business_name, is_approved) 
          VALUES ($1, $2, $3)`,
         [
           row.id,

@@ -12,7 +12,7 @@ const CACHE_TTL = parseInt(process.env.SQUARE_STOCK_SYNC_CACHE_TTL || "60") * 10
 
 export class SquareService {
   /**
-   * Get Square client instance for a retailer
+   * Get Square client instance for a business
    */
   private getClient(accessToken: string, environment: SquareEnvironment = SquareEnvironment.Production): SquareClient {
     return new SquareClient({
@@ -81,11 +81,11 @@ export class SquareService {
    */
   async syncProductStock(productId: string): Promise<{ success: boolean; stock: number | null; error?: string }> {
     try {
-      // Get product with retailer info
+      // Get product with business info
       const productResult = await pool.query(
-        `SELECT p.id, p.square_item_id, p.sync_from_epos, r.square_access_token, r.square_location_id, r.square_sync_enabled
+        `SELECT p.id, p.square_item_id, p.sync_from_epos, b.square_access_token, b.square_location_id, b.square_sync_enabled
          FROM products p
-         JOIN retailers r ON p.retailer_id = r.id
+         JOIN businesses b ON p.business_id = b.id
          WHERE p.id = $1`,
         [productId]
       );
@@ -106,7 +106,7 @@ export class SquareService {
       }
 
       if (!product.square_access_token || !product.square_location_id) {
-        return { success: false, stock: null, error: "Retailer Square connection not configured" };
+        return { success: false, stock: null, error: "Business Square connection not configured" };
       }
 
       // Fetch stock from Square

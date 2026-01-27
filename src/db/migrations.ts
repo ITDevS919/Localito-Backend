@@ -11,7 +11,7 @@ export async function runMigrations() {
         username VARCHAR(255) UNIQUE NOT NULL,
         email VARCHAR(255) UNIQUE NOT NULL,
         password VARCHAR(255) NOT NULL,
-        role VARCHAR(20) NOT NULL DEFAULT 'customer' CHECK (role IN ('customer', 'retailer', 'admin')),
+        role VARCHAR(20) NOT NULL DEFAULT 'customer' CHECK (role IN ('customer', 'business', 'admin')),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
@@ -23,7 +23,7 @@ export async function runMigrations() {
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
                       WHERE table_name='users' AND column_name='role') THEN
           ALTER TABLE users ADD COLUMN role VARCHAR(20) NOT NULL DEFAULT 'customer' 
-          CHECK (role IN ('customer', 'retailer', 'admin'));
+          CHECK (role IN ('customer', 'business', 'admin'));
         END IF;
       END $$;
     `);
@@ -39,9 +39,9 @@ export async function runMigrations() {
       END $$;
     `);
 
-    // Create retailers table
+    // Create businesses table
     await client.query(`
-      CREATE TABLE IF NOT EXISTS retailers (
+      CREATE TABLE IF NOT EXISTS businesses (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         business_name VARCHAR(255) NOT NULL,
@@ -62,43 +62,43 @@ export async function runMigrations() {
       DO $$ 
       BEGIN
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                      WHERE table_name='retailers' AND column_name='postcode') THEN
-          ALTER TABLE retailers ADD COLUMN postcode VARCHAR(20);
+                      WHERE table_name='businesses' AND column_name='postcode') THEN
+          ALTER TABLE businesses ADD COLUMN postcode VARCHAR(20);
         END IF;
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                      WHERE table_name='retailers' AND column_name='city') THEN
-          ALTER TABLE retailers ADD COLUMN city VARCHAR(100);
+                      WHERE table_name='businesses' AND column_name='city') THEN
+          ALTER TABLE businesses ADD COLUMN city VARCHAR(100);
         END IF;
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                      WHERE table_name='retailers' AND column_name='latitude') THEN
-          ALTER TABLE retailers ADD COLUMN latitude DECIMAL(10, 8);
+                      WHERE table_name='businesses' AND column_name='latitude') THEN
+          ALTER TABLE businesses ADD COLUMN latitude DECIMAL(10, 8);
         END IF;
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                      WHERE table_name='retailers' AND column_name='longitude') THEN
-          ALTER TABLE retailers ADD COLUMN longitude DECIMAL(11, 8);
+                      WHERE table_name='businesses' AND column_name='longitude') THEN
+          ALTER TABLE businesses ADD COLUMN longitude DECIMAL(11, 8);
         END IF;
       END $$;
     `);
 
-    // Add Square integration fields to retailers table
+    // Add Square integration fields to businesses table
     await client.query(`
       DO $$ 
       BEGIN
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                      WHERE table_name='retailers' AND column_name='square_access_token') THEN
-          ALTER TABLE retailers ADD COLUMN square_access_token VARCHAR(255);
+                      WHERE table_name='businesses' AND column_name='square_access_token') THEN
+          ALTER TABLE businesses ADD COLUMN square_access_token VARCHAR(255);
         END IF;
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                      WHERE table_name='retailers' AND column_name='square_location_id') THEN
-          ALTER TABLE retailers ADD COLUMN square_location_id VARCHAR(255);
+                      WHERE table_name='businesses' AND column_name='square_location_id') THEN
+          ALTER TABLE businesses ADD COLUMN square_location_id VARCHAR(255);
         END IF;
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                      WHERE table_name='retailers' AND column_name='square_connected_at') THEN
-          ALTER TABLE retailers ADD COLUMN square_connected_at TIMESTAMP;
+                      WHERE table_name='businesses' AND column_name='square_connected_at') THEN
+          ALTER TABLE businesses ADD COLUMN square_connected_at TIMESTAMP;
         END IF;
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                      WHERE table_name='retailers' AND column_name='square_sync_enabled') THEN
-          ALTER TABLE retailers ADD COLUMN square_sync_enabled BOOLEAN DEFAULT FALSE;
+                      WHERE table_name='businesses' AND column_name='square_sync_enabled') THEN
+          ALTER TABLE businesses ADD COLUMN square_sync_enabled BOOLEAN DEFAULT FALSE;
         END IF;
       END $$;
     `);
@@ -107,7 +107,7 @@ export async function runMigrations() {
     await client.query(`
       CREATE TABLE IF NOT EXISTS products (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        retailer_id UUID NOT NULL REFERENCES retailers(id) ON DELETE CASCADE,
+        business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
         name VARCHAR(255) NOT NULL,
         description TEXT,
         price DECIMAL(10, 2) NOT NULL CHECK (price >= 0),
@@ -137,7 +137,7 @@ export async function runMigrations() {
       CREATE TABLE IF NOT EXISTS orders (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        retailer_id UUID NOT NULL REFERENCES retailers(id) ON DELETE CASCADE,
+        business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
         status VARCHAR(20) NOT NULL DEFAULT 'pending' 
         CHECK (status IN ('awaiting_payment', 'pending', 'processing', 'shipped', 'delivered', 'cancelled', 'ready_for_pickup', 'picked_up')),
         total DECIMAL(10, 2) NOT NULL CHECK (total >= 0),
@@ -236,7 +236,7 @@ export async function runMigrations() {
     await client.query(`
       CREATE TABLE IF NOT EXISTS stripe_connect_accounts (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        retailer_id UUID NOT NULL UNIQUE REFERENCES retailers(id) ON DELETE CASCADE,
+        business_id UUID NOT NULL UNIQUE REFERENCES businesses(id) ON DELETE CASCADE,
         stripe_account_id VARCHAR(255) NOT NULL UNIQUE,
         stripe_secret_key TEXT,
         onboarding_completed BOOLEAN DEFAULT FALSE,
@@ -256,7 +256,7 @@ export async function runMigrations() {
 
     // Create indexes
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_stripe_connect_accounts_retailer_id ON stripe_connect_accounts(retailer_id)
+      CREATE INDEX IF NOT EXISTS idx_stripe_connect_accounts_business_id ON stripe_connect_accounts(business_id)
     `);
 
     await client.query(`
@@ -277,23 +277,23 @@ export async function runMigrations() {
     `);
 
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_retailers_user_id ON retailers(user_id)
+      CREATE INDEX IF NOT EXISTS idx_businesses_user_id ON businesses(user_id)
     `);
 
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_retailers_postcode ON retailers(postcode)
+      CREATE INDEX IF NOT EXISTS idx_businesses_postcode ON businesses(postcode)
     `);
 
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_retailers_city ON retailers(city)
+      CREATE INDEX IF NOT EXISTS idx_businesses_city ON businesses(city)
     `);
 
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_retailers_location ON retailers(latitude, longitude)
+      CREATE INDEX IF NOT EXISTS idx_businesses_location ON businesses(latitude, longitude)
     `);
 
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_products_retailer_id ON products(retailer_id)
+      CREATE INDEX IF NOT EXISTS idx_products_business_id ON products(business_id)
     `);
 
     await client.query(`
@@ -309,7 +309,7 @@ export async function runMigrations() {
     `);
 
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_orders_retailer_id ON orders(retailer_id)
+      CREATE INDEX IF NOT EXISTS idx_orders_business_id ON orders(business_id)
     `);
 
     await client.query(`
@@ -475,11 +475,11 @@ export async function runMigrations() {
       CREATE INDEX IF NOT EXISTS idx_wishlist_product_id ON wishlist_items(product_id)
     `);
         
-    // Create retailer_posts table
+    // Create business_posts table
     await client.query(`
-      CREATE TABLE IF NOT EXISTS retailer_posts (
+      CREATE TABLE IF NOT EXISTS business_posts (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        retailer_id UUID NOT NULL REFERENCES retailers(id) ON DELETE CASCADE,
+        business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
         content TEXT NOT NULL,
         images TEXT[] DEFAULT ARRAY[]::TEXT[],
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -487,78 +487,78 @@ export async function runMigrations() {
       )
     `);
 
-    // Create retailer_followers table
+    // Create business_followers table
     await client.query(`
-      CREATE TABLE IF NOT EXISTS retailer_followers (
+      CREATE TABLE IF NOT EXISTS business_followers (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        retailer_id UUID NOT NULL REFERENCES retailers(id) ON DELETE CASCADE,
+        business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
         user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(retailer_id, user_id)
+        UNIQUE(business_id, user_id)
       )
     `);
 
-    // Add banner_image to retailers table
+    // Add banner_image to businesses table
     await client.query(`
       DO $$ 
       BEGIN
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                      WHERE table_name='retailers' AND column_name='banner_image') THEN
-          ALTER TABLE retailers ADD COLUMN banner_image TEXT;
+                      WHERE table_name='businesses' AND column_name='banner_image') THEN
+          ALTER TABLE businesses ADD COLUMN banner_image TEXT;
         END IF;
       END $$;
     `);
 
-    // Add same-day pickup cutoff fields to retailers table
+    // Add same-day pickup cutoff fields to businesses table
     await client.query(`
       DO $$ 
       BEGIN
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                      WHERE table_name='retailers' AND column_name='same_day_pickup_allowed') THEN
-          ALTER TABLE retailers ADD COLUMN same_day_pickup_allowed BOOLEAN DEFAULT TRUE;
+                      WHERE table_name='businesses' AND column_name='same_day_pickup_allowed') THEN
+          ALTER TABLE businesses ADD COLUMN same_day_pickup_allowed BOOLEAN DEFAULT TRUE;
         END IF;
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                      WHERE table_name='retailers' AND column_name='cutoff_time') THEN
-          ALTER TABLE retailers ADD COLUMN cutoff_time TIME;
+                      WHERE table_name='businesses' AND column_name='cutoff_time') THEN
+          ALTER TABLE businesses ADD COLUMN cutoff_time TIME;
         END IF;
       END $$;
     `);
 
-    // Add retailer billing columns for per-retailer commission and trial periods
+    // Add business billing columns for per-business commission and trial periods
     await client.query(`
       DO $$ 
       BEGIN
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                      WHERE table_name='retailers' AND column_name='commission_rate_override') THEN
-          ALTER TABLE retailers ADD COLUMN commission_rate_override DECIMAL(5,4) NULL;
+                      WHERE table_name='businesses' AND column_name='commission_rate_override') THEN
+          ALTER TABLE businesses ADD COLUMN commission_rate_override DECIMAL(5,4) NULL;
         END IF;
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                      WHERE table_name='retailers' AND column_name='trial_starts_at') THEN
-          ALTER TABLE retailers ADD COLUMN trial_starts_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                      WHERE table_name='businesses' AND column_name='trial_starts_at') THEN
+          ALTER TABLE businesses ADD COLUMN trial_starts_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
         END IF;
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                      WHERE table_name='retailers' AND column_name='trial_ends_at') THEN
-          ALTER TABLE retailers ADD COLUMN trial_ends_at TIMESTAMP NULL;
+                      WHERE table_name='businesses' AND column_name='trial_ends_at') THEN
+          ALTER TABLE businesses ADD COLUMN trial_ends_at TIMESTAMP NULL;
         END IF;
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                      WHERE table_name='retailers' AND column_name='billing_status') THEN
-          ALTER TABLE retailers ADD COLUMN billing_status VARCHAR(20) DEFAULT 'trial' 
+                      WHERE table_name='businesses' AND column_name='billing_status') THEN
+          ALTER TABLE businesses ADD COLUMN billing_status VARCHAR(20) DEFAULT 'trial' 
             CHECK (billing_status IN ('trial', 'active', 'suspended'));
         END IF;
       END $$;
     `);
 
-    // Create retailer_payout_settings table
+    // Create business_payout_settings table
     await client.query(`
-      CREATE TABLE IF NOT EXISTS retailer_payout_settings (
+      CREATE TABLE IF NOT EXISTS business_payout_settings (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        retailer_id UUID NOT NULL REFERENCES retailers(id) ON DELETE CASCADE,
+        business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
         payout_method VARCHAR(50) NOT NULL CHECK (payout_method IN ('bank', 'paypal', 'stripe')),
         account_details JSONB,
         is_verified BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(retailer_id)
+        UNIQUE(business_id)
       )
     `);
 
@@ -566,7 +566,7 @@ export async function runMigrations() {
     await client.query(`
       CREATE TABLE IF NOT EXISTS payouts (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        retailer_id UUID NOT NULL REFERENCES retailers(id) ON DELETE CASCADE,
+        business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
         amount DECIMAL(10, 2) NOT NULL CHECK (amount > 0),
         currency VARCHAR(10) NOT NULL DEFAULT 'GBP',
         amount_base DECIMAL(10, 2) NOT NULL DEFAULT 0,
@@ -611,23 +611,23 @@ export async function runMigrations() {
 
     // Create indexes
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_retailer_posts_retailer_id ON retailer_posts(retailer_id)
+      CREATE INDEX IF NOT EXISTS idx_business_posts_business_id ON business_posts(business_id)
     `);
 
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_retailer_posts_created_at ON retailer_posts(created_at DESC)
+      CREATE INDEX IF NOT EXISTS idx_business_posts_created_at ON business_posts(created_at DESC)
     `);
 
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_retailer_followers_retailer_id ON retailer_followers(retailer_id)
+      CREATE INDEX IF NOT EXISTS idx_business_followers_business_id ON business_followers(business_id)
     `);
 
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_retailer_followers_user_id ON retailer_followers(user_id)
+      CREATE INDEX IF NOT EXISTS idx_business_followers_user_id ON business_followers(user_id)
     `);
 
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_payouts_retailer_id ON payouts(retailer_id)
+      CREATE INDEX IF NOT EXISTS idx_payouts_business_id ON payouts(business_id)
     `);
 
     await client.query(`
@@ -665,8 +665,13 @@ export async function runMigrations() {
           ALTER TABLE orders ADD COLUMN platform_commission DECIMAL(10, 2);
         END IF;
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                      WHERE table_name='orders' AND column_name='retailer_amount') THEN
-          ALTER TABLE orders ADD COLUMN retailer_amount DECIMAL(10, 2);
+                      WHERE table_name='orders' AND column_name='business_amount') THEN
+          IF EXISTS (SELECT 1 FROM information_schema.columns 
+                     WHERE table_name='orders' AND column_name='retailer_amount') THEN
+            ALTER TABLE orders RENAME COLUMN retailer_amount TO business_amount;
+          ELSE
+            ALTER TABLE orders ADD COLUMN business_amount DECIMAL(10, 2);
+          END IF;
         END IF;
       END $$;
     `);
@@ -796,14 +801,18 @@ export async function runMigrations() {
     // Insert default categories if they don't exist
     await client.query(`
       INSERT INTO categories (name, description) VALUES
-      ('Electronics', 'Electronic devices and accessories'),
-      ('Clothing', 'Apparel and fashion items'),
-      ('Food & Beverages', 'Food and drink products'),
-      ('Home & Garden', 'Home improvement and garden supplies'),
-      ('Sports & Outdoors', 'Sports equipment and outdoor gear'),
-      ('Books', 'Books and reading materials'),
-      ('Toys & Games', 'Toys and games for all ages'),
-      ('Health & Beauty', 'Health and beauty products')
+      ('Food & Drink', 'Restaurants, bakeries, cafés, takeaways, delis, butchers, greengrocers, specialty grocers, off‑licences'),
+      ('Health & Beauty', 'Pharmacies, barbers, salons, cosmetics, skincare, health foods'),
+      ('Fashion & Accessories', 'Clothing, shoes, vintage, jewellery, bags, streetwear'),
+      ('Home & Living', 'Homeware, furniture, kitchenware, decor, plants, DIY, hardware'),
+      ('Electronics & Tech', 'Phones, computers, audio, gaming, repairs'),
+      ('Books, Music & Hobbies', 'Bookshops, records, games/comics, arts & crafts, instruments'),
+      ('Kids & Family', 'Toys, baby stores, childrenswear, family gift shops'),
+      ('Sports & Outdoors', 'Sportswear, equipment, bikes, camping/outdoor'),
+      ('Gifts, Flowers & Stationery', 'Florists, gift shops, cards, stationery, party supplies'),
+      ('Pets', 'Pet shops, pet food, accessories, groomers'),
+      ('Services', 'Tailors, cobblers, dry cleaners, printing, key cutting, repairs'),
+      ('Other', 'Catch‑all if nothing fits; you can review and refine later')
       ON CONFLICT (name) DO NOTHING
     `);
 
@@ -824,7 +833,7 @@ export async function runMigrations() {
     await client.query(`
       CREATE TABLE IF NOT EXISTS services (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        retailer_id UUID NOT NULL REFERENCES retailers(id) ON DELETE CASCADE,
+        business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
         name VARCHAR(255) NOT NULL,
         description TEXT,
         price DECIMAL(10, 2) NOT NULL CHECK (price >= 0),
@@ -868,26 +877,26 @@ export async function runMigrations() {
       )
     `);
 
-    // Create retailer_availability_schedules table (weekly schedule)
+    // Create business_availability_schedules table (weekly schedule)
     await client.query(`
-      CREATE TABLE IF NOT EXISTS retailer_availability_schedules (
+      CREATE TABLE IF NOT EXISTS business_availability_schedules (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        retailer_id UUID NOT NULL REFERENCES retailers(id) ON DELETE CASCADE,
+        business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
         day_of_week INTEGER NOT NULL CHECK (day_of_week >= 0 AND day_of_week <= 6),
         start_time TIME NOT NULL,
         end_time TIME NOT NULL,
         is_available BOOLEAN DEFAULT TRUE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(retailer_id, day_of_week)
+        UNIQUE(business_id, day_of_week)
       )
     `);
 
-    // Create retailer_availability_blocks table (blocked dates/times)
+    // Create business_availability_blocks table (blocked dates/times)
     await client.query(`
-      CREATE TABLE IF NOT EXISTS retailer_availability_blocks (
+      CREATE TABLE IF NOT EXISTS business_availability_blocks (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        retailer_id UUID NOT NULL REFERENCES retailers(id) ON DELETE CASCADE,
+        business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
         block_date DATE NOT NULL,
         start_time TIME,
         end_time TIME,
@@ -934,19 +943,19 @@ export async function runMigrations() {
     await client.query(`
       CREATE TABLE IF NOT EXISTS booking_locks (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        retailer_id UUID NOT NULL REFERENCES retailers(id) ON DELETE CASCADE,
+        business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
         booking_date DATE NOT NULL,
         booking_time TIME NOT NULL,
         locked_by UUID REFERENCES users(id) ON DELETE CASCADE,
         expires_at TIMESTAMP NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(retailer_id, booking_date, booking_time)
+        UNIQUE(business_id, booking_date, booking_time)
       )
     `);
 
     // Create indexes for services and booking
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_services_retailer_id ON services(retailer_id)
+      CREATE INDEX IF NOT EXISTS idx_services_business_id ON services(business_id)
     `);
 
     await client.query(`
@@ -970,23 +979,23 @@ export async function runMigrations() {
     `);
 
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_retailer_availability_schedules_retailer_id 
-        ON retailer_availability_schedules(retailer_id)
+      CREATE INDEX IF NOT EXISTS idx_business_availability_schedules_business_id 
+        ON business_availability_schedules(business_id)
     `);
 
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_retailer_availability_blocks_retailer_date 
-        ON retailer_availability_blocks(retailer_id, block_date)
+      CREATE INDEX IF NOT EXISTS idx_business_availability_blocks_business_date 
+        ON business_availability_blocks(business_id, block_date)
     `);
 
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_booking_locks_retailer_date_time 
-        ON booking_locks(retailer_id, booking_date, booking_time)
+      CREATE INDEX IF NOT EXISTS idx_booking_locks_business_date_time 
+        ON booking_locks(business_id, booking_date, booking_time)
     `);
 
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_orders_booking_date_time 
-        ON orders(retailer_id, booking_date, booking_time) 
+        ON orders(business_id, booking_date, booking_time) 
         WHERE booking_date IS NOT NULL
     `);
 

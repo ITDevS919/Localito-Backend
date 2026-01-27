@@ -66,13 +66,20 @@ npm install
    GOOGLE_CLIENT_ID=your-google-client-id.apps.googleusercontent.com
    GOOGLE_CLIENT_SECRET=your-google-client-secret
    GOOGLE_CALLBACK_URL=http://localhost:5000/api/auth/google/callback
+   
+   # Google OAuth for Mobile Apps (Expo AuthSession)
+   # Use WEB Client ID (same as web applications)
+   # Expo AuthSession uses browser-based OAuth, not native SDKs
+   # The Google provider handles redirect URI automatically
+   # Make sure to register the redirect URI in Google Cloud Console
+   GOOGLE_CLIENT_ID_MOBILE=your-web-client-id.apps.googleusercontent.com
    ```
 
    Adjust the database configuration (`DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`) to match your PostgreSQL setup.
 
    **Important for Stripe OAuth:**
    - `BACKEND_URL` must be set to your backend server URL (e.g., `http://localhost:5000` or `https://api.yourdomain.com`)
-   - The redirect URI `{BACKEND_URL}/api/retailer/stripe/oauth/callback` must be registered in your Stripe OAuth application settings
+   - The redirect URI `{BACKEND_URL}/api/business/stripe/oauth/callback` must be registered in your Stripe OAuth application settings
    - Go to Stripe Dashboard → Developers → OAuth → Your OAuth App → Redirect URLs and add the exact URL
 
 ## Development

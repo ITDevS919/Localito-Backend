@@ -14,14 +14,14 @@ export interface AvailabilitySchedule {
 }
 
 export class AvailabilityService {
-  // Get weekly schedule for a retailer
-  async getWeeklySchedule(retailerId: string): Promise<AvailabilitySchedule[]> {
+  // Get weekly schedule for a business
+  async getWeeklySchedule(businessId: string): Promise<AvailabilitySchedule[]> {
     const result = await pool.query(
       `SELECT day_of_week, start_time, end_time, is_available
-       FROM retailer_availability_schedules
-       WHERE retailer_id = $1
+       FROM business_availability_schedules
+       WHERE business_id = $1
        ORDER BY day_of_week`,
-      [retailerId]
+      [businessId]
     );
     return result.rows.map(row => ({
       dayOfWeek: row.day_of_week,
@@ -33,7 +33,7 @@ export class AvailabilityService {
 
   // Get available time slots for a date range
   async getAvailableSlots(
-    retailerId: string,
+    businessId: string,
     startDate: Date,
     endDate: Date,
     durationMinutes: number = 60,
@@ -43,32 +43,32 @@ export class AvailabilityService {
     const currentDate = new Date(startDate);
     
     // Get weekly schedule
-    const schedule = await this.getWeeklySchedule(retailerId);
+    const schedule = await this.getWeeklySchedule(businessId);
     
-    // If no schedule exists, return empty array (retailer needs to set up availability)
+    // If no schedule exists, return empty array (business needs to set up availability)
     if (schedule.length === 0) {
       return slots;
     }
     
-    // Get retailer cutoff settings
-    const retailerResult = await pool.query(
-      `SELECT same_day_pickup_allowed, cutoff_time FROM retailers WHERE id = $1`,
-      [retailerId]
+    // Get business cutoff settings
+    const businessResult = await pool.query(
+      `SELECT same_day_pickup_allowed, cutoff_time FROM businesses WHERE id = $1`,
+      [businessId]
     );
-    const retailer = retailerResult.rows[0];
-    const sameDayPickupAllowed = retailer?.same_day_pickup_allowed !== false; // Default to true
-    const cutoffTime = retailer?.cutoff_time; // Format: HH:MM:SS or HH:MM
+    const business = businessResult.rows[0];
+    const sameDayPickupAllowed = business?.same_day_pickup_allowed !== false; // Default to true
+    const cutoffTime = business?.cutoff_time; // Format: HH:MM:SS or HH:MM
     
     const scheduleMap = new Map(schedule.map(s => [s.dayOfWeek, s]));
     
     // Get blocked dates/times
-    const blocks = await this.getBlocks(retailerId, startDate, endDate);
+    const blocks = await this.getBlocks(businessId, startDate, endDate);
     
     // Get existing bookings
-    const bookings = await this.getBookings(retailerId, startDate, endDate);
+    const bookings = await this.getBookings(businessId, startDate, endDate);
     
     // Get active locks
-    const locks = await this.getActiveLocks(retailerId, startDate, endDate);
+    const locks = await this.getActiveLocks(businessId, startDate, endDate);
     
     // Get today's date for cutoff comparison
     const today = new Date();
@@ -161,7 +161,7 @@ export class AvailabilityService {
 
   // Lock a slot during checkout (expires in 15 minutes)
   async lockSlot(
-    retailerId: string,
+    businessId: string,
     date: string,
     time: string,
     userId: string
@@ -172,7 +172,7 @@ export class AvailabilityService {
     try {
       // First check if slot is actually available
       const slots = await this.getAvailableSlots(
-        retailerId,
+        businessId,
         new Date(date),
         new Date(date),
         60,
@@ -185,12 +185,12 @@ export class AvailabilityService {
       }
       
       await pool.query(
-        `INSERT INTO booking_locks (retailer_id, booking_date, booking_time, locked_by, expires_at)
+        `INSERT INTO booking_locks (business_id, booking_date, booking_time, locked_by, expires_at)
          VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (retailer_id, booking_date, booking_time) 
+         ON CONFLICT (business_id, booking_date, booking_time) 
          DO UPDATE SET locked_by = $4, expires_at = $5
          WHERE booking_locks.expires_at < NOW()`,
-        [retailerId, date, time, userId, expiresAt]
+        [businessId, date, time, userId, expiresAt]
       );
       return true;
     } catch (error) {
@@ -200,34 +200,34 @@ export class AvailabilityService {
   }
 
   // Release a lock
-  async releaseLock(retailerId: string, date: string, time: string): Promise<void> {
+  async releaseLock(businessId: string, date: string, time: string): Promise<void> {
     await pool.query(
       `DELETE FROM booking_locks 
-       WHERE retailer_id = $1 AND booking_date = $2 AND booking_time = $3`,
-      [retailerId, date, time]
+       WHERE business_id = $1 AND booking_date = $2 AND booking_time = $3`,
+      [businessId, date, time]
     );
   }
 
-  // Check if same-day pickup is allowed for a retailer (for product orders)
-  async isSameDayPickupAllowed(retailerId: string): Promise<{ allowed: boolean; reason?: string }> {
-    const retailerResult = await pool.query(
-      `SELECT same_day_pickup_allowed, cutoff_time FROM retailers WHERE id = $1`,
-      [retailerId]
+  // Check if same-day pickup is allowed for a business (for product orders)
+  async isSameDayPickupAllowed(businessId: string): Promise<{ allowed: boolean; reason?: string }> {
+    const businessResult = await pool.query(
+      `SELECT same_day_pickup_allowed, cutoff_time FROM businesses WHERE id = $1`,
+      [businessId]
     );
     
-    if (retailerResult.rows.length === 0) {
-      return { allowed: true }; // Default to allowed if retailer not found
+    if (businessResult.rows.length === 0) {
+      return { allowed: true }; // Default to allowed if business not found
     }
     
-    const retailer = retailerResult.rows[0];
-    const sameDayPickupAllowed = retailer?.same_day_pickup_allowed !== false; // Default to true
-    const cutoffTime = retailer?.cutoff_time; // Format: HH:MM:SS or HH:MM
+    const business = businessResult.rows[0];
+    const sameDayPickupAllowed = business?.same_day_pickup_allowed !== false; // Default to true
+    const cutoffTime = business?.cutoff_time; // Format: HH:MM:SS or HH:MM
     
     // If same-day pickup is not allowed at all
     if (!sameDayPickupAllowed) {
       return { 
         allowed: false, 
-        reason: "Same-day pickup is not allowed for this retailer. Please select tomorrow or later." 
+        reason: "Same-day pickup is not allowed for this business. Please select tomorrow or later." 
       };
     }
     
@@ -289,38 +289,38 @@ export class AvailabilityService {
     return slots;
   }
 
-  private async getBlocks(retailerId: string, startDate: Date, endDate: Date) {
+  private async getBlocks(businessId: string, startDate: Date, endDate: Date) {
     const result = await pool.query(
       `SELECT block_date, start_time, end_time, is_all_day
-       FROM retailer_availability_blocks
-       WHERE retailer_id = $1 
+       FROM business_availability_blocks
+       WHERE business_id = $1 
        AND block_date BETWEEN $2 AND $3`,
-      [retailerId, startDate, endDate]
+      [businessId, startDate, endDate]
     );
     return result.rows;
   }
 
-  private async getBookings(retailerId: string, startDate: Date, endDate: Date) {
+  private async getBookings(businessId: string, startDate: Date, endDate: Date) {
     const result = await pool.query(
       `SELECT booking_date, booking_time
        FROM orders
-       WHERE retailer_id = $1
+       WHERE business_id = $1
        AND booking_date BETWEEN $2 AND $3
        AND booking_status != 'cancelled'
        AND booking_date IS NOT NULL`,
-      [retailerId, startDate, endDate]
+      [businessId, startDate, endDate]
     );
     return result.rows;
   }
 
-  private async getActiveLocks(retailerId: string, startDate: Date, endDate: Date) {
+  private async getActiveLocks(businessId: string, startDate: Date, endDate: Date) {
     const result = await pool.query(
       `SELECT booking_date, booking_time, expires_at
        FROM booking_locks
-       WHERE retailer_id = $1
+       WHERE business_id = $1
        AND booking_date BETWEEN $2 AND $3
        AND expires_at > NOW()`,
-      [retailerId, startDate, endDate]
+      [businessId, startDate, endDate]
     );
     return result.rows;
   }

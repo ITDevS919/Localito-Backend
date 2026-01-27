@@ -6,7 +6,7 @@ import { geocodingService } from "./geocodingService";
 export class ProductService {
   async getProducts(filters?: {
     category?: string;
-    retailerId?: string;
+    businessId?: string;
     isApproved?: boolean;
     search?: string;
     location?: string;
@@ -17,13 +17,13 @@ export class ProductService {
     limit?: number; // Add limit parameter
   }): Promise<{ products: Product[]; total: number; page: number; limit: number; totalPages: number }> {
       let query = `
-      SELECT p.*, r.business_name as retailer_name, r.postcode, r.city, r.latitude, r.longitude,
+      SELECT p.*, b.business_name as business_name, b.postcode, b.city, b.latitude, b.longitude,
              COALESCE(p.review_count, 0) as review_count,
              COALESCE(p.average_rating, 0) as average_rating,
              p.sync_from_epos, p.square_item_id, p.last_epos_sync_at,
-             r.square_sync_enabled, r.square_access_token, r.square_location_id
+             b.square_sync_enabled, b.square_access_token, b.square_location_id
       FROM products p
-      JOIN retailers r ON p.retailer_id = r.id
+      JOIN businesses b ON p.business_id = b.id
       WHERE 1=1
     `;
     const params: any[] = [];
@@ -35,9 +35,9 @@ export class ProductService {
       paramCount++;
     }
 
-    if (filters?.retailerId) {
-      query += ` AND p.retailer_id = $${paramCount}`;
-      params.push(filters.retailerId);
+    if (filters?.businessId) {
+      query += ` AND p.business_id = $${paramCount}`;
+      params.push(filters.businessId);
       paramCount++;
     }
 
@@ -57,24 +57,24 @@ export class ProductService {
     const isRadiusSearch = filters?.latitude && filters?.longitude && filters?.radiusKm;
     
     if (isRadiusSearch) {
-      // Radius-based search: filter retailers with coordinates within radius
+      // Radius-based search: filter businesses with coordinates within radius
       // We'll filter by bounding box first (for performance), then calculate exact distance
-      query += ` AND r.latitude IS NOT NULL AND r.longitude IS NOT NULL`;
+      query += ` AND b.latitude IS NOT NULL AND b.longitude IS NOT NULL`;
     } else if (filters?.location) {
       // Fallback to text-based search by postcode or city
       const locationParam = filters.location.trim();
       console.log(`[ProductService] Using text-based search for location: "${locationParam}"`);
       console.log(`[ProductService] Current query before location filter:`, query);
       
-      // Compare against retailers table postcode and city fields
+      // Compare against businesses table postcode and city fields
       // Handle NULL values and trim whitespace for better matching
       // Use ILIKE for case-insensitive matching (supports both exact and partial matches)
       query += ` AND (
-        (r.postcode IS NOT NULL AND TRIM(r.postcode) ILIKE $${paramCount})
-        OR (r.city IS NOT NULL AND TRIM(r.city) ILIKE $${paramCount + 1})
-        OR (r.postcode IS NOT NULL AND TRIM(r.postcode) ILIKE $${paramCount + 2})
-        OR (r.postcode IS NOT NULL AND TRIM(r.postcode) ILIKE $${paramCount + 3})
-        OR (r.city IS NOT NULL AND TRIM(r.city) ILIKE $${paramCount + 4})
+        (b.postcode IS NOT NULL AND TRIM(b.postcode) ILIKE $${paramCount})
+        OR (b.city IS NOT NULL AND TRIM(b.city) ILIKE $${paramCount + 1})
+        OR (b.postcode IS NOT NULL AND TRIM(b.postcode) ILIKE $${paramCount + 2})
+        OR (b.postcode IS NOT NULL AND TRIM(b.postcode) ILIKE $${paramCount + 3})
+        OR (b.city IS NOT NULL AND TRIM(b.city) ILIKE $${paramCount + 4})
       )`;
       params.push(`%${locationParam}%`); // For partial postcode match
       params.push(`%${locationParam}%`); // For partial city match
@@ -88,7 +88,7 @@ export class ProductService {
         exactPostcode: locationParam,
         exactCity: locationParam
       });
-      console.log(`[ProductService] Filtering retailers where r.postcode or r.city matches: "${locationParam}"`);
+      console.log(`[ProductService] Filtering businesses where b.postcode or b.city matches: "${locationParam}"`);
       paramCount += 5;
     }
 
@@ -164,7 +164,7 @@ export class ProductService {
 
     let products = result.rows.map((row) => ({
       id: row.id,
-      retailerId: row.retailer_id,
+      businessId: row.business_id,
       name: row.name,
       description: row.description,
       price: parseFloat(row.price),
@@ -174,13 +174,13 @@ export class ProductService {
       isApproved: row.is_approved,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
-      // Include retailer information
-      retailer_name: row.retailer_name,
+      // Include business information
+      business_name: row.business_name,
       postcode: row.postcode,
       city: row.city,
-      // Include retailer location data for distance calculation
-      retailerLatitude: row.latitude ? parseFloat(row.latitude) : null,
-      retailerLongitude: row.longitude ? parseFloat(row.longitude) : null,
+      // Include business location data for distance calculation
+      businessLatitude: row.latitude ? parseFloat(row.latitude) : null,
+      businessLongitude: row.longitude ? parseFloat(row.longitude) : null,
       // Include review data
       reviewCount: parseInt(row.review_count) || 0,
       averageRating: parseFloat(row.average_rating) || 0,
@@ -193,15 +193,15 @@ export class ProductService {
     // If radius search is enabled, filter by exact distance
     if (isRadiusSearch) {
       products = products.filter((product) => {
-        if (!product.retailerLatitude || !product.retailerLongitude) {
+        if (!product.businessLatitude || !product.businessLongitude) {
           return false;
         }
 
         const distance = geocodingService.calculateDistance(
           filters.latitude!,
           filters.longitude!,
-          product.retailerLatitude,
-          product.retailerLongitude
+          product.businessLatitude,
+          product.businessLongitude
         );
 
         return distance <= filters.radiusKm!;
@@ -209,21 +209,21 @@ export class ProductService {
 
       // Sort by distance (closest first)
       products.sort((a, b) => {
-        if (!a.retailerLatitude || !a.retailerLongitude) return 1;
-        if (!b.retailerLatitude || !b.retailerLongitude) return -1;
+        if (!a.businessLatitude || !a.businessLongitude) return 1;
+        if (!b.businessLatitude || !b.businessLongitude) return -1;
 
         const distA = geocodingService.calculateDistance(
           filters.latitude!,
           filters.longitude!,
-          a.retailerLatitude,
-          a.retailerLongitude
+          a.businessLatitude,
+          a.businessLongitude
         );
 
         const distB = geocodingService.calculateDistance(
           filters.latitude!,
           filters.longitude!,
-          b.retailerLatitude,
-          b.retailerLongitude
+          b.businessLatitude,
+          b.businessLongitude
         );
 
         return distA - distB;
@@ -240,7 +240,7 @@ export class ProductService {
 
       // Remove temporary location fields before returning
       return {
-        products: paginatedProducts.map(({ retailerLatitude, retailerLongitude, ...product }) => product),
+        products: paginatedProducts.map(({ businessLatitude, businessLongitude, ...product }) => product),
         total,
         page,
         limit,
@@ -253,7 +253,7 @@ export class ProductService {
 
     // Remove temporary location fields before returning
     return {
-      products: products.map(({ retailerLatitude, retailerLongitude, ...product }) => product),
+      products: products.map(({ businessLatitude, businessLongitude, ...product }) => product),
       total,
       page,
       limit,
@@ -263,13 +263,13 @@ export class ProductService {
 
   async getProductById(id: string): Promise<Product | undefined> {
     const result = await pool.query(
-      `SELECT p.*, r.business_name as retailer_name, r.id as retailer_user_id,
+      `SELECT p.*, r.business_name as business_name, r.id as business_user_id,
               COALESCE(p.review_count, 0) as review_count,
               COALESCE(p.average_rating, 0) as average_rating,
               p.sync_from_epos, p.square_item_id, p.last_epos_sync_at,
               r.square_sync_enabled, r.square_access_token, r.square_location_id
        FROM products p
-       JOIN retailers r ON p.retailer_id = r.id
+       JOIN businesses b ON p.business_id = b.id
        WHERE p.id = $1`,
       [id]
     );
@@ -296,7 +296,7 @@ export class ProductService {
 
     return {
       id: row.id,
-      retailerId: row.retailer_id,
+      businessId: row.business_id,
       name: row.name,
       description: row.description,
       price: parseFloat(row.price),
@@ -315,7 +315,7 @@ export class ProductService {
   }
 
   async createProduct(product: {
-    retailerId: string;
+    businessId: string;
     name: string;
     description: string;
     price: number;
@@ -331,24 +331,24 @@ export class ProductService {
     // If EPOS sync is enabled, fetch stock from Square
     if (product.syncFromEpos && product.squareItemId) {
       try {
-        // Get retailer's Square credentials
-        const retailerResult = await pool.query(
+        // Get business's Square credentials
+        const businessResult = await pool.query(
           `SELECT square_access_token, square_location_id, square_sync_enabled
-           FROM retailers WHERE id = $1`,
-          [product.retailerId]
+           FROM businesses WHERE id = $1`,
+          [product.businessId]
         );
         
-        if (retailerResult.rows.length > 0) {
-          const retailer = retailerResult.rows[0];
+        if (businessResult.rows.length > 0) {
+          const business = businessResult.rows[0];
           
-          if (retailer.square_sync_enabled && 
-              retailer.square_access_token && 
-              retailer.square_location_id) {
+          if (business.square_sync_enabled && 
+              business.square_access_token && 
+              business.square_location_id) {
             
             // Fetch stock from Square
             const stock = await squareService.getItemStock(
-              retailer.square_access_token,
-              retailer.square_location_id,
+              business.square_access_token,
+              business.square_location_id,
               product.squareItemId
             );
             
@@ -368,11 +368,11 @@ export class ProductService {
     }
     
     const result = await pool.query(
-      `INSERT INTO products (retailer_id, name, description, price, stock, category, images, is_approved, sync_from_epos, square_item_id, last_epos_sync_at)
+      `INSERT INTO products (business_id, name, description, price, stock, category, images, is_approved, sync_from_epos, square_item_id, last_epos_sync_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING *`,
       [
-        product.retailerId,
+        product.businessId,
         product.name,
         product.description,
         product.price,
@@ -389,7 +389,7 @@ export class ProductService {
     const row = result.rows[0];
     return {
       id: row.id,
-      retailerId: row.retailer_id,
+      businessId: row.business_id,
       name: row.name,
       description: row.description,
       price: parseFloat(row.price),
@@ -414,7 +414,7 @@ export class ProductService {
     
     // Get current product to check EPOS sync status
     const currentProduct = await pool.query(
-      `SELECT p.sync_from_epos, p.square_item_id, p.retailer_id
+      `SELECT p.sync_from_epos, p.square_item_id, p.business_id
        FROM products p
        WHERE p.id = $1`,
       [id]
@@ -439,33 +439,33 @@ export class ProductService {
     if (shouldSyncStock && squareItemId) {
       try {
         const currentProduct = await pool.query(
-          `SELECT p.retailer_id
+          `SELECT p.business_id
            FROM products p
            WHERE p.id = $1`,
           [id]
         );
         
         if (currentProduct.rows.length > 0) {
-          const retailerId = currentProduct.rows[0].retailer_id;
+          const businessId = currentProduct.rows[0].business_id;
           
-          // Get retailer's Square credentials
-          const retailerResult = await pool.query(
+          // Get business's Square credentials
+          const businessResult = await pool.query(
             `SELECT square_access_token, square_location_id, square_sync_enabled
-             FROM retailers WHERE id = $1`,
-            [retailerId]
+             FROM businesses WHERE id = $1`,
+            [businessId]
           );
           
-          if (retailerResult.rows.length > 0) {
-            const retailer = retailerResult.rows[0];
+          if (businessResult.rows.length > 0) {
+            const business = businessResult.rows[0];
             
-            if (retailer.square_sync_enabled && 
-                retailer.square_access_token && 
-                retailer.square_location_id) {
+            if (business.square_sync_enabled && 
+                business.square_access_token && 
+                business.square_location_id) {
               
               // Fetch stock from Square
               const stock = await squareService.getItemStock(
-                retailer.square_access_token,
-                retailer.square_location_id,
+                business.square_access_token,
+                business.square_location_id,
                 squareItemId
               );
               
@@ -542,7 +542,7 @@ export class ProductService {
     const row = result.rows[0];
     return {
       id: row.id,
-      retailerId: row.retailer_id,
+      businessId: row.business_id,
       name: row.name,
       description: row.description,
       price: parseFloat(row.price),
@@ -567,7 +567,7 @@ export class ProductService {
     const row = result.rows[0];
     return {
       id: row.id,
-      retailerId: row.retailer_id,
+      businessId: row.business_id,
       name: row.name,
       description: row.description,
       price: parseFloat(row.price),
@@ -580,11 +580,11 @@ export class ProductService {
     };
   }
 
-  async deleteProduct(id: string, retailerId: string): Promise<boolean> {
-    // Verify the product belongs to the retailer before deleting
+  async deleteProduct(id: string, businessId: string): Promise<boolean> {
+    // Verify the product belongs to the business before deleting
     const checkResult = await pool.query(
-      "SELECT id FROM products WHERE id = $1 AND retailer_id = $2",
-      [id, retailerId]
+      "SELECT id FROM products WHERE id = $1 AND business_id = $2",
+      [id, businessId]
     );
 
     if (checkResult.rows.length === 0) {
@@ -596,9 +596,9 @@ export class ProductService {
     return true;
   }
 
-  async getRetailerIdByUserId(userId: string): Promise<string | undefined> {
+  async getBusinessIdByUserId(userId: string): Promise<string | undefined> {
     const result = await pool.query(
-      "SELECT id FROM retailers WHERE user_id = $1",
+      "SELECT id FROM businesses WHERE user_id = $1",
       [userId]
     );
 

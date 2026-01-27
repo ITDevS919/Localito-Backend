@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 // User roles
-export type UserRole = "customer" | "retailer" | "admin";
+export type UserRole = "customer" | "business" | "admin";
 
 // User schema
 export interface User {
@@ -21,7 +21,7 @@ export interface PublicUser {
   createdAt: Date;
 }
 
-export const retailerDataSchema = z.object({
+export const businessDataSchema = z.object({
   businessName: z.string().min(1, "Business name is required"),
   businessAddress: z.string().optional(),
   postcode: z.string().optional(),
@@ -39,18 +39,18 @@ export const insertUserSchema = z.object({
   username: z.string().min(3, "Username must be at least 3 characters"),
   email: z.string().email("Invalid email address"),
   password: z.string().min(6, "Password must be at least 6 characters"),
-  role: z.enum(["customer", "retailer", "admin"]).default("customer"),
-  retailerData: retailerDataSchema.optional(),
+  role: z.enum(["customer", "business", "admin"]).default("customer"),
+  businessData: businessDataSchema.optional(),
 }).refine(
   (data) => {
-    if (data.role === "retailer") {
-      return !!data.retailerData;
+    if (data.role === "business") {
+      return !!data.businessData;
     }
     return true;
   },
   {
-    message: "Retailer data is required for retailer signup",
-    path: ["retailerData"],
+    message: "Business data is required for business signup",
+    path: ["businessData"],
   }
 );
 
@@ -59,8 +59,8 @@ export const loginSchema = z.object({
   password: z.string().min(1, "Password is required"),
 });
 
-// Retailer schema
-export interface Retailer {
+// Business schema
+export interface Business {
   id: string;
   userId: string;
   businessName: string;
@@ -86,7 +86,7 @@ export interface Retailer {
 // Product schema
 export interface Product {
   id: string;
-  retailerId: string;
+  businessId: string;
   name: string;
   description: string;
   price: number;
@@ -117,14 +117,14 @@ export interface CartItem {
 export interface Order {
   id: string;
   userId: string;
-  retailerId: string;
+  businessId: string;
   status: string;
   total: number;
   stripeSessionId?: string;
   stripePaymentIntentId?: string;
   stripeTransferId?: string;
   platformCommission?: number;
-  retailerAmount?: number;
+  businessAmount?: number;
   discountAmount?: number;
   pointsUsed?: number;
   pointsEarned?: number;
@@ -134,7 +134,7 @@ export interface Order {
   pickupInstructions?: string;
   readyForPickupAt?: Date;
   pickedUpAt?: Date;
-  retailerName?: string;
+  businessName?: string;
   customerName?: string;
   customerEmail?: string;
 }
@@ -151,22 +151,22 @@ export interface OrderItem {
 export type InsertUser = z.infer<typeof insertUserSchema>;
 export type LoginUser = z.infer<typeof loginSchema>;
 
-// Retailer post schema
-export interface RetailerPost {
+// Business post schema
+export interface BusinessPost {
   id: string;
-  retailerId: string;
+  businessId: string;
   content: string;
   images: string[];
   createdAt: Date;
   updatedAt: Date;
-  retailerName?: string;
-  retailerBannerImage?: string;
+  businessName?: string;
+  businessBannerImage?: string;
 }
 
-// Retailer follower schema
-export interface RetailerFollower {
+// Business follower schema
+export interface BusinessFollower {
   id: string;
-  retailerId: string;
+  businessId: string;
   userId: string;
   createdAt: Date;
 }
@@ -174,7 +174,7 @@ export interface RetailerFollower {
 // Payout settings schema
 export interface PayoutSettings {
   id: string;
-  retailerId: string;
+  businessId: string;
   payoutMethod: 'bank' | 'paypal' | 'stripe';
   accountDetails: Record<string, any>;
   isVerified: boolean;
@@ -185,7 +185,7 @@ export interface PayoutSettings {
 // Payout schema
 export interface Payout {
   id: string;
-  retailerId: string;
+  businessId: string;
   amount: number;
   status: 'pending' | 'processing' | 'completed' | 'failed';
   payoutMethod: string;
@@ -199,7 +199,7 @@ export interface Payout {
 // Service schema
 export interface Service {
   id: string;
-  retailerId: string;
+  businessId: string;
   name: string;
   description: string;
   price: number;
@@ -248,7 +248,7 @@ export interface AvailabilitySchedule {
 // Availability block schema
 export interface AvailabilityBlock {
   id: string;
-  retailerId: string;
+  businessId: string;
   blockDate: Date;
   startTime?: string;
   endTime?: string;

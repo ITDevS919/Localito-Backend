@@ -1,6 +1,7 @@
 import { httpServer } from "./app";
 import { testConnection } from "./db/connection";
 import { runMigrations } from "./db/migrations";
+import { stripeService } from "./services/stripeService";
 
 const PORT = parseInt(process.env.PORT || "5000", 10);
 
@@ -29,6 +30,17 @@ async function startServer() {
     // Run migrations
     log("Running database migrations...");
     await runMigrations();
+
+    // Verify Stripe connection
+    if (process.env.STRIPE_SECRET_KEY) {
+      log("Verifying Stripe connection...");
+      const stripeConnected = await stripeService.verifyConnection();
+      if (!stripeConnected) {
+        log("⚠️ Stripe connection verification failed. Stripe features may not work.", "warn");
+      }
+    } else {
+      log("⚠️ STRIPE_SECRET_KEY not set. Stripe features will not work.", "warn");
+    }
 
     // Start HTTP server
     httpServer.listen(PORT, "0.0.0.0", () => {

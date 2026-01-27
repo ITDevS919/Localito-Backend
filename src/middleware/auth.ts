@@ -72,13 +72,13 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
             }
           }
 
-          // For login flows (not signup), don't auto-create retailer/admin accounts
+          // For login flows (not signup), don't auto-create business/admin accounts
           // They should use the signup flow which collects required information
           // Check if this is a login attempt by checking the route
           const isLoginFlow = req.originalUrl?.includes('/login') || req.path?.includes('/login');
           
-          if (isLoginFlow && (role === "retailer" || role === "admin")) {
-            console.log("[Google Auth Strategy] Login flow detected for retailer/admin, but account not found");
+          if (isLoginFlow && (role === "business" || role === "admin")) {
+            console.log("[Google Auth Strategy] Login flow detected for business/admin, but account not found");
             return done(new Error("Account not found. Please sign up first using the signup page."));
           }
 

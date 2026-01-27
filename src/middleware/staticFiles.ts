@@ -19,14 +19,16 @@ export function serveStaticFiles(app: Express) {
   app.use("/uploads", express.static(uploadsPath));
   
   if (!fs.existsSync(distPath)) {
-    app.use(express.static(distPath));
-    
-    // Fall through to index.html for client-side routing
-    app.use("*", (_req, res) => {
-      res.sendFile(path.resolve(distPath, "index.html"));
-    });
-    }else {
-    // If no client build, just log a warning (don't crash)
-    console.warn("Client build directory not found. Static file serving disabled.");
+    throw new Error(
+      `Could not find the build directory: ${distPath}, make sure to build the client first`
+    );
   }
+
+  app.use(express.static(distPath));
+
+  // Fall through to index.html for client-side routing
+  app.use("*", (_req, res) => {
+    res.sendFile(path.resolve(distPath, "index.html"));
+  });
 }
+

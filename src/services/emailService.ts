@@ -1,4 +1,46 @@
+import { Resend } from 'resend';
 import nodemailer, { Transporter } from 'nodemailer';
+
+// Import all React Email render functions
+import { renderOurStoryEmail, renderOurStoryEmailText } from '../emails/sendOurStory';
+import { renderOrderConfirmationEmail, renderOrderConfirmationEmailText } from '../emails/sendOrderConfirmation';
+import { renderOrderReadyForPickupEmail, renderOrderReadyForPickupEmailText } from '../emails/sendOrderReadyForPickup';
+import { renderAbandonedCartEmail, renderAbandonedCartEmailText } from '../emails/sendAbandonedCart';
+import { renderCartReminderEmail, renderCartReminderEmailText } from '../emails/sendCartReminder';
+import { renderOrderCollectionConfirmedEmail, renderOrderCollectionConfirmedEmailText } from '../emails/sendOrderCollectionConfirmed';
+import { renderPasswordResetEmail, renderPasswordResetEmailText } from '../emails/sendPasswordReset';
+import { renderWelcomeVerificationEmail, renderWelcomeVerificationEmailText } from '../emails/sendWelcomeVerification';
+import { renderOrderCancellationEmail, renderOrderCancellationEmailText } from '../emails/sendOrderCancellation';
+import { renderNewOrderAlertEmail, renderNewOrderAlertEmailText } from '../emails/sendNewOrderAlert';
+import { renderPendingOrderReminderEmail, renderPendingOrderReminderEmailText } from '../emails/sendPendingOrderReminder';
+import { renderPaymentReceivedEmail, renderPaymentReceivedEmailText } from '../emails/sendPaymentReceived';
+import { renderKYCVerificationStatusEmail, renderKYCVerificationStatusEmailText } from '../emails/sendKYCVerificationStatus';
+import { renderBusinessPasswordResetEmail, renderBusinessPasswordResetEmailText } from '../emails/sendBusinessPasswordReset';
+import { renderBusinessWelcomeEmail, renderBusinessWelcomeEmailText } from '../emails/sendBusinessWelcome';
+import { renderLowStockAlertEmail, renderLowStockAlertEmailText } from '../emails/sendLowStockAlert';
+import { renderPaymentIssueEmail, renderPaymentIssueEmailText } from '../emails/sendPaymentIssue';
+import { renderCriticalOrderIssueAlertEmail, renderCriticalOrderIssueAlertEmailText } from '../emails/sendCriticalOrderIssueAlert';
+import { renderAccountSuspensionWarningEmail, renderAccountSuspensionWarningEmailText } from '../emails/sendAccountSuspensionWarning';
+
+// Import data types
+import type { OrderConfirmationData } from '../emails/sendOrderConfirmation';
+import type { OrderReadyForPickupData } from '../emails/sendOrderReadyForPickup';
+import type { AbandonedCartData } from '../emails/sendAbandonedCart';
+import type { CartReminderData } from '../emails/sendCartReminder';
+import type { OrderCollectionConfirmedData } from '../emails/sendOrderCollectionConfirmed';
+import type { PasswordResetData } from '../emails/sendPasswordReset';
+import type { WelcomeVerificationData } from '../emails/sendWelcomeVerification';
+import type { OrderCancellationData } from '../emails/sendOrderCancellation';
+import type { NewOrderAlertData } from '../emails/sendNewOrderAlert';
+import type { PendingOrderReminderData } from '../emails/sendPendingOrderReminder';
+import type { PaymentReceivedData } from '../emails/sendPaymentReceived';
+import type { KYCVerificationStatusData } from '../emails/sendKYCVerificationStatus';
+import type { BusinessPasswordResetData } from '../emails/sendBusinessPasswordReset';
+import type { BusinessWelcomeData } from '../emails/sendBusinessWelcome';
+import type { LowStockAlertData } from '../emails/sendLowStockAlert';
+import type { PaymentIssueData } from '../emails/sendPaymentIssue';
+import type { CriticalOrderIssueAlertData } from '../emails/sendCriticalOrderIssueAlert';
+import type { AccountSuspensionWarningData } from '../emails/sendAccountSuspensionWarning';
 
 interface EmailOptions {
   to: string;
@@ -8,13 +50,40 @@ interface EmailOptions {
 }
 
 export class EmailService {
-  private transporter: Transporter | null = null;
+  private resend: Resend | null = null;
+  private transporter: Transporter | null = null; // Keep for backward compatibility
+  private useResend: boolean = true; // Default to Resend
 
   constructor() {
+    this.initializeResend();
+    // Keep nodemailer initialization for backward compatibility
     this.initializeTransporter();
   }
 
+  private initializeResend() {
+    const resendApiKey = process.env.RESEND_API_KEY;
+
+    if (!resendApiKey) {
+      console.warn('[EmailService] RESEND_API_KEY not configured. Falling back to SMTP.');
+      this.useResend = false;
+      return;
+    }
+
+    try {
+      this.resend = new Resend(resendApiKey);
+      console.log('[EmailService] ✓ Resend initialized successfully');
+    } catch (error) {
+      console.error('[EmailService] Failed to initialize Resend:', error);
+      this.useResend = false;
+    }
+  }
+
   private initializeTransporter() {
+    // Only initialize if Resend is not available
+    if (this.useResend && this.resend) {
+      return;
+    }
+
     const smtpHost = process.env.SMTP_HOST || 'smtp.gmail.com';
     const smtpPort = parseInt(process.env.SMTP_PORT || '587');
     const smtpUser = process.env.SMTP_USER;
@@ -30,14 +99,13 @@ export class EmailService {
       this.transporter = nodemailer.createTransport({
         host: smtpHost,
         port: smtpPort,
-        secure: smtpPort === 465, // true for 465, false for other ports
+        secure: smtpPort === 465,
         auth: {
           user: smtpUser,
           pass: smtpPassword,
         },
       });
 
-      // Verify connection
       this.transporter.verify((error) => {
         if (error) {
           console.error('[EmailService] SMTP connection verification failed:', error);
@@ -52,8 +120,52 @@ export class EmailService {
   }
 
   async sendEmail(options: EmailOptions): Promise<boolean> {
+    // Prefer Resend if available
+    if (this.useResend && this.resend) {
+      return this.sendEmailViaResend(options);
+    }
+
+    // Fallback to SMTP
+    if (this.transporter) {
+      return this.sendEmailViaSMTP(options);
+    }
+
+    console.warn('[EmailService] No email service configured. Skipping email send.');
+    return false;
+  }
+
+  private async sendEmailViaResend(options: EmailOptions): Promise<boolean> {
+    if (!this.resend) {
+      return false;
+    }
+
+    try {
+      const fromEmail = process.env.RESEND_FROM_EMAIL || process.env.SMTP_FROM_EMAIL || 'hello@localito.com';
+      const fromName = process.env.RESEND_FROM_NAME || process.env.SMTP_FROM_NAME || 'Localito';
+
+      const { data, error } = await this.resend.emails.send({
+        from: `${fromName} <${fromEmail}>`,
+        to: options.to,
+        subject: options.subject,
+        html: options.html,
+        text: options.text || this.htmlToText(options.html),
+      });
+
+      if (error) {
+        console.error('[EmailService] Resend error:', error);
+        return false;
+      }
+
+      console.log(`[EmailService] ✓ Email sent successfully via Resend to ${options.to}`);
+      return true;
+    } catch (error: any) {
+      console.error('[EmailService] Failed to send email via Resend:', error);
+      return false;
+    }
+  }
+
+  private async sendEmailViaSMTP(options: EmailOptions): Promise<boolean> {
     if (!this.transporter) {
-      console.warn('[EmailService] Email transporter not initialized. Skipping email send.');
       return false;
     }
 
@@ -69,16 +181,15 @@ export class EmailService {
         text: options.text || this.htmlToText(options.html),
       });
 
-      console.log(`[EmailService] ✓ Email sent successfully to ${options.to}`);
+      console.log(`[EmailService] ✓ Email sent successfully via SMTP to ${options.to}`);
       return true;
     } catch (error: any) {
-      console.error('[EmailService] Failed to send email:', error);
+      console.error('[EmailService] Failed to send email via SMTP:', error);
       return false;
     }
   }
 
   private htmlToText(html: string): string {
-    // Simple HTML to text conversion
     return html
       .replace(/<[^>]*>/g, '')
       .replace(/&nbsp;/g, ' ')
@@ -89,13 +200,387 @@ export class EmailService {
       .trim();
   }
 
-  // Customer booking confirmation email
+  // ============================================
+  // React Email Template Methods
+  // ============================================
+
+  /**
+   * Send "Our Story" introductory email
+   */
+  async sendOurStoryEmail(to: string, recipientName?: string): Promise<boolean> {
+    try {
+      const html = await renderOurStoryEmail(recipientName);
+      const text = renderOurStoryEmailText(recipientName);
+      return this.sendEmail({
+        to,
+        subject: 'Welcome to Localito – Our Story',
+        html,
+        text,
+      });
+    } catch (error: any) {
+      console.error('[EmailService] Failed to send Our Story email:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Send order confirmation email to customer
+   */
+  async sendOrderConfirmationEmail(to: string, data: OrderConfirmationData): Promise<boolean> {
+    try {
+      const html = await renderOrderConfirmationEmail(data);
+      const text = renderOrderConfirmationEmailText(data);
+      return this.sendEmail({
+        to,
+        subject: `Your Localito Order Confirmation – ${data.orderId}`,
+        html,
+        text,
+      });
+    } catch (error: any) {
+      console.error('[EmailService] Failed to send order confirmation email:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Send "Order Ready for Pickup" notification
+   */
+  async sendOrderReadyForPickupEmail(to: string, data: OrderReadyForPickupData): Promise<boolean> {
+    try {
+      const html = await renderOrderReadyForPickupEmail(data);
+      const text = renderOrderReadyForPickupEmailText(data);
+      return this.sendEmail({
+        to,
+        subject: `Your Localito Order is Ready for Pickup – ${data.orderId}`,
+        html,
+        text,
+      });
+    } catch (error: any) {
+      console.error('[EmailService] Failed to send order ready email:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Send abandoned cart reminder (first)
+   */
+  async sendAbandonedCartEmail(to: string, data: AbandonedCartData): Promise<boolean> {
+    try {
+      const html = await renderAbandonedCartEmail(data);
+      const text = renderAbandonedCartEmailText(data);
+      return this.sendEmail({
+        to,
+        subject: "Don't Miss Out – Your Localito Cart is Waiting!",
+        html,
+        text,
+      });
+    } catch (error: any) {
+      console.error('[EmailService] Failed to send abandoned cart email:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Send cart reminder (follow-up)
+   */
+  async sendCartReminderEmail(to: string, data: CartReminderData): Promise<boolean> {
+    try {
+      const html = await renderCartReminderEmail(data);
+      const text = renderCartReminderEmailText(data);
+      return this.sendEmail({
+        to,
+        subject: 'Quick Reminder – Your Localito Cart Awaits!',
+        html,
+        text,
+      });
+    } catch (error: any) {
+      console.error('[EmailService] Failed to send cart reminder email:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Send order collection confirmed email
+   */
+  async sendOrderCollectionConfirmedEmail(to: string, data: OrderCollectionConfirmedData): Promise<boolean> {
+    try {
+      const html = await renderOrderCollectionConfirmedEmail(data);
+      const text = renderOrderCollectionConfirmedEmailText(data);
+      return this.sendEmail({
+        to,
+        subject: `Order Collected – ${data.orderId} Confirmed!`,
+        html,
+        text,
+      });
+    } catch (error: any) {
+      console.error('[EmailService] Failed to send order collection confirmed email:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Send password reset email (customer)
+   */
+  async sendPasswordResetEmail(to: string, data: PasswordResetData): Promise<boolean> {
+    try {
+      const html = await renderPasswordResetEmail(data);
+      const text = renderPasswordResetEmailText(data);
+      return this.sendEmail({
+        to,
+        subject: 'Reset Your Localito Password',
+        html,
+        text,
+      });
+    } catch (error: any) {
+      console.error('[EmailService] Failed to send password reset email:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Send welcome and verification email
+   */
+  async sendWelcomeVerificationEmail(to: string, data: WelcomeVerificationData): Promise<boolean> {
+    try {
+      const html = await renderWelcomeVerificationEmail(data);
+      const text = renderWelcomeVerificationEmailText(data);
+      return this.sendEmail({
+        to,
+        subject: 'Welcome to Localito – Verify Your Account!',
+        html,
+        text,
+      });
+    } catch (error: any) {
+      console.error('[EmailService] Failed to send welcome verification email:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Send order cancellation/refund confirmation
+   */
+  async sendOrderCancellationEmail(to: string, data: OrderCancellationData): Promise<boolean> {
+    try {
+      const html = await renderOrderCancellationEmail(data);
+      const text = renderOrderCancellationEmailText(data);
+      return this.sendEmail({
+        to,
+        subject: `Your Localito Order Cancellation/Refund Confirmation – ${data.orderId}`,
+        html,
+        text,
+      });
+    } catch (error: any) {
+      console.error('[EmailService] Failed to send order cancellation email:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Send new order alert to business
+   */
+  async sendNewOrderAlertEmail(to: string, data: NewOrderAlertData): Promise<boolean> {
+    try {
+      const html = await renderNewOrderAlertEmail(data);
+      const text = renderNewOrderAlertEmailText(data);
+      return this.sendEmail({
+        to,
+        subject: `New Order Alert – ${data.orderId} from ${data.customerName}`,
+        html,
+        text,
+      });
+    } catch (error: any) {
+      console.error('[EmailService] Failed to send new order alert email:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Send pending order reminder to business
+   */
+  async sendPendingOrderReminderEmail(to: string, data: PendingOrderReminderData): Promise<boolean> {
+    try {
+      const html = await renderPendingOrderReminderEmail(data);
+      const text = renderPendingOrderReminderEmailText(data);
+      return this.sendEmail({
+        to,
+        subject: `Friendly Reminder – Order ${data.orderId} is Pending at ${data.businessName}`,
+        html,
+        text,
+      });
+    } catch (error: any) {
+      console.error('[EmailService] Failed to send pending order reminder email:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Send payment received confirmation to business
+   */
+  async sendPaymentReceivedEmail(to: string, data: PaymentReceivedData): Promise<boolean> {
+    try {
+      const html = await renderPaymentReceivedEmail(data);
+      const text = renderPaymentReceivedEmailText(data);
+      return this.sendEmail({
+        to,
+        subject: `Payment Received – Order ${data.orderId} Payout Confirmed!`,
+        html,
+        text,
+      });
+    } catch (error: any) {
+      console.error('[EmailService] Failed to send payment received email:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Send KYC verification status email
+   */
+  async sendKYCVerificationStatusEmail(to: string, data: KYCVerificationStatusData): Promise<boolean> {
+    try {
+      const html = await renderKYCVerificationStatusEmail(data);
+      const text = renderKYCVerificationStatusEmailText(data);
+      const statusText = data.status === 'approved' ? 'Approved' : 'Rejected';
+      return this.sendEmail({
+        to,
+        subject: `Your Localito KYC Verification Status – ${statusText}`,
+        html,
+        text,
+      });
+    } catch (error: any) {
+      console.error('[EmailService] Failed to send KYC verification status email:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Send business password reset email
+   */
+  async sendBusinessPasswordResetEmail(to: string, data: BusinessPasswordResetData): Promise<boolean> {
+    try {
+      const html = await renderBusinessPasswordResetEmail(data);
+      const text = renderBusinessPasswordResetEmailText(data);
+      return this.sendEmail({
+        to,
+        subject: 'Reset Your Localito Business Password',
+        html,
+        text,
+      });
+    } catch (error: any) {
+      console.error('[EmailService] Failed to send business password reset email:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Send business welcome email
+   */
+  async sendBusinessWelcomeEmail(to: string, data: BusinessWelcomeData): Promise<boolean> {
+    try {
+      const html = await renderBusinessWelcomeEmail(data);
+      const text = renderBusinessWelcomeEmailText(data);
+      return this.sendEmail({
+        to,
+        subject: "Welcome to Localito – Let's Get Your Business Live!",
+        html,
+        text,
+      });
+    } catch (error: any) {
+      console.error('[EmailService] Failed to send business welcome email:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Send low stock alert to business
+   */
+  async sendLowStockAlertEmail(to: string, data: LowStockAlertData): Promise<boolean> {
+    try {
+      const html = await renderLowStockAlertEmail(data);
+      const text = renderLowStockAlertEmailText(data);
+      return this.sendEmail({
+        to,
+        subject: `Low Stock Alert – ${data.productName} at ${data.businessName}`,
+        html,
+        text,
+      });
+    } catch (error: any) {
+      console.error('[EmailService] Failed to send low stock alert email:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Send payment issue notification to customer
+   */
+  async sendPaymentIssueEmail(to: string, data: PaymentIssueData): Promise<boolean> {
+    try {
+      const html = await renderPaymentIssueEmail(data);
+      const text = renderPaymentIssueEmailText(data);
+      return this.sendEmail({
+        to,
+        subject: `Payment Issue with Your Localito Order – ${data.orderId}`,
+        html,
+        text,
+      });
+    } catch (error: any) {
+      console.error('[EmailService] Failed to send payment issue email:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Send critical order issue alert to admin
+   */
+  async sendCriticalOrderIssueAlertEmail(to: string, data: CriticalOrderIssueAlertData): Promise<boolean> {
+    try {
+      const html = await renderCriticalOrderIssueAlertEmail(data);
+      const text = renderCriticalOrderIssueAlertEmailText(data);
+      return this.sendEmail({
+        to,
+        subject: `Critical Order Issue Alert – ${data.orderId} Needs Immediate Attention`,
+        html,
+        text,
+      });
+    } catch (error: any) {
+      console.error('[EmailService] Failed to send critical order issue alert email:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Send account suspension/warning email
+   */
+  async sendAccountSuspensionWarningEmail(to: string, data: AccountSuspensionWarningData): Promise<boolean> {
+    try {
+      const html = await renderAccountSuspensionWarningEmail(data);
+      const text = renderAccountSuspensionWarningEmailText(data);
+      const statusText = data.status === 'suspended' ? 'Account Suspended' : 'Account Warning';
+      return this.sendEmail({
+        to,
+        subject: `${statusText} – Action Required`,
+        html,
+        text,
+      });
+    } catch (error: any) {
+      console.error('[EmailService] Failed to send account suspension warning email:', error);
+      return false;
+    }
+  }
+
+  // ============================================
+  // Legacy Booking Methods (kept for backward compatibility)
+  // ============================================
+
+  /**
+   * Customer booking confirmation email (legacy - uses inline HTML)
+   * @deprecated Consider migrating to React Email template
+   */
   async sendBookingConfirmationToCustomer(
     customerEmail: string,
     customerName: string,
     bookingDetails: {
       orderId: string;
-      retailerName: string;
+      businessName: string;
       bookingDate: string;
       bookingTime: string;
       duration: number;
@@ -231,8 +716,8 @@ export class EmailService {
       </div>
       
       <div class="detail-row">
-        <span class="detail-label">Retailer:</span>
-        <span class="detail-value">${bookingDetails.retailerName}</span>
+        <span class="detail-label">Business:</span>
+        <span class="detail-value">${bookingDetails.businessName}</span>
       </div>
       
       <div class="detail-row">
@@ -285,7 +770,7 @@ export class EmailService {
     </div>
     
     <div class="footer">
-      <p>If you need to make any changes to your booking, please contact ${bookingDetails.retailerName} directly.</p>
+      <p>If you need to make any changes to your booking, please contact ${bookingDetails.businessName} directly.</p>
       <p>Thank you for choosing Localito!</p>
     </div>
   </div>
@@ -300,10 +785,13 @@ export class EmailService {
     });
   }
 
-  // Retailer booking notification email
-  async sendBookingNotificationToRetailer(
-    retailerEmail: string,
-    retailerName: string,
+  /**
+   * Business booking notification email (legacy - uses inline HTML)
+   * @deprecated Consider migrating to React Email template
+   */
+  async sendBookingNotificationToBusiness(
+    businessEmail: string,
+    businessName: string,
     bookingDetails: {
       orderId: string;
       customerName: string;
@@ -443,7 +931,7 @@ export class EmailService {
       <h1>New Booking Received!</h1>
     </div>
     
-    <p>Hi ${retailerName},</p>
+    <p>Hi ${businessName},</p>
     
     <p>You have received a new booking. Please see the details below:</p>
     
@@ -498,7 +986,7 @@ export class EmailService {
     </div>
     
     <div style="text-align: center;">
-      <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/retailer/orders/${bookingDetails.orderId}" class="button">
+      <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/business/orders/${bookingDetails.orderId}" class="button">
         View Order Details
       </a>
     </div>
@@ -513,7 +1001,7 @@ export class EmailService {
     `;
 
     return this.sendEmail({
-      to: retailerEmail,
+      to: businessEmail,
       subject: `New Booking: ${formattedDate} at ${bookingDetails.bookingTime} - Order #${bookingDetails.orderId.slice(0, 8)}`,
       html,
     });
@@ -521,4 +1009,3 @@ export class EmailService {
 }
 
 export const emailService = new EmailService();
-
