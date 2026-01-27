@@ -263,11 +263,11 @@ export class ProductService {
 
   async getProductById(id: string): Promise<Product | undefined> {
     const result = await pool.query(
-      `SELECT p.*, r.business_name as business_name, r.id as business_user_id,
+      `SELECT p.*, b.business_name as business_name, b.id as business_user_id,
               COALESCE(p.review_count, 0) as review_count,
               COALESCE(p.average_rating, 0) as average_rating,
               p.sync_from_epos, p.square_item_id, p.last_epos_sync_at,
-              r.square_sync_enabled, r.square_access_token, r.square_location_id
+              b.square_sync_enabled, b.square_access_token, b.square_location_id
        FROM products p
        JOIN businesses b ON p.business_id = b.id
        WHERE p.id = $1`,
