@@ -231,6 +231,26 @@ async function testDashboardLoginLink() {
     const accountId = business.stripe_account_id;
 
     try {
+      // Check account type first
+      const account = await stripeService.retrieveAccount(accountId);
+      
+      if (account.type !== 'express') {
+        logTest(
+          "Dashboard Login Link",
+          true,
+          `Skipped: Account is ${account.type} type. Login links are only available for Express accounts. Standard accounts can access their dashboard at https://dashboard.stripe.com`,
+          {
+            accountId,
+            accountType: account.type,
+            note: "Standard accounts must access their dashboard through the Stripe Dashboard directly"
+          }
+        );
+        console.log(`\n📋 Account Type: ${account.type}`);
+        console.log(`   Login links are only available for Express accounts.`);
+        console.log(`   Standard accounts can access their dashboard at: https://dashboard.stripe.com\n`);
+        return;
+      }
+
       const loginLink = await stripeService.createExpressDashboardLoginLink(accountId);
       
       logTest(
@@ -240,13 +260,12 @@ async function testDashboardLoginLink() {
         {
           accountId,
           url: loginLink.url,
-          expiresAt: loginLink.expires_at,
           created: loginLink.created,
         }
       );
 
       console.log(`\n📋 Express Dashboard URL: ${loginLink.url}`);
-      console.log(`   Expires at: ${new Date(loginLink.expires_at * 1000).toISOString()}`);
+      console.log(`   Created at: ${new Date(loginLink.created * 1000).toISOString()}`);
       console.log(`   Use this URL to access the business's Stripe Dashboard\n`);
     } catch (error: any) {
       logTest(

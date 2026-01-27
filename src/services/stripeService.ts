@@ -50,8 +50,8 @@ export interface CommissionTier {
 export const COMMISSION_TIERS: CommissionTier[] = [
   { name: "Starter", minTurnover: 0, maxTurnover: 5000, commissionRate: 0.09 },      // 9%
   { name: "Growth", minTurnover: 5000, maxTurnover: 10000, commissionRate: 0.08 },    // 8%
-  { name: "Momentum", minTurnover: 10000, maxTurnover: 50000, commissionRate: 0.07 }, // 7%
-  { name: "Elite", minTurnover: 50000, maxTurnover: null, commissionRate: 0.06 },    // 6%
+  { name: "Momentum", minTurnover: 10000, maxTurnover: 25000, commissionRate: 0.07 }, // 7%
+  { name: "Elite", minTurnover: 25000, maxTurnover: null, commissionRate: 0.06 },    // 6%
 ];
 
 // Use 30-day rolling period (can be changed to calendar month)
@@ -596,9 +596,25 @@ export class StripeService {
    * @param accountId - The Stripe Connect account ID (acct_xxx)
    * @returns Login link object with URL that redirects to Express Dashboard
    */
-  async createExpressDashboardLoginLink(accountId: string) {
+  /**
+   * Retrieve Stripe account information by account ID
+   * @param accountId - The Stripe Connect account ID (acct_xxx)
+   * @returns Stripe account object
+   */
+  async retrieveAccount(accountId: string): Promise<Stripe.Account> {
+    return await this.stripe.accounts.retrieve(accountId);
+  }
+
+  async createExpressDashboardLoginLink(accountId: string): Promise<Stripe.LoginLink> {
     try {
       console.log(`[Stripe] Creating Express Dashboard login link for account: ${accountId}`);
+      
+      // Check account type first before attempting to create login link
+      const account = await this.retrieveAccount(accountId);
+      
+      if (account.type !== 'express') {
+        throw new Error(`Login links are only available for Express accounts. This account is of type '${account.type}'. Standard accounts must access their dashboard through the Stripe Dashboard directly.`);
+      }
       
       const loginLink = await this.stripe.accounts.createLoginLink(accountId);
       
