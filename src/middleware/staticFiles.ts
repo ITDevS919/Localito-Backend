@@ -18,10 +18,15 @@ export function serveStaticFiles(app: Express) {
   // Serve uploaded files
   app.use("/uploads", express.static(uploadsPath));
   
+  // Only serve static files if build directory exists
+  // This allows the backend to run even if frontend is served separately
   if (!fs.existsSync(distPath)) {
-    throw new Error(
-      `Could not find the build directory: ${distPath}, make sure to build the client first`
+    console.warn(
+      `[StaticFiles] Build directory not found: ${distPath}. ` +
+      `Static file serving is disabled. If you need the backend to serve the frontend, ` +
+      `build the client first with 'npm run build' in the client directory.`
     );
+    return;
   }
 
   app.use(express.static(distPath));
