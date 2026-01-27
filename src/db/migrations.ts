@@ -381,7 +381,65 @@ export async function runMigrations() {
       END $$;
     `);
 
-    // Update reviews table to support services
+    // ==================== SERVICES & BOOKING SYSTEM ====================
+    // Create services table BEFORE modifying reviews to reference it
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS services (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        price DECIMAL(10, 2) NOT NULL CHECK (price >= 0),
+        category VARCHAR(100) NOT NULL,
+        images TEXT[] DEFAULT ARRAY[]::TEXT[],
+        duration_minutes INTEGER NOT NULL CHECK (duration_minutes > 0),
+        is_approved BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        max_participants INTEGER DEFAULT 1 CHECK (max_participants > 0),
+        requires_staff BOOLEAN DEFAULT FALSE,
+        location_type VARCHAR(50) DEFAULT 'onsite' CHECK (location_type IN ('onsite', 'customer_address', 'online')),
+        review_count INTEGER DEFAULT 0,
+        average_rating DECIMAL(3, 2) DEFAULT 0.00
+      )
+    `);
+
+    // Create indexes for services (immediately after table creation)
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_services_business_id ON services(business_id)
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_services_category ON services(category)
+    `);
+
+    // Create cart_service_items table (depends on services)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS cart_service_items (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        service_id UUID NOT NULL REFERENCES services(id) ON DELETE CASCADE,
+        quantity INTEGER NOT NULL DEFAULT 1 CHECK (quantity > 0),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, service_id)
+      )
+    `);
+
+    // Create order_service_items table (depends on services and orders)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS order_service_items (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+        service_id UUID NOT NULL REFERENCES services(id) ON DELETE CASCADE,
+        quantity INTEGER NOT NULL CHECK (quantity > 0),
+        price DECIMAL(10, 2) NOT NULL CHECK (price >= 0),
+        booking_date DATE,
+        booking_time TIME,
+        booking_duration_minutes INTEGER
+      )
+    `);
+
+    // Update reviews table to support services (NOW services table exists)
     await client.query(`
       DO $$ 
       BEGIN
@@ -827,55 +885,8 @@ export async function runMigrations() {
       ADD COLUMN IF NOT EXISTS qr_code_scanned_by UUID REFERENCES users(id)
     `);
 
-    // ==================== SERVICES & BOOKING SYSTEM ====================
-    
-    // Create services table
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS services (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
-        name VARCHAR(255) NOT NULL,
-        description TEXT,
-        price DECIMAL(10, 2) NOT NULL CHECK (price >= 0),
-        category VARCHAR(100) NOT NULL,
-        images TEXT[] DEFAULT ARRAY[]::TEXT[],
-        duration_minutes INTEGER NOT NULL CHECK (duration_minutes > 0),
-        is_approved BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        max_participants INTEGER DEFAULT 1 CHECK (max_participants > 0),
-        requires_staff BOOLEAN DEFAULT FALSE,
-        location_type VARCHAR(50) DEFAULT 'onsite' CHECK (location_type IN ('onsite', 'customer_address', 'online')),
-        review_count INTEGER DEFAULT 0,
-        average_rating DECIMAL(3, 2) DEFAULT 0.00
-      )
-    `);
-
-    // Create cart_service_items table
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS cart_service_items (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        service_id UUID NOT NULL REFERENCES services(id) ON DELETE CASCADE,
-        quantity INTEGER NOT NULL DEFAULT 1 CHECK (quantity > 0),
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(user_id, service_id)
-      )
-    `);
-
-    // Create order_service_items table
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS order_service_items (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
-        service_id UUID NOT NULL REFERENCES services(id) ON DELETE CASCADE,
-        quantity INTEGER NOT NULL CHECK (quantity > 0),
-        price DECIMAL(10, 2) NOT NULL CHECK (price >= 0),
-        booking_date DATE,
-        booking_time TIME,
-        booking_duration_minutes INTEGER
-      )
-    `);
+    // ==================== SERVICES & BOOKING SYSTEM (CONTINUED) ====================
+    // Note: services, cart_service_items, and order_service_items tables were created earlier
 
     // Create business_availability_schedules table (weekly schedule)
     await client.query(`
@@ -953,15 +964,7 @@ export async function runMigrations() {
       )
     `);
 
-    // Create indexes for services and booking
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_services_business_id ON services(business_id)
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_services_category ON services(category)
-    `);
-
+    // Create additional indexes for services and booking (some were created earlier)
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_cart_service_items_user_id ON cart_service_items(user_id)
     `);
