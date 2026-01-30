@@ -302,7 +302,23 @@ router.get("/auth/google/callback",
         console.log(`[Google Auth] Request host: ${req.headers.host}`);
         
         if (user.role === "business") {
-          res.redirect(`${frontendUrl}/business/dashboard`);
+          // Check if business has completed onboarding
+          pool.query(
+            `SELECT onboarding_completed_at FROM businesses WHERE user_id = $1`,
+            [user.id]
+          ).then((result) => {
+            if (result.rows.length > 0 && result.rows[0].onboarding_completed_at) {
+              // Existing business that has completed onboarding
+              res.redirect(`${frontendUrl}/business/dashboard`);
+            } else {
+              // New business or hasn't completed onboarding yet
+              res.redirect(`${frontendUrl}/business/onboarding`);
+            }
+          }).catch((err) => {
+            console.error("[Google Auth] Error checking onboarding status:", err);
+            // Fallback to onboarding if error
+            res.redirect(`${frontendUrl}/business/onboarding`);
+          });
         } else if (user.role === "admin") {
           res.redirect(`${frontendUrl}/admin/dashboard`);
         } else {
@@ -687,6 +703,85 @@ router.get("/business/profile", isAuthenticated, async (req, res, next) => {
     }
 
     res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Get business onboarding status
+router.get("/business/onboarding-status", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can access this" });
+    }
+
+    // Get business info
+    const businessResult = await pool.query(
+      `SELECT 
+        b.business_name,
+        b.postcode,
+        b.city,
+        b.square_access_token,
+        b.square_location_id,
+        b.onboarding_completed_at,
+        (SELECT COUNT(*) FROM products WHERE business_id = b.id) as product_count
+       FROM businesses b
+       WHERE b.user_id = $1`,
+      [user.id]
+    );
+
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
+    }
+
+    const business = businessResult.rows[0];
+
+    // Check Stripe setup
+    const stripeResult = await pool.query(
+      `SELECT onboarding_completed FROM stripe_connect_accounts WHERE business_id = (
+        SELECT id FROM businesses WHERE user_id = $1
+      )`,
+      [user.id]
+    );
+
+    const profileComplete = !!(business.business_name && (business.postcode || business.city));
+    const squareConnected = !!(business.square_access_token && business.square_location_id);
+    const hasProducts = business.product_count > 0;
+    const stripeSetup = stripeResult.rows.length > 0 && stripeResult.rows[0].onboarding_completed;
+
+    res.json({
+      success: true,
+      data: {
+        profileComplete,
+        squareConnected,
+        hasProducts,
+        stripeSetup,
+        onboardingCompletedAt: business.onboarding_completed_at,
+        allComplete: profileComplete && hasProducts && stripeSetup,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Mark business onboarding as complete
+router.post("/business/onboarding-complete", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can complete onboarding" });
+    }
+
+    await pool.query(
+      `UPDATE businesses 
+       SET onboarding_completed_at = CURRENT_TIMESTAMP 
+       WHERE user_id = $1`,
+      [user.id]
+    );
+
+    res.json({ success: true, message: "Onboarding marked as complete" });
   } catch (error) {
     next(error);
   }
@@ -5514,7 +5609,7 @@ router.get("/business/stripe/onboarding-link", isAuthenticated, async (req, res,
     }
 
     const businessResult = await pool.query(
-      "SELECT id, business_name, address, city, postcode FROM businesses WHERE user_id = $1",
+      "SELECT id, business_name, business_address, city, postcode FROM businesses WHERE user_id = $1",
       [user.id]
     );
 
@@ -5571,22 +5666,27 @@ router.get("/business/stripe/onboarding-link", isAuthenticated, async (req, res,
       data: { url: accountLink.url } 
     });
   } catch (error: any) {
+    const errMessage = error?.message || String(error);
     console.error("[Stripe Onboarding] Error:", {
       userId: user?.id,
       businessId: business?.id,
-      error: error.message,
-      type: error.type,
-      code: error.code,
+      error: errMessage,
+      type: error?.type,
+      code: error?.code,
     });
-    
-    // Provide user-friendly error messages
-    if (error.message?.includes('account')) {
+
+    // User-friendly message; in development include detail to help debug
+    const isDev = process.env.NODE_ENV !== "production";
+    const publicMessage = "Failed to set up Stripe account. Please try again or contact support.";
+    const detail = isDev && errMessage ? ` (${errMessage})` : "";
+
+    if (errMessage?.toLowerCase().includes("account") || error?.code) {
       return res.status(400).json({
         success: false,
-        message: "Failed to set up Stripe account. Please try again or contact support.",
+        message: publicMessage + detail,
       });
     }
-    
+
     next(error);
   }
 });
