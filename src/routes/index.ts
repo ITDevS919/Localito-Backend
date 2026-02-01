@@ -489,7 +489,7 @@ import { pool } from "../db/connection";
 router.get("/products", async (req, res, next) => {
   try {
     console.log(`[Products API] Request received with query params:`, req.query);
-    const { category, search, businessId, location, latitude, longitude, radiusKm, page, limit } = req.query;
+    const { category, search, businessId, businessType, location, latitude, longitude, radiusKm, page, limit } = req.query;
     
     let lat: number | undefined;
     let lon: number | undefined;
@@ -549,6 +549,7 @@ router.get("/products", async (req, res, next) => {
       category: category as string,
       search: search as string,
       businessId: businessId as string,
+      businessTypeCategoryId: businessType as string,
       location: locationForSearch, // Use text search only if no coordinates or radius is 0
       latitude: lat,
       longitude: lon,
@@ -691,9 +692,10 @@ router.get("/business/profile", isAuthenticated, async (req, res, next) => {
     }
 
     const result = await pool.query(
-      `SELECT b.*, u.email
+      `SELECT b.*, u.email, c.name as primary_category_name
        FROM businesses b
        JOIN users u ON b.user_id = u.id
+       LEFT JOIN categories c ON b.primary_category_id = c.id
        WHERE b.user_id = $1`,
       [user.id]
     );
@@ -702,7 +704,14 @@ router.get("/business/profile", isAuthenticated, async (req, res, next) => {
       return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    res.json({ success: true, data: result.rows[0] });
+    const row = result.rows[0];
+    res.json({
+      success: true,
+      data: {
+        ...row,
+        primary_category_name: row.primary_category_name || null,
+      },
+    });
   } catch (error) {
     next(error);
   }
@@ -795,10 +804,17 @@ router.put("/business/settings", isAuthenticated, async (req, res, next) => {
       return res.status(403).json({ success: false, message: "Only businesses can update settings" });
     }
 
-    const { businessName, businessAddress, postcode, city, phone, sameDayPickupAllowed, cutoffTime } = req.body;
+    const { businessName, businessAddress, postcode, city, phone, sameDayPickupAllowed, cutoffTime, primaryCategoryId, businessType } = req.body;
 
     if (!businessName || businessName.trim().length === 0) {
       return res.status(400).json({ success: false, message: "Business name is required" });
+    }
+
+    // Validate businessType if provided
+    if (businessType !== undefined && businessType !== null && businessType !== "") {
+      if (!["product", "service"].includes(businessType)) {
+        return res.status(400).json({ success: false, message: "Business type must be 'product' or 'service'" });
+      }
     }
 
     // Get business ID
@@ -846,6 +862,16 @@ router.put("/business/settings", isAuthenticated, async (req, res, next) => {
       validatedCutoffTime = `${parts[0]}:${parts[1]}:${parts[2] || '00'}`;
     }
 
+    // Validate primary_category_id if provided (must exist in categories)
+    let validatedPrimaryCategoryId: string | null = null;
+    if (primaryCategoryId !== undefined && primaryCategoryId !== null && primaryCategoryId !== "") {
+      const catCheck = await pool.query("SELECT id FROM categories WHERE id = $1", [primaryCategoryId]);
+      if (catCheck.rows.length === 0) {
+        return res.status(400).json({ success: false, message: "Invalid business type (category)" });
+      }
+      validatedPrimaryCategoryId = primaryCategoryId;
+    }
+
     // Update business profile
     const updateResult = await pool.query(
       `UPDATE businesses 
@@ -857,8 +883,10 @@ router.put("/business/settings", isAuthenticated, async (req, res, next) => {
            latitude = $6,
            longitude = $7,
            same_day_pickup_allowed = $8,
-           cutoff_time = $9
-       WHERE id = $10
+           cutoff_time = $9,
+           primary_category_id = $10,
+           business_type = $11
+       WHERE id = $12
        RETURNING *`,
       [
         businessName, 
@@ -870,6 +898,8 @@ router.put("/business/settings", isAuthenticated, async (req, res, next) => {
         longitude,
         sameDayPickupAllowed !== undefined ? sameDayPickupAllowed : true,
         validatedCutoffTime,
+        validatedPrimaryCategoryId,
+        businessType || null,
         businessId
       ]
     );
@@ -1375,7 +1405,7 @@ router.delete("/cart/:productId", isAuthenticated, async (req, res, next) => {
 // Get all services (public)
 router.get("/services", async (req, res, next) => {
   try {
-    const { category, businessId, search } = req.query;
+    const { category, businessId, businessType, search } = req.query;
     let query = `
       SELECT s.*, b.business_name as business_name, b.business_address, b.city
       FROM services s
@@ -1395,6 +1425,12 @@ router.get("/services", async (req, res, next) => {
       paramCount++;
       query += ` AND s.business_id = $${paramCount}`;
       params.push(businessId);
+    }
+
+    if (businessType) {
+      paramCount++;
+      query += ` AND b.primary_category_id = $${paramCount}`;
+      params.push(businessType);
     }
 
     if (search) {
@@ -4232,12 +4268,36 @@ router.put("/admin/settings/commission", isAuthenticated, async (req, res, next)
   }
 });
 
-// Public: Get active categories (for search page and product creation)
+// Public: Get active categories (for search page and product/service creation)
+// Query: for=product -> top-level only (parent_id IS NULL). for=service -> service subcategories only (children of Services).
 router.get("/categories", async (req, res, next) => {
   try {
-    const result = await pool.query(
-      "SELECT id, name, description FROM categories WHERE is_active = TRUE ORDER BY name ASC"
-    );
+    const { for: forParam } = req.query;
+    let result;
+
+    if (forParam === "service") {
+      // Return only service subcategories (children of "Services") for service creation dropdown
+      result = await pool.query(
+        `SELECT c.id, c.name, c.description, c.parent_id
+         FROM categories c
+         JOIN categories parent ON parent.id = c.parent_id AND parent.name = 'Services'
+         WHERE c.is_active = TRUE
+         ORDER BY c.name ASC`
+      );
+    } else if (forParam === "product") {
+      // Return only top-level categories (no parent) for product creation; exclude "Services" so products use product categories
+      result = await pool.query(
+        `SELECT id, name, description, parent_id
+         FROM categories
+         WHERE is_active = TRUE AND parent_id IS NULL AND name != 'Services'
+         ORDER BY name ASC`
+      );
+    } else {
+      // All active categories with parent_id (for search filters and business type)
+      result = await pool.query(
+        `SELECT id, name, description, parent_id FROM categories WHERE is_active = TRUE ORDER BY COALESCE(parent_id::text, '') ASC, name ASC`
+      );
+    }
 
     res.json({ success: true, data: result.rows });
   } catch (error) {
@@ -4254,7 +4314,7 @@ router.get("/admin/categories", isAuthenticated, async (req, res, next) => {
     }
 
     const result = await pool.query(
-      "SELECT * FROM categories ORDER BY name ASC"
+      "SELECT * FROM categories ORDER BY COALESCE(parent_id::text, '') ASC, name ASC"
     );
 
     res.json({ success: true, data: result.rows });
@@ -4270,16 +4330,16 @@ router.post("/admin/categories", isAuthenticated, async (req, res, next) => {
       return res.status(403).json({ success: false, message: "Only admins can access this" });
     }
 
-    const { name, description } = req.body;
+    const { name, description, parent_id: parentId } = req.body;
     if (!name || typeof name !== "string" || name.trim().length === 0) {
       return res.status(400).json({ success: false, message: "Category name is required" });
     }
 
     const result = await pool.query(
-      `INSERT INTO categories (name, description)
-       VALUES ($1, $2)
+      `INSERT INTO categories (name, description, parent_id)
+       VALUES ($1, $2, $3)
        RETURNING *`,
-      [name.trim(), description || null]
+      [name.trim(), description || null, parentId || null]
     );
 
     res.status(201).json({ success: true, data: result.rows[0] });
@@ -4298,7 +4358,7 @@ router.put("/admin/categories/:id", isAuthenticated, async (req, res, next) => {
       return res.status(403).json({ success: false, message: "Only admins can access this" });
     }
 
-    const { name, description, is_active } = req.body;
+    const { name, description, is_active, parent_id: parentId } = req.body;
     const updates: string[] = [];
     const params: any[] = [];
     let paramCount = 1;
@@ -4314,6 +4374,10 @@ router.put("/admin/categories/:id", isAuthenticated, async (req, res, next) => {
     if (is_active !== undefined) {
       updates.push(`is_active = $${paramCount++}`);
       params.push(is_active);
+    }
+    if (parentId !== undefined) {
+      updates.push(`parent_id = $${paramCount++}`);
+      params.push(parentId || null);
     }
 
     if (updates.length === 0) {
@@ -4855,8 +4919,10 @@ router.get("/business/:businessId/public", async (req, res, next) => {
 
     const result = await pool.query(
       `SELECT b.*, 
-       (SELECT COUNT(*) FROM business_followers WHERE business_id = b.id) as follower_count
+       (SELECT COUNT(*) FROM business_followers WHERE business_id = b.id) as follower_count,
+       c.name as primary_category_name
        FROM businesses b
+       LEFT JOIN categories c ON b.primary_category_id = c.id
        WHERE b.id = $1 AND b.is_approved = true`,
       [businessId]
     );

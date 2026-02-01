@@ -27,6 +27,7 @@ export const businessDataSchema = z.object({
   postcode: z.string().optional(),
   city: z.string().optional(),
   phone: z.string().optional(),
+  businessType: z.enum(["product", "service"]).optional(),
 }).refine(
   (data) => data.postcode || data.city,
   {

@@ -7,6 +7,7 @@ export class ProductService {
   async getProducts(filters?: {
     category?: string;
     businessId?: string;
+    businessTypeCategoryId?: string; // business's primary_category_id (business type)
     isApproved?: boolean;
     search?: string;
     location?: string;
@@ -38,6 +39,12 @@ export class ProductService {
     if (filters?.businessId) {
       query += ` AND p.business_id = $${paramCount}`;
       params.push(filters.businessId);
+      paramCount++;
+    }
+
+    if (filters?.businessTypeCategoryId) {
+      query += ` AND b.primary_category_id = $${paramCount}`;
+      params.push(filters.businessTypeCategoryId);
       paramCount++;
     }
 

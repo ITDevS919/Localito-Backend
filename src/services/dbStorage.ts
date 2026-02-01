@@ -142,8 +142,8 @@ export class DbStorage {
       }
 
       await pool.query(
-        `INSERT INTO businesses (user_id, business_name, business_address, postcode, city, phone, latitude, longitude, is_approved) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        `INSERT INTO businesses (user_id, business_name, business_address, postcode, city, phone, latitude, longitude, is_approved, business_type) 
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
         [
           row.id,
           businessData.businessName,
@@ -153,7 +153,8 @@ export class DbStorage {
           businessData.phone || null,
           latitude,
           longitude,
-          false
+          false,
+          businessData.businessType || null
         ]
       );
     }

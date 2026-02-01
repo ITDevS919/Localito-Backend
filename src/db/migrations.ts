@@ -849,6 +849,95 @@ export async function runMigrations() {
       ON CONFLICT (name) DO NOTHING
     `);
 
+    // Add parent_id to categories for hierarchy (e.g. Services > Cleaners, Hairdressers, etc.)
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                      WHERE table_name = 'categories' AND column_name = 'parent_id') THEN
+          ALTER TABLE categories ADD COLUMN parent_id UUID REFERENCES categories(id) ON DELETE SET NULL;
+        END IF;
+      END $$;
+    `);
+
+    // Insert service subcategories (children of Services)
+    await client.query(`
+      INSERT INTO categories (name, description, parent_id)
+      SELECT v.name, v.description, parent.id
+      FROM (VALUES
+        ('Cleaners', 'Cleaning services'),
+        ('Hairdressers', 'Hairdressers, barbers, salons'),
+        ('Massage Therapists', 'Massage, physiotherapy, wellness'),
+        ('Tailors & Alterations', 'Tailors, alterations'),
+        ('Dry Cleaning', 'Dry cleaners'),
+        ('Printing & Copying', 'Printing, copying'),
+        ('Key Cutting', 'Key cutting'),
+        ('Repairs', 'General repairs'),
+        ('Beauty & Nails', 'Beauty salons, nail technicians'),
+        ('Other Services', 'Other local services')
+      ) AS v(name, description)
+      CROSS JOIN (SELECT id FROM categories WHERE name = 'Services' LIMIT 1) parent(id)
+      ON CONFLICT (name) DO NOTHING
+    `);
+
+    // Add primary_category_id (business type) to businesses – references categories.id
+    await client.query(`
+      DO $$ 
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='businesses' AND column_name='primary_category_id') THEN
+          ALTER TABLE businesses ADD COLUMN primary_category_id UUID REFERENCES categories(id) ON DELETE SET NULL;
+        END IF;
+      END $$;
+    `);
+
+    // Backfill primary_category_id from most common product category (then service) per business
+    // Uses a simpler query to avoid correlated subquery syntax issues in some PostgreSQL versions
+    await client.query(`
+      UPDATE businesses b
+      SET primary_category_id = (
+        SELECT c.id FROM categories c
+        WHERE c.name = (
+          SELECT COALESCE(
+            (SELECT p.category FROM products p
+             WHERE p.business_id = b.id AND p.is_approved = true
+             GROUP BY p.category ORDER BY COUNT(*) DESC LIMIT 1),
+            (SELECT s.category FROM services s
+             WHERE s.business_id = b.id AND s.is_approved = true
+             GROUP BY s.category ORDER BY COUNT(*) DESC LIMIT 1)
+          )
+        )
+        LIMIT 1
+      )
+      WHERE b.primary_category_id IS NULL
+        AND (
+          EXISTS (SELECT 1 FROM products p WHERE p.business_id = b.id)
+          OR EXISTS (SELECT 1 FROM services s WHERE s.business_id = b.id)
+        )
+    `);
+
+    // Add business_type column to businesses table
+    await client.query(`
+      DO $$ 
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='businesses' AND column_name='business_type') THEN
+          ALTER TABLE businesses ADD COLUMN business_type VARCHAR(20) CHECK (business_type IN ('product', 'service'));
+        END IF;
+      END $$;
+    `);
+
+    // Backfill business_type based on existing products/services
+    await client.query(`
+      UPDATE businesses b
+      SET business_type = CASE
+        WHEN EXISTS (SELECT 1 FROM products p WHERE p.business_id = b.id) THEN 'product'
+        WHEN EXISTS (SELECT 1 FROM services s WHERE s.business_id = b.id) THEN 'service'
+        ELSE NULL
+      END
+      WHERE b.business_type IS NULL
+    `);
+
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_order_discount_codes_discount_code_id ON order_discount_codes(discount_code_id)
     `);

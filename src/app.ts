@@ -23,16 +23,31 @@ app.set('trust proxy', 1);
 
 // Middleware - CORS configuration
 // Support multiple origins (comma-separated) for production
-const allowedOrigins = process.env.FRONTEND_URL 
-  ? process.env.FRONTEND_URL.split(',').map(url => url.trim())
-  : ["http://localhost:5173"];
+// Include common Vite dev ports (5173, 5174, 5175) when multiple instances run
+const localOrigins = [
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "http://localhost:5174",
+  "http://127.0.0.1:5174",
+  "http://localhost:5175",
+  "http://127.0.0.1:5175",
+];
+const envOrigins = process.env.FRONTEND_URL 
+  ? process.env.FRONTEND_URL.split(',').map((url: string) => url.trim()).filter(Boolean)
+  : [];
+const allowedOrigins = [...new Set([...localOrigins, ...envOrigins])];
+
+// In development, allow local network origins (e.g. http://192.168.x.x:5175)
+const isDev = process.env.NODE_ENV !== "production";
+const localNetworkPattern = /^http:\/\/(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+)(:\d+)?$/;
 
 app.use(cors({
   origin: (origin, callback) => {
     // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return callback(null, true);
     
-    if (allowedOrigins.includes(origin)) {
+    const isAllowed = allowedOrigins.includes(origin) || (isDev && localNetworkPattern.test(origin));
+    if (isAllowed) {
       callback(null, true);
     } else {
       console.warn(`[CORS] Blocked origin: ${origin}`);
@@ -98,9 +113,11 @@ app.use((err: any, req: Request, res: Response, next: NextFunction) => {
     // JSON parse error or body too large
     const origin = req.headers.origin;
     if (origin) {
-      const allowedOrigins = process.env.FRONTEND_URL 
-        ? process.env.FRONTEND_URL.split(',').map(url => url.trim())
-        : ["http://localhost:5173"];
+      const localOrigins = ["http://localhost:5173", "http://127.0.0.1:5173"];
+      const envOrigins = process.env.FRONTEND_URL 
+        ? process.env.FRONTEND_URL.split(',').map((url: string) => url.trim()).filter(Boolean)
+        : [];
+      const allowedOrigins = [...new Set([...localOrigins, ...envOrigins])];
       
       if (allowedOrigins.includes(origin)) {
         res.setHeader('Access-Control-Allow-Origin', origin);
