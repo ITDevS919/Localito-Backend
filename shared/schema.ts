@@ -99,9 +99,10 @@ export interface Product {
   updatedAt: Date;
   reviewCount?: number;
   averageRating?: number;
-  // EPOS sync fields
+  // EPOS sync fields (Square or Shopify)
   syncFromEpos?: boolean;
   squareItemId?: string;
+  shopifyProductId?: string;
   lastEposSyncAt?: Date;
 }
 

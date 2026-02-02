@@ -483,6 +483,7 @@ import { productService } from "../services/productService";
 const availabilityService = new AvailabilityService();
 import { geocodingService } from "../services/geocodingService";
 import { squareService } from "../services/squareService";
+import * as shopifyService from "../services/shopifyService";
 import { pool } from "../db/connection";
 
 // Get products (public)
@@ -636,7 +637,7 @@ router.post("/products", isAuthenticated, async (req, res, next) => {
       return res.status(404).json({ success: false, message: "Business profile not found" });
     }
 
-    const { name, description, price, stock, category, images, syncFromEpos, squareItemId } = req.body;
+    const { name, description, price, stock, category, images, syncFromEpos, squareItemId, shopifyProductId } = req.body;
     const product = await productService.createProduct({
       businessId,
       name,
@@ -647,6 +648,7 @@ router.post("/products", isAuthenticated, async (req, res, next) => {
       images,
       syncFromEpos: syncFromEpos || false,
       squareItemId: squareItemId || null,
+      shopifyProductId: shopifyProductId || null,
     });
 
     res.status(201).json({ success: true, data: product });
@@ -1207,7 +1209,7 @@ router.put("/products/:id", isAuthenticated, async (req, res, next) => {
       return res.status(403).json({ success: false, message: "You can only update your own products" });
     }
 
-    const { name, description, price, stock, category, images, syncFromEpos, squareItemId } = req.body;
+    const { name, description, price, stock, category, images, syncFromEpos, squareItemId, shopifyProductId } = req.body;
     const updatedProduct = await productService.updateProduct(req.params.id, {
       name,
       description,
@@ -1217,6 +1219,7 @@ router.put("/products/:id", isAuthenticated, async (req, res, next) => {
       images,
       syncFromEpos,
       squareItemId,
+      shopifyProductId,
     });
 
     res.json({ success: true, data: updatedProduct });
@@ -4602,6 +4605,219 @@ router.get("/business/square/items/:itemId/details", isAuthenticated, async (req
       success: true,
       data: details,
     });
+  } catch (error: any) {
+    next(error);
+  }
+});
+
+// ==================== SHOPIFY INTEGRATION ====================
+
+// Start Shopify OAuth – redirect merchant to Shopify to install/authorize app
+router.get("/shopify/auth", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can connect Shopify" });
+    }
+    const shop = (req.query.shop as string)?.trim();
+    if (!shop) {
+      return res.status(400).json({ success: false, message: "Query parameter 'shop' is required (e.g. mystore.myshopify.com)" });
+    }
+    const businessResult = await pool.query(
+      "SELECT id FROM businesses WHERE user_id = $1",
+      [user.id]
+    );
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
+    }
+    const businessId = businessResult.rows[0].id;
+    const state = Buffer.from(JSON.stringify({ businessId })).toString("base64url");
+    const backendUrl = process.env.BACKEND_URL || process.env.API_URL || `${req.protocol}://${req.get("host")}`;
+    const redirectUri = `${backendUrl.replace(/\/$/, "")}/api/shopify/callback`;
+    const authUrl = shopifyService.getAuthUrl(shop, state, redirectUri);
+    return res.redirect(302, authUrl);
+  } catch (error: any) {
+    next(error);
+  }
+});
+
+// Shopify OAuth callback – exchange code for token, save to business, redirect to frontend
+router.get("/shopify/callback", async (req, res, next) => {
+  try {
+    const { code, shop, state } = req.query as Record<string, string | undefined>;
+    if (!code || !shop) {
+      const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+      return res.redirect(302, `${frontendUrl}/business/shopify-settings?error=missing_params`);
+    }
+    let businessId: string | undefined;
+    try {
+      const parsed = JSON.parse(Buffer.from(state || "", "base64url").toString());
+      businessId = parsed?.businessId;
+    } catch {
+      businessId = undefined;
+    }
+    if (!businessId) {
+      const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+      return res.redirect(302, `${frontendUrl}/business/shopify-settings?error=invalid_state`);
+    }
+    const accessToken = await shopifyService.exchangeCodeForToken(shop, code);
+    const normalizedShop = shopifyService.normalizeShop(shop);
+    await pool.query(
+      `UPDATE businesses
+       SET shopify_shop = $1, shopify_access_token = $2, shopify_connected_at = CURRENT_TIMESTAMP, shopify_sync_enabled = true
+       WHERE id = $3`,
+      [normalizedShop, accessToken, businessId]
+    );
+    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+    return res.redirect(302, `${frontendUrl}/business/shopify-settings?connected=1`);
+  } catch (err: any) {
+    console.error("[Shopify] OAuth callback error:", err?.message || err);
+    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+    return res.redirect(302, `${frontendUrl}/business/shopify-settings?error=oauth_failed`);
+  }
+});
+
+// Get Shopify connection status
+router.get("/business/shopify/status", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can view Shopify status" });
+    }
+    const businessResult = await pool.query(
+      `SELECT shopify_shop, shopify_access_token, shopify_sync_enabled, shopify_connected_at
+       FROM businesses WHERE user_id = $1`,
+      [user.id]
+    );
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
+    }
+    const business = businessResult.rows[0];
+    const isConnected = !!(business.shopify_shop && business.shopify_access_token);
+    res.json({
+      success: true,
+      data: {
+        connected: isConnected,
+        syncEnabled: business.shopify_sync_enabled ?? false,
+        connectedAt: business.shopify_connected_at ?? null,
+        shop: business.shopify_shop ?? null,
+      },
+    });
+  } catch (error: any) {
+    next(error);
+  }
+});
+
+// Disconnect Shopify account
+router.delete("/business/shopify/disconnect", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can disconnect Shopify" });
+    }
+    const businessResult = await pool.query(
+      "SELECT id FROM businesses WHERE user_id = $1",
+      [user.id]
+    );
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
+    }
+    const businessId = businessResult.rows[0].id;
+    await pool.query(
+      `UPDATE businesses
+       SET shopify_shop = NULL, shopify_access_token = NULL, shopify_connected_at = NULL, shopify_sync_enabled = false
+       WHERE id = $1`,
+      [businessId]
+    );
+    res.json({ success: true, message: "Shopify account disconnected successfully" });
+  } catch (error: any) {
+    next(error);
+  }
+});
+
+// Test Shopify connection
+router.post("/business/shopify/test", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can test Shopify connection" });
+    }
+    const businessResult = await pool.query(
+      `SELECT shopify_shop, shopify_access_token FROM businesses WHERE user_id = $1`,
+      [user.id]
+    );
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
+    }
+    const business = businessResult.rows[0];
+    if (!business.shopify_access_token || !business.shopify_shop) {
+      return res.status(400).json({ success: false, message: "Shopify account not connected" });
+    }
+    const isValid = await shopifyService.validateConnection(
+      business.shopify_access_token,
+      business.shopify_shop
+    );
+    res.json({
+      success: true,
+      data: { valid: isValid, message: isValid ? "Connection OK" : "Connection failed" },
+    });
+  } catch (error: any) {
+    next(error);
+  }
+});
+
+// Get Shopify products (catalog items for linking/sync)
+router.get("/business/shopify/items", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can list Shopify products" });
+    }
+    const businessResult = await pool.query(
+      `SELECT shopify_shop, shopify_access_token FROM businesses WHERE user_id = $1`,
+      [user.id]
+    );
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
+    }
+    const business = businessResult.rows[0];
+    if (!business.shopify_access_token || !business.shopify_shop) {
+      return res.status(400).json({ success: false, message: "Shopify account not connected" });
+    }
+    const items = await shopifyService.getProducts(
+      business.shopify_access_token,
+      business.shopify_shop
+    );
+    res.json({ success: true, data: items });
+  } catch (error: any) {
+    next(error);
+  }
+});
+
+// Get Shopify product details (price, stock) for linking
+router.get("/business/shopify/items/:productId/details", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can access this" });
+    }
+    const businessResult = await pool.query(
+      `SELECT shopify_shop, shopify_access_token FROM businesses WHERE user_id = $1`,
+      [user.id]
+    );
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
+    }
+    const business = businessResult.rows[0];
+    if (!business.shopify_access_token || !business.shopify_shop) {
+      return res.status(400).json({ success: false, message: "Shopify account not connected" });
+    }
+    const details = await shopifyService.getProductDetails(
+      business.shopify_access_token,
+      business.shopify_shop,
+      req.params.productId
+    );
+    res.json({ success: true, data: details });
   } catch (error: any) {
     next(error);
   }

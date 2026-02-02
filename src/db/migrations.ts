@@ -114,6 +114,29 @@ export async function runMigrations() {
       END $$;
     `);
 
+    // Add Shopify integration fields to businesses table
+    await client.query(`
+      DO $$ 
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='businesses' AND column_name='shopify_shop') THEN
+          ALTER TABLE businesses ADD COLUMN shopify_shop VARCHAR(255);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='businesses' AND column_name='shopify_access_token') THEN
+          ALTER TABLE businesses ADD COLUMN shopify_access_token TEXT;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='businesses' AND column_name='shopify_connected_at') THEN
+          ALTER TABLE businesses ADD COLUMN shopify_connected_at TIMESTAMP;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='businesses' AND column_name='shopify_sync_enabled') THEN
+          ALTER TABLE businesses ADD COLUMN shopify_sync_enabled BOOLEAN DEFAULT FALSE;
+        END IF;
+      END $$;
+    `);
+
     // Create products table
     await client.query(`
       CREATE TABLE IF NOT EXISTS products (
@@ -388,6 +411,10 @@ export async function runMigrations() {
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
                       WHERE table_name='products' AND column_name='last_epos_sync_at') THEN
           ALTER TABLE products ADD COLUMN last_epos_sync_at TIMESTAMP;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='products' AND column_name='shopify_product_id') THEN
+          ALTER TABLE products ADD COLUMN shopify_product_id VARCHAR(255);
         END IF;
       END $$;
     `);

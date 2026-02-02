@@ -1,6 +1,7 @@
 import { pool } from "../db/connection";
 import type { Product } from "../../shared/schema";
 import { squareService } from "./squareService";
+import * as shopifyService from "./shopifyService";
 import { geocodingService } from "./geocodingService";
 
 export class ProductService {
@@ -21,8 +22,9 @@ export class ProductService {
       SELECT p.*, b.business_name as business_name, b.postcode, b.city, b.latitude, b.longitude,
              COALESCE(p.review_count, 0) as review_count,
              COALESCE(p.average_rating, 0) as average_rating,
-             p.sync_from_epos, p.square_item_id, p.last_epos_sync_at,
-             b.square_sync_enabled, b.square_access_token, b.square_location_id
+             p.sync_from_epos, p.square_item_id, p.shopify_product_id, p.last_epos_sync_at,
+             b.square_sync_enabled, b.square_access_token, b.square_location_id,
+             b.shopify_sync_enabled, b.shopify_access_token, b.shopify_shop
       FROM products p
       JOIN businesses b ON p.business_id = b.id
       WHERE 1=1
@@ -151,18 +153,25 @@ export class ProductService {
     // Sync stock from Square for products with EPOS sync enabled
     // Do this in parallel for better performance
     const syncPromises = result.rows
-      .filter((row) => row.sync_from_epos && row.square_item_id && row.square_sync_enabled && row.square_access_token && row.square_location_id)
+      .filter((row) => {
+        if (!row.sync_from_epos) return false;
+        if (row.square_item_id && row.square_sync_enabled && row.square_access_token && row.square_location_id) return true;
+        if (row.shopify_product_id && row.shopify_sync_enabled && row.shopify_access_token && row.shopify_shop) return true;
+        return false;
+      })
       .map(async (row) => {
         try {
-          const syncResult = await squareService.syncProductStock(row.id);
+          const syncResult = row.square_item_id
+            ? await squareService.syncProductStock(row.id)
+            : row.shopify_product_id
+              ? await shopifyService.syncProductStock(row.id)
+              : { success: false as const, stock: null };
           if (syncResult.success && syncResult.stock !== null) {
-            // Update the row with synced stock
             row.stock = syncResult.stock;
             row.last_epos_sync_at = new Date();
           }
         } catch (error) {
           console.error(`[ProductService] Failed to sync stock for product ${row.id}:`, error);
-          // Continue with local stock value on error
         }
       });
 
@@ -194,6 +203,7 @@ export class ProductService {
       // Include EPOS sync fields
       syncFromEpos: row.sync_from_epos || false,
       squareItemId: row.square_item_id || null,
+      shopifyProductId: row.shopify_product_id || null,
       lastEposSyncAt: row.last_epos_sync_at || null,
         }));
 
@@ -273,8 +283,9 @@ export class ProductService {
       `SELECT p.*, b.business_name as business_name, b.id as business_user_id,
               COALESCE(p.review_count, 0) as review_count,
               COALESCE(p.average_rating, 0) as average_rating,
-              p.sync_from_epos, p.square_item_id, p.last_epos_sync_at,
-              b.square_sync_enabled, b.square_access_token, b.square_location_id
+              p.sync_from_epos, p.square_item_id, p.shopify_product_id, p.last_epos_sync_at,
+              b.square_sync_enabled, b.square_access_token, b.square_location_id,
+              b.shopify_sync_enabled, b.shopify_access_token, b.shopify_shop
        FROM products p
        JOIN businesses b ON p.business_id = b.id
        WHERE p.id = $1`,
@@ -287,17 +298,20 @@ export class ProductService {
 
     const row = result.rows[0];
 
-    // Sync stock from Square if EPOS sync is enabled
-    if (row.sync_from_epos && row.square_item_id && row.square_sync_enabled && row.square_access_token && row.square_location_id) {
+    // Sync stock from Square or Shopify if EPOS sync is enabled
+    if (row.sync_from_epos) {
       try {
-        const syncResult = await squareService.syncProductStock(id);
+        const syncResult = row.square_item_id && row.square_sync_enabled && row.square_access_token && row.square_location_id
+          ? await squareService.syncProductStock(id)
+          : row.shopify_product_id && row.shopify_sync_enabled && row.shopify_access_token && row.shopify_shop
+            ? await shopifyService.syncProductStock(id)
+            : { success: false as const, stock: null };
         if (syncResult.success && syncResult.stock !== null) {
           row.stock = syncResult.stock;
           row.last_epos_sync_at = new Date();
         }
       } catch (error) {
         console.error(`[ProductService] Failed to sync stock for product ${id}:`, error);
-        // Continue with local stock value on error
       }
     }
 
@@ -317,6 +331,7 @@ export class ProductService {
       averageRating: parseFloat(row.average_rating) || 0,
       syncFromEpos: row.sync_from_epos || false,
       squareItemId: row.square_item_id || null,
+      shopifyProductId: row.shopify_product_id || null,
       lastEposSyncAt: row.last_epos_sync_at || null,
     };
   }
@@ -331,65 +346,66 @@ export class ProductService {
     images?: string[];
     syncFromEpos?: boolean;
     squareItemId?: string;
+    shopifyProductId?: string;
   }): Promise<Product> {
     let finalStock = product.stock;
     let lastEposSyncAt: Date | null = null;
-    
-    // If EPOS sync is enabled, fetch stock from Square
-    if (product.syncFromEpos && product.squareItemId) {
+
+    // If EPOS sync is enabled, fetch stock from Square or Shopify
+    if (product.syncFromEpos) {
       try {
-        // Get business's Square credentials
         const businessResult = await pool.query(
-          `SELECT square_access_token, square_location_id, square_sync_enabled
+          `SELECT square_access_token, square_location_id, square_sync_enabled,
+                  shopify_access_token, shopify_shop, shopify_sync_enabled
            FROM businesses WHERE id = $1`,
           [product.businessId]
         );
-        
         if (businessResult.rows.length > 0) {
           const business = businessResult.rows[0];
-          
-          if (business.square_sync_enabled && 
-              business.square_access_token && 
-              business.square_location_id) {
-            
-            // Fetch stock from Square
+          if (product.squareItemId && business.square_sync_enabled && business.square_access_token && business.square_location_id) {
             const stock = await squareService.getItemStock(
               business.square_access_token,
               business.square_location_id,
               product.squareItemId
             );
-            
             if (stock !== null) {
               finalStock = stock;
               lastEposSyncAt = new Date();
-              console.log(`[ProductService] Synced stock from Square: ${stock} for item ${product.squareItemId}`);
-            } else {
-              console.warn(`[ProductService] Failed to sync stock from Square for item ${product.squareItemId}, using provided stock: ${product.stock}`);
+            }
+          } else if (product.shopifyProductId && business.shopify_sync_enabled && business.shopify_access_token && business.shopify_shop) {
+            const stock = await shopifyService.getProductStock(
+              business.shopify_access_token,
+              business.shopify_shop,
+              product.shopifyProductId
+            );
+            if (stock !== null) {
+              finalStock = stock;
+              lastEposSyncAt = new Date();
             }
           }
         }
-      } catch (error: any) {
-        console.error(`[ProductService] Error syncing stock from Square during product creation:`, error);
-        // Continue with provided stock value on error
+      } catch (error: unknown) {
+        console.error("[ProductService] Error syncing stock during product creation:", error);
       }
     }
-    
+
     const result = await pool.query(
-      `INSERT INTO products (business_id, name, description, price, stock, category, images, is_approved, sync_from_epos, square_item_id, last_epos_sync_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      `INSERT INTO products (business_id, name, description, price, stock, category, images, is_approved, sync_from_epos, square_item_id, shopify_product_id, last_epos_sync_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        RETURNING *`,
       [
         product.businessId,
         product.name,
         product.description,
         product.price,
-        finalStock, // Use synced stock
+        finalStock,
         product.category,
         product.images || [],
-        false, // Products need admin approval
+        false,
         product.syncFromEpos || false,
         product.squareItemId || null,
-        lastEposSyncAt, // Set sync timestamp if syncing
+        product.shopifyProductId || null,
+        lastEposSyncAt,
       ]
     );
 
@@ -408,92 +424,93 @@ export class ProductService {
       updatedAt: row.updated_at,
       syncFromEpos: row.sync_from_epos || false,
       squareItemId: row.square_item_id || null,
+      shopifyProductId: row.shopify_product_id || null,
       lastEposSyncAt: row.last_epos_sync_at || null,
     };
   }
 
   async updateProduct(id: string, updates: Partial<Product>): Promise<Product> {
-    // Check if we need to sync stock from Square
-    // This happens when syncFromEpos is enabled and squareItemId is set/updated
-    let shouldSyncStock = false;
+    let shouldSyncSquare = false;
+    let shouldSyncShopify = false;
     let squareItemId: string | null = null;
-    let syncFromEpos = false;
-    
-    // Get current product to check EPOS sync status
+    let shopifyProductId: string | null = null;
+
     const currentProduct = await pool.query(
-      `SELECT p.sync_from_epos, p.square_item_id, p.business_id
-       FROM products p
-       WHERE p.id = $1`,
+      `SELECT p.sync_from_epos, p.square_item_id, p.shopify_product_id, p.business_id
+       FROM products p WHERE p.id = $1`,
       [id]
     );
-    
+
     if (currentProduct.rows.length > 0) {
       const current = currentProduct.rows[0];
-      // Determine final values after update
       const finalSyncFromEpos = updates.syncFromEpos !== undefined ? updates.syncFromEpos : current.sync_from_epos;
       const finalSquareItemId = updates.squareItemId !== undefined ? (updates.squareItemId || null) : current.square_item_id;
-      
-      // Sync stock if EPOS sync is enabled and squareItemId is set
-      shouldSyncStock = finalSyncFromEpos && !!finalSquareItemId;
+      const finalShopifyProductId = updates.shopifyProductId !== undefined ? (updates.shopifyProductId || null) : current.shopify_product_id;
+      shouldSyncSquare = finalSyncFromEpos && !!finalSquareItemId;
+      shouldSyncShopify = finalSyncFromEpos && !!finalShopifyProductId;
       squareItemId = finalSquareItemId;
-      syncFromEpos = finalSyncFromEpos;
+      shopifyProductId = finalShopifyProductId;
     }
-    
+
     let syncedStock: number | null = null;
     let lastEposSyncAt: Date | null = null;
-    
-    // Sync stock from Square if needed
-    if (shouldSyncStock && squareItemId) {
+
+    if (shouldSyncSquare && squareItemId) {
       try {
-        const currentProduct = await pool.query(
-          `SELECT p.business_id
-           FROM products p
-           WHERE p.id = $1`,
+        const biz = await pool.query(
+          `SELECT business_id FROM products WHERE id = $1`,
           [id]
         );
-        
-        if (currentProduct.rows.length > 0) {
-          const businessId = currentProduct.rows[0].business_id;
-          
-          // Get business's Square credentials
-          const businessResult = await pool.query(
-            `SELECT square_access_token, square_location_id, square_sync_enabled
-             FROM businesses WHERE id = $1`,
-            [businessId]
+        if (biz.rows.length > 0) {
+          const creds = await pool.query(
+            `SELECT square_access_token, square_location_id, square_sync_enabled FROM businesses WHERE id = $1`,
+            [biz.rows[0].business_id]
           );
-          
-          if (businessResult.rows.length > 0) {
-            const business = businessResult.rows[0];
-            
-            if (business.square_sync_enabled && 
-                business.square_access_token && 
-                business.square_location_id) {
-              
-              // Fetch stock from Square
-              const stock = await squareService.getItemStock(
-                business.square_access_token,
-                business.square_location_id,
-                squareItemId
-              );
-              
-              if (stock !== null) {
-                syncedStock = stock;
-                lastEposSyncAt = new Date();
-                console.log(`[ProductService] Synced stock from Square during update: ${stock} for item ${squareItemId}`);
-              } else {
-                console.warn(`[ProductService] Failed to sync stock from Square during update for item ${squareItemId}`);
-              }
+          if (creds.rows.length > 0 && creds.rows[0].square_sync_enabled && creds.rows[0].square_access_token && creds.rows[0].square_location_id) {
+            const stock = await squareService.getItemStock(
+              creds.rows[0].square_access_token,
+              creds.rows[0].square_location_id,
+              squareItemId
+            );
+            if (stock !== null) {
+              syncedStock = stock;
+              lastEposSyncAt = new Date();
             }
           }
         }
-      } catch (error: any) {
-        console.error(`[ProductService] Error syncing stock from Square during product update:`, error);
-        // Continue with provided stock value on error
+      } catch (err) {
+        console.error("[ProductService] Error syncing stock from Square during update:", err);
+      }
+    } else if (shouldSyncShopify && shopifyProductId) {
+      try {
+        const biz = await pool.query(
+          `SELECT business_id FROM products WHERE id = $1`,
+          [id]
+        );
+        if (biz.rows.length > 0) {
+          const creds = await pool.query(
+            `SELECT shopify_access_token, shopify_shop, shopify_sync_enabled FROM businesses WHERE id = $1`,
+            [biz.rows[0].business_id]
+          );
+          if (creds.rows.length > 0 && creds.rows[0].shopify_sync_enabled && creds.rows[0].shopify_access_token && creds.rows[0].shopify_shop) {
+            const stock = await shopifyService.getProductStock(
+              creds.rows[0].shopify_access_token,
+              creds.rows[0].shopify_shop,
+              shopifyProductId
+            );
+            if (stock !== null) {
+              syncedStock = stock;
+              lastEposSyncAt = new Date();
+            }
+          }
+        }
+      } catch (err) {
+        console.error("[ProductService] Error syncing stock from Shopify during update:", err);
       }
     }
-    
+
     const fields: string[] = [];
-    const values: any[] = [];
+    const values: unknown[] = [];
     let paramCount = 1;
 
     if (updates.name !== undefined) {
@@ -508,7 +525,6 @@ export class ProductService {
       fields.push(`price = $${paramCount++}`);
       values.push(updates.price);
     }
-    // Use synced stock if available, otherwise use provided stock
     if (syncedStock !== null) {
       fields.push(`stock = $${paramCount++}`);
       values.push(syncedStock);
@@ -532,7 +548,10 @@ export class ProductService {
       fields.push(`square_item_id = $${paramCount++}`);
       values.push(updates.squareItemId || null);
     }
-    // Update sync timestamp if we synced stock
+    if (updates.shopifyProductId !== undefined) {
+      fields.push(`shopify_product_id = $${paramCount++}`);
+      values.push(updates.shopifyProductId || null);
+    }
     if (lastEposSyncAt !== null) {
       fields.push(`last_epos_sync_at = $${paramCount++}`);
       values.push(lastEposSyncAt);
@@ -561,6 +580,7 @@ export class ProductService {
       updatedAt: row.updated_at,
       syncFromEpos: row.sync_from_epos || false,
       squareItemId: row.square_item_id || null,
+      shopifyProductId: row.shopify_product_id || null,
       lastEposSyncAt: row.last_epos_sync_at || null,
     };
   }
