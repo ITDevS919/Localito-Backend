@@ -4612,7 +4612,77 @@ router.get("/business/square/items/:itemId/details", isAuthenticated, async (req
 
 // ==================== SHOPIFY INTEGRATION ====================
 
-// Start Shopify OAuth – redirect merchant to Shopify to install/authorize app
+// One-time tokens for mobile Shopify OAuth (token -> { businessId, expiresAt })
+const shopifyMobileTokens = new Map<string, { businessId: string; expiresAt: number }>();
+const SHOPIFY_MOBILE_TOKEN_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+function cleanupShopifyMobileTokens(): void {
+  const now = Date.now();
+  for (const [token, data] of shopifyMobileTokens.entries()) {
+    if (data.expiresAt < now) shopifyMobileTokens.delete(token);
+  }
+}
+
+// Mobile: get a one-time URL to start Shopify OAuth (no session in browser)
+router.get("/business/shopify/connect-url", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can connect Shopify" });
+    }
+    const shop = (req.query.shop as string)?.trim();
+    if (!shop) {
+      return res.status(400).json({ success: false, message: "Query parameter 'shop' is required" });
+    }
+    const businessResult = await pool.query(
+      "SELECT id FROM businesses WHERE user_id = $1",
+      [user.id]
+    );
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
+    }
+    const businessId = businessResult.rows[0].id;
+    const token = crypto.randomBytes(24).toString("hex");
+    shopifyMobileTokens.set(token, {
+      businessId,
+      expiresAt: Date.now() + SHOPIFY_MOBILE_TOKEN_TTL_MS,
+    });
+    cleanupShopifyMobileTokens();
+    const backendUrl = (process.env.BACKEND_URL || process.env.API_URL || `${req.protocol}://${req.get("host")}`).replace(/\/$/, "");
+    const apiBase = backendUrl.endsWith("/api") ? backendUrl : `${backendUrl}/api`;
+    const url = `${apiBase}/shopify/auth/mobile?shop=${encodeURIComponent(shop)}&mobile_token=${token}`;
+    res.json({ success: true, data: { url } });
+  } catch (error: any) {
+    next(error);
+  }
+});
+
+// Start Shopify OAuth (mobile) – no session; validated via one-time token
+router.get("/shopify/auth/mobile", async (req, res, next) => {
+  try {
+    const shop = (req.query.shop as string)?.trim();
+    const mobileToken = (req.query.mobile_token as string)?.trim();
+    if (!shop || !mobileToken) {
+      const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+      return res.redirect(302, `${frontendUrl}/business/shopify-settings?error=missing_params`);
+    }
+    const data = shopifyMobileTokens.get(mobileToken);
+    shopifyMobileTokens.delete(mobileToken);
+    if (!data || data.expiresAt < Date.now()) {
+      const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+      return res.redirect(302, `${frontendUrl}/business/shopify-settings?error=invalid_state`);
+    }
+    const state = Buffer.from(JSON.stringify({ businessId: data.businessId })).toString("base64url");
+    const backendUrl = process.env.BACKEND_URL || process.env.API_URL || `${req.protocol}://${req.get("host")}`;
+    const redirectUri = `${backendUrl.replace(/\/$/, "")}/api/shopify/callback`;
+    const authUrl = shopifyService.getAuthUrl(shop, state, redirectUri);
+    return res.redirect(302, authUrl);
+  } catch (error: any) {
+    next(error);
+  }
+});
+
+// Start Shopify OAuth – redirect merchant to Shopify to install/authorize app (web)
 router.get("/shopify/auth", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
