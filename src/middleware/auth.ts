@@ -6,19 +6,28 @@ import { storage } from "../services/storage";
 import type { User } from "../../shared/schema";
 
 // Configure Passport Local Strategy
+// Accepts either username OR email in the "username" field
 passport.use(
   new LocalStrategy(async (username, password, done) => {
     try {
-      const user = await storage.getUserByUsername(username);
+      const identifier = username.trim();
+
+      // Try username first
+      let user = await storage.getUserByUsername(identifier);
+
+      // If not found, try email (so users can log in with email after password reset)
+      if (!user) {
+        user = await storage.getUserByEmail(identifier);
+      }
       
       if (!user) {
-        return done(null, false, { message: "Invalid username or password" });
+        return done(null, false, { message: "Invalid username/email or password" });
       }
 
       const isValidPassword = await storage.verifyPassword(password, user.password);
       
       if (!isValidPassword) {
-        return done(null, false, { message: "Invalid username or password" });
+        return done(null, false, { message: "Invalid username/email or password" });
       }
 
       return done(null, user);
