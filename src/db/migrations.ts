@@ -993,6 +993,17 @@ export async function runMigrations() {
       ADD COLUMN IF NOT EXISTS qr_code_scanned_by UUID REFERENCES users(id)
     `);
 
+    // Add is_suspended field to businesses table for admin moderation
+    await client.query(`
+      DO $$ 
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='businesses' AND column_name='is_suspended') THEN
+          ALTER TABLE businesses ADD COLUMN is_suspended BOOLEAN DEFAULT FALSE;
+        END IF;
+      END $$;
+    `);
+
     // ==================== SERVICES & BOOKING SYSTEM ====================
     
     // Create services table

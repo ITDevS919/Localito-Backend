@@ -43,6 +43,18 @@ export function getAuthUrl(shop: string, state: string, redirectUri: string): st
   return `https://${normalized}/admin/oauth/authorize?${params.toString()}`;
 }
 
+/** Error thrown when Shopify token exchange fails; body may contain error from Shopify */
+export class ShopifyTokenError extends Error {
+  constructor(
+    message: string,
+    public status: number,
+    public body: string
+  ) {
+    super(message);
+    this.name = "ShopifyTokenError";
+  }
+}
+
 /**
  * Exchange authorization code for a permanent access token
  */
@@ -60,12 +72,23 @@ export async function exchangeCodeForToken(shop: string, code: string): Promise<
       code,
     }),
   });
+  const text = await res.text();
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Shopify token exchange failed: ${res.status} ${text}`);
+    throw new ShopifyTokenError(
+      `Shopify token exchange failed: ${res.status} ${text}`,
+      res.status,
+      text
+    );
   }
-  const data = (await res.json()) as { access_token?: string };
-  if (!data.access_token) throw new Error("Shopify did not return an access token");
+  let data: { access_token?: string };
+  try {
+    data = JSON.parse(text) as { access_token?: string };
+  } catch {
+    throw new ShopifyTokenError("Shopify returned invalid JSON", res.status, text);
+  }
+  if (!data.access_token) {
+    throw new ShopifyTokenError("Shopify did not return an access token", res.status, text);
+  }
   return data.access_token;
 }
 

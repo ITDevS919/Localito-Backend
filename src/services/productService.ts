@@ -20,6 +20,7 @@ export class ProductService {
   }): Promise<{ products: Product[]; total: number; page: number; limit: number; totalPages: number }> {
       let query = `
       SELECT p.*, b.business_name as business_name, b.postcode, b.city, b.latitude, b.longitude,
+             u.username as business_username,
              COALESCE(p.review_count, 0) as review_count,
              COALESCE(p.average_rating, 0) as average_rating,
              p.sync_from_epos, p.square_item_id, p.shopify_product_id, p.last_epos_sync_at,
@@ -27,6 +28,7 @@ export class ProductService {
              b.shopify_sync_enabled, b.shopify_access_token, b.shopify_shop
       FROM products p
       JOIN businesses b ON p.business_id = b.id
+      JOIN users u ON b.user_id = u.id
       WHERE 1=1
     `;
     const params: any[] = [];
@@ -54,6 +56,12 @@ export class ProductService {
       query += ` AND p.is_approved = $${paramCount}`;
       params.push(filters.isApproved);
       paramCount++;
+    }
+
+    // Filter out products from suspended businesses (unless explicitly searching by businessId)
+    // This ensures products from suspended businesses don't appear in public searches
+    if (!filters?.businessId) {
+      query += ` AND b.is_suspended = false`;
     }
 
     if (filters?.search) {
@@ -192,6 +200,7 @@ export class ProductService {
       updatedAt: row.updated_at,
       // Include business information
       business_name: row.business_name,
+      business_username: row.business_username || null,
       postcode: row.postcode,
       city: row.city,
       // Include business location data for distance calculation
@@ -281,6 +290,7 @@ export class ProductService {
   async getProductById(id: string): Promise<Product | undefined> {
     const result = await pool.query(
       `SELECT p.*, b.business_name as business_name, b.id as business_user_id,
+              b.is_suspended, b.postcode, b.city, u.username as business_username,
               COALESCE(p.review_count, 0) as review_count,
               COALESCE(p.average_rating, 0) as average_rating,
               p.sync_from_epos, p.square_item_id, p.shopify_product_id, p.last_epos_sync_at,
@@ -288,7 +298,8 @@ export class ProductService {
               b.shopify_sync_enabled, b.shopify_access_token, b.shopify_shop
        FROM products p
        JOIN businesses b ON p.business_id = b.id
-       WHERE p.id = $1`,
+       JOIN users u ON b.user_id = u.id
+       WHERE p.id = $1 AND b.is_suspended = false`,
       [id]
     );
 
@@ -333,6 +344,10 @@ export class ProductService {
       squareItemId: row.square_item_id || null,
       shopifyProductId: row.shopify_product_id || null,
       lastEposSyncAt: row.last_epos_sync_at || null,
+      business_name: row.business_name || null,
+      business_username: row.business_username || null,
+      city: row.city || null,
+      postcode: row.postcode || null,
     };
   }
 
@@ -607,6 +622,32 @@ export class ProductService {
     };
   }
 
+  async unapproveProduct(id: string): Promise<Product> {
+    const result = await pool.query(
+      `UPDATE products SET is_approved = false, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *`,
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      throw new Error("Product not found");
+    }
+
+    const row = result.rows[0];
+    return {
+      id: row.id,
+      businessId: row.business_id,
+      name: row.name,
+      description: row.description,
+      price: parseFloat(row.price),
+      stock: row.stock,
+      category: row.category,
+      images: row.images || [],
+      isApproved: row.is_approved,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
   async deleteProduct(id: string, businessId: string): Promise<boolean> {
     // Verify the product belongs to the business before deleting
     const checkResult = await pool.query(
@@ -619,6 +660,22 @@ export class ProductService {
     }
 
     // Delete the product
+    await pool.query("DELETE FROM products WHERE id = $1", [id]);
+    return true;
+  }
+
+  async adminDeleteProduct(id: string): Promise<boolean> {
+    // Admin can delete any product - verify product exists first
+    const checkResult = await pool.query(
+      "SELECT id FROM products WHERE id = $1",
+      [id]
+    );
+
+    if (checkResult.rows.length === 0) {
+      throw new Error("Product not found");
+    }
+
+    // Delete the product (CASCADE will handle order_items, reviews, etc.)
     await pool.query("DELETE FROM products WHERE id = $1", [id]);
     return true;
   }

@@ -580,6 +580,7 @@ const availabilityService = new AvailabilityService();
 import { geocodingService } from "../services/geocodingService";
 import { squareService } from "../services/squareService";
 import * as shopifyService from "../services/shopifyService";
+import { ShopifyTokenError } from "../services/shopifyService";
 import { pool } from "../db/connection";
 
 // Get products (public)
@@ -666,6 +667,48 @@ router.get("/products", async (req, res, next) => {
         totalPages: result.totalPages,
       }
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Get all products for admin (admin only) - MUST be before /products/:id route
+router.get("/admin/products/all", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ success: false, message: "Only admins can access this" });
+    }
+
+    const limit = parseInt(req.query.limit as string) || 100;
+    const offset = parseInt(req.query.offset as string) || 0;
+
+    // Get all products with business information
+    const result = await pool.query(
+      `SELECT p.*, b.business_name as business_name, b.postcode, b.city
+       FROM products p
+       JOIN businesses b ON p.business_id = b.id
+       ORDER BY p.created_at DESC
+       LIMIT $1 OFFSET $2`,
+      [limit, offset]
+    );
+
+    const products = result.rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      description: row.description,
+      price: parseFloat(row.price),
+      stock: row.stock,
+      category: row.category,
+      images: row.images || [],
+      isApproved: row.is_approved,
+      business_name: row.business_name,
+      postcode: row.postcode,
+      city: row.city,
+      created_at: row.created_at,
+    }));
+
+    res.json({ success: true, data: products });
   } catch (error) {
     next(error);
   }
@@ -831,6 +874,8 @@ router.get("/business/onboarding-status", isAuthenticated, async (req, res, next
         b.city,
         b.square_access_token,
         b.square_location_id,
+        b.shopify_shop,
+        b.shopify_access_token,
         b.onboarding_completed_at,
         (SELECT COUNT(*) FROM products WHERE business_id = b.id) as product_count
        FROM businesses b
@@ -854,6 +899,7 @@ router.get("/business/onboarding-status", isAuthenticated, async (req, res, next
 
     const profileComplete = !!(business.business_name && (business.postcode || business.city));
     const squareConnected = !!(business.square_access_token && business.square_location_id);
+    const shopifyConnected = !!(business.shopify_shop && business.shopify_access_token);
     const hasProducts = business.product_count > 0;
     const stripeSetup = stripeResult.rows.length > 0 && stripeResult.rows[0].onboarding_completed;
 
@@ -862,6 +908,7 @@ router.get("/business/onboarding-status", isAuthenticated, async (req, res, next
       data: {
         profileComplete,
         squareConnected,
+        shopifyConnected,
         hasProducts,
         stripeSetup,
         onboardingCompletedAt: business.onboarding_completed_at,
@@ -1357,6 +1404,36 @@ router.post("/products/:id/approve", isAuthenticated, async (req, res, next) => 
 
     const product = await productService.approveProduct(req.params.id);
     res.json({ success: true, data: product });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Unapprove product (admin only)
+router.post("/products/:id/unapprove", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ success: false, message: "Only admins can unapprove products" });
+    }
+
+    const product = await productService.unapproveProduct(req.params.id);
+    res.json({ success: true, data: product, message: "Product unapproved and hidden from customers" });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Delete product (admin only)
+router.delete("/admin/products/:id", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ success: false, message: "Only admins can delete products" });
+    }
+
+    await productService.adminDeleteProduct(req.params.id);
+    res.json({ success: true, message: "Product permanently deleted" });
   } catch (error) {
     next(error);
   }
@@ -3790,6 +3867,98 @@ router.post("/businesses/:id/approve", isAuthenticated, async (req, res, next) =
   }
 });
 
+// Suspend business (admin only)
+router.post("/admin/businesses/:id/suspend", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ success: false, message: "Only admins can suspend businesses" });
+    }
+
+    const { reason } = req.body;
+    
+    // Check if business exists
+    const checkResult = await pool.query(
+      "SELECT id, business_name, is_suspended FROM businesses WHERE id = $1",
+      [req.params.id]
+    );
+
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business not found" });
+    }
+
+    const business = checkResult.rows[0];
+
+    // If already suspended, return early
+    if (business.is_suspended) {
+      return res.json({ 
+        success: true, 
+        message: "Business is already suspended",
+        data: business
+      });
+    }
+
+    // Suspend the business
+    const result = await pool.query(
+      "UPDATE businesses SET is_suspended = true WHERE id = $1 RETURNING *",
+      [req.params.id]
+    );
+
+    res.json({ 
+      success: true, 
+      message: "Business suspended successfully",
+      data: result.rows[0]
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Unsuspend business (admin only)
+router.post("/admin/businesses/:id/unsuspend", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ success: false, message: "Only admins can unsuspend businesses" });
+    }
+
+    // Check if business exists
+    const checkResult = await pool.query(
+      "SELECT id, business_name, is_suspended FROM businesses WHERE id = $1",
+      [req.params.id]
+    );
+
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business not found" });
+    }
+
+    const business = checkResult.rows[0];
+
+    // If not suspended, return early
+    if (!business.is_suspended) {
+      return res.json({ 
+        success: true, 
+        message: "Business is not suspended",
+        data: business
+      });
+    }
+
+    // Unsuspend the business
+    const result = await pool.query(
+      "UPDATE businesses SET is_suspended = false WHERE id = $1 RETURNING *",
+      [req.params.id]
+    );
+
+    res.json({ 
+      success: true, 
+      message: "Business unsuspended successfully",
+      data: result.rows[0]
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Admin: Get all businesses with pagination and filters
 router.get("/admin/businesses", isAuthenticated, async (req, res, next) => {
   try {
@@ -4780,40 +4949,51 @@ router.get("/shopify/auth/mobile", async (req, res, next) => {
 
 // Start Shopify OAuth – redirect merchant to Shopify to install/authorize app (web)
 router.get("/shopify/auth", isAuthenticated, async (req, res, next) => {
+  const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+  const redirectWithError = (code: string) =>
+    res.redirect(302, `${frontendUrl}/business/shopify-settings?error=${code}`);
   try {
     const user = getCurrentUser(req);
     if (!user || user.role !== "business") {
-      return res.status(403).json({ success: false, message: "Only businesses can connect Shopify" });
+      return redirectWithError("business_only");
     }
     const shop = (req.query.shop as string)?.trim();
     if (!shop) {
-      return res.status(400).json({ success: false, message: "Query parameter 'shop' is required (e.g. mystore.myshopify.com)" });
+      return redirectWithError("missing_shop");
     }
     const businessResult = await pool.query(
       "SELECT id FROM businesses WHERE user_id = $1",
       [user.id]
     );
     if (businessResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Business profile not found" });
+      return redirectWithError("no_business");
     }
     const businessId = businessResult.rows[0].id;
     const state = Buffer.from(JSON.stringify({ businessId })).toString("base64url");
     const backendUrl = process.env.BACKEND_URL || process.env.API_URL || `${req.protocol}://${req.get("host")}`;
     const redirectUri = `${backendUrl.replace(/\/$/, "")}/api/shopify/callback`;
     const authUrl = shopifyService.getAuthUrl(shop, state, redirectUri);
+    console.info("[Shopify] Redirecting to authorize shop=%s redirectUri=%s", shop, redirectUri);
     return res.redirect(302, authUrl);
   } catch (error: any) {
-    next(error);
+    console.error("[Shopify] Auth start error:", error?.message || error);
+    return redirectWithError("auth_failed");
   }
 });
 
 // Shopify OAuth callback – exchange code for token, save to business, redirect to frontend
 router.get("/shopify/callback", async (req, res, next) => {
+  const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+  const redirectWithError = (code: string, detail?: string) => {
+    const url = new URL(`${frontendUrl}/business/shopify-settings`);
+    url.searchParams.set("error", code);
+    if (detail) url.searchParams.set("error_detail", detail);
+    return res.redirect(302, url.toString());
+  };
   try {
     const { code, shop, state } = req.query as Record<string, string | undefined>;
     if (!code || !shop) {
-      const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
-      return res.redirect(302, `${frontendUrl}/business/shopify-settings?error=missing_params`);
+      return redirectWithError("missing_params");
     }
     let businessId: string | undefined;
     try {
@@ -4823,8 +5003,8 @@ router.get("/shopify/callback", async (req, res, next) => {
       businessId = undefined;
     }
     if (!businessId) {
-      const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
-      return res.redirect(302, `${frontendUrl}/business/shopify-settings?error=invalid_state`);
+      console.warn("[Shopify] Callback missing or invalid state");
+      return redirectWithError("invalid_state");
     }
     const accessToken = await shopifyService.exchangeCodeForToken(shop, code);
     const normalizedShop = shopifyService.normalizeShop(shop);
@@ -4834,13 +5014,34 @@ router.get("/shopify/callback", async (req, res, next) => {
        WHERE id = $3`,
       [normalizedShop, accessToken, businessId]
     );
-    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
     return res.redirect(302, `${frontendUrl}/business/shopify-settings?connected=1`);
-  } catch (err: any) {
-    console.error("[Shopify] OAuth callback error:", err?.message || err);
-    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
-    return res.redirect(302, `${frontendUrl}/business/shopify-settings?error=oauth_failed`);
+  } catch (err: unknown) {
+    if (err instanceof ShopifyTokenError) {
+      console.error("[Shopify] Token exchange failed:", err.status, err.body);
+      const bodyLower = err.body.toLowerCase();
+      if (err.status === 400 && (bodyLower.includes("redirect_uri") || bodyLower.includes("redirect uri"))) {
+        return redirectWithError("redirect_uri_mismatch");
+      }
+      if (err.status === 401 || err.status === 403) {
+        return redirectWithError("invalid_credentials");
+      }
+      // Sanitize short detail for URL (avoid long or sensitive text)
+      const detail = err.body.length > 80 ? err.body.slice(0, 80) + "…" : err.body;
+      return redirectWithError("token_exchange_failed", detail.replace(/[^\w\s\-.,]/g, " ").trim());
+    }
+    console.error("[Shopify] OAuth callback error:", err);
+    return redirectWithError("oauth_failed");
   }
+});
+
+// Public: return the Shopify callback URL so the frontend can show it when redirect_uri_mismatch
+router.get("/shopify/redirect-uri", (req, res) => {
+  const backendUrl =
+    process.env.BACKEND_URL ||
+    process.env.API_URL ||
+    `${req.protocol}://${req.get("host") || "localhost:5000"}`;
+  const redirectUri = `${backendUrl.replace(/\/$/, "")}/api/shopify/callback`;
+  res.json({ redirectUri });
 });
 
 // Get Shopify connection status
@@ -5293,20 +5494,36 @@ router.get("/user/following", isAuthenticated, async (req, res, next) => {
   }
 });
 
-// Get public business profile with follower count
-router.get("/business/:businessId/public", async (req, res, next) => {
-  try {
-    const { businessId } = req.params;
-    const user = getCurrentUser(req);
+// Helper: true if string looks like a UUID
+const isUuid = (s: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
 
+// Get public business profile with follower count
+// :identifier can be business UUID or business owner's username (e.g. /business/berrow)
+// Owners and admins can always see the business; others only if approved and not suspended.
+router.get("/business/:identifier/public", async (req, res, next) => {
+  try {
+    const { identifier } = req.params;
+    const user = getCurrentUser(req);
+    const isAdmin = user?.role === "admin";
+    const ownerId = user?.id ?? null;
+
+    const byId = isUuid(identifier);
+    const publicCondition = "b.is_approved = true AND b.is_suspended = false";
+    const ownerCondition = ownerId ? ` OR b.user_id = $${byId ? 2 : 2}` : "";
+    const whereClause = byId
+      ? (isAdmin ? "WHERE b.id = $1" : `WHERE b.id = $1 AND (${publicCondition}${ownerCondition})`)
+      : (isAdmin ? "WHERE u.username = $1" : `WHERE u.username = $1 AND (${publicCondition}${ownerCondition})`);
+
+    const params = ownerId ? [identifier, ownerId] : [identifier];
     const result = await pool.query(
-      `SELECT b.*, 
+      `SELECT b.*, u.username,
        (SELECT COUNT(*) FROM business_followers WHERE business_id = b.id) as follower_count,
        c.name as primary_category_name
        FROM businesses b
+       JOIN users u ON b.user_id = u.id
        LEFT JOIN categories c ON b.primary_category_id = c.id
-       WHERE b.id = $1 AND b.is_approved = true`,
-      [businessId]
+       ${whereClause}`,
+      params
     );
 
     if (result.rows.length === 0) {
@@ -5314,6 +5531,7 @@ router.get("/business/:businessId/public", async (req, res, next) => {
     }
 
     const business = result.rows[0];
+    const businessId = business.id;
 
     // Check if user is following (if authenticated)
     let isFollowing = false;
