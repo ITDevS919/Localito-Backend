@@ -9,6 +9,8 @@ import { fileURLToPath } from "url";
 import { createRequire } from "module";
 import { storage } from "../services/storage";
 import { isAuthenticated, getCurrentUser } from "../middleware/auth";
+import { z } from "zod";
+import bcrypt from "bcrypt";
 import { insertUserSchema, loginSchema, User } from "../../shared/schema";
 // Using require to avoid TS module resolution issues in this runtime config
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -254,6 +256,100 @@ router.post("/auth/logout", (req, res, next) => {
       });
     });
   });
+});
+
+// Forgot password – request reset email (always return generic success to prevent email enumeration)
+const forgotPasswordSchema = { email: z.string().email("Invalid email address") };
+router.post("/auth/forgot-password", async (req, res, next) => {
+  try {
+    const parse = z.object(forgotPasswordSchema).safeParse(req.body);
+    if (!parse.success) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid email address",
+        errors: parse.error.errors,
+      });
+    }
+    const { email } = parse.data;
+    const user = await storage.getUserByEmail(email);
+    const frontendUrl = (process.env.FRONTEND_URL || "http://localhost:5173").replace(/\/$/, "");
+    if (user) {
+      const { token } = await storage.createPasswordResetToken(user.id);
+      const resetLink = `${frontendUrl}/reset-password?token=${encodeURIComponent(token)}`;
+      let emailSent = false;
+      if (user.role === "business") {
+        const businessResult = await pool.query(
+          "SELECT business_name FROM businesses WHERE user_id = $1",
+          [user.id]
+        );
+        const businessOwnerName = businessResult.rows[0]?.business_name || user.username;
+        emailSent = await emailService.sendBusinessPasswordResetEmail(user.email, {
+          businessOwnerName,
+          resetLink,
+        });
+      } else {
+        emailSent = await emailService.sendPasswordResetEmail(user.email, {
+          userName: user.username,
+          resetLink,
+        });
+      }
+      if (!emailSent) {
+        console.error(
+          "[auth/forgot-password] Failed to send password reset email to",
+          user.email,
+          "- check RESEND_API_KEY, RESEND_FROM_EMAIL (or SMTP), and server logs above for details."
+        );
+      }
+    }
+    res.json({
+      success: true,
+      message: "If an account exists for that email, you will receive password reset instructions.",
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Reset password – set new password using token
+const resetPasswordSchema = z.object({
+  token: z.string().min(1, "Reset token is required"),
+  newPassword: z.string().min(6, "Password must be at least 6 characters"),
+});
+router.post("/auth/reset-password", async (req, res, next) => {
+  try {
+    const parse = resetPasswordSchema.safeParse(req.body);
+    if (!parse.success) {
+      return res.status(400).json({
+        success: false,
+        message: "Validation failed",
+        errors: parse.error.errors,
+      });
+    }
+    const { token, newPassword } = parse.data;
+    const record = await storage.getPasswordResetToken(token);
+    if (!record) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid or expired reset link. Please request a new password reset.",
+      });
+    }
+    if (new Date() > record.expiresAt) {
+      await storage.deletePasswordResetToken(token);
+      return res.status(400).json({
+        success: false,
+        message: "This reset link has expired. Please request a new password reset.",
+      });
+    }
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    await storage.updateUserPassword(record.userId, hashedPassword);
+    await storage.deletePasswordResetToken(token);
+    res.json({
+      success: true,
+      message: "Your password has been reset. You can now log in with your new password.",
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 // Google OAuth routes

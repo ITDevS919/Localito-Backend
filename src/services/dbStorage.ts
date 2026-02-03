@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import { type User, type InsertUser, type Business } from "../../shared/schema";
 import { pool } from "../db/connection";
 import bcrypt from "bcrypt";
@@ -199,6 +200,34 @@ export class DbStorage {
       "UPDATE users SET google_id = $1 WHERE id = $2",
       [googleId, userId]
     );
+  }
+
+  async createPasswordResetToken(userId: string): Promise<{ token: string; expiresAt: Date }> {
+    const token = crypto.randomBytes(32).toString("hex");
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+    await pool.query(
+      "INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES ($1, $2, $3)",
+      [userId, token, expiresAt]
+    );
+    return { token, expiresAt };
+  }
+
+  async getPasswordResetToken(token: string): Promise<{ userId: string; expiresAt: Date } | undefined> {
+    const result = await pool.query(
+      "SELECT user_id, expires_at FROM password_reset_tokens WHERE token = $1",
+      [token]
+    );
+    if (result.rows.length === 0) return undefined;
+    const row = result.rows[0];
+    return { userId: row.user_id, expiresAt: new Date(row.expires_at) };
+  }
+
+  async deletePasswordResetToken(token: string): Promise<void> {
+    await pool.query("DELETE FROM password_reset_tokens WHERE token = $1", [token]);
+  }
+
+  async updateUserPassword(userId: string, hashedPassword: string): Promise<void> {
+    await pool.query("UPDATE users SET password = $1 WHERE id = $2", [hashedPassword, userId]);
   }
 
   async createUserFromGoogle(googleId: string, email: string, displayName: string, role: string = "customer"): Promise<User> {

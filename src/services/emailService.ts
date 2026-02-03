@@ -140,7 +140,8 @@ export class EmailService {
     }
 
     try {
-      const fromEmail = process.env.RESEND_FROM_EMAIL || process.env.SMTP_FROM_EMAIL || 'hello@localito.com';
+      // Use Resend's test sender if no from-address is configured (required for unverified domains)
+      const fromEmail = process.env.RESEND_FROM_EMAIL || process.env.SMTP_FROM_EMAIL || 'onboarding@resend.dev';
       const fromName = process.env.RESEND_FROM_NAME || process.env.SMTP_FROM_NAME || 'Localito';
 
       const { data, error } = await this.resend.emails.send({
