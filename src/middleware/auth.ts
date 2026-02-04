@@ -109,6 +109,7 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
           );
 
           console.log("[Google Auth Strategy] User created successfully:", user.id);
+          (user as any)._isNewUser = true;
           return done(null, user);
         } catch (error: any) {
           console.error("[Google Auth Strategy] Error during authentication:", error);

@@ -136,26 +136,20 @@ router.post("/auth/signup", async (req, res, next) => {
       businessData: role === "business" ? businessData : undefined
     });
 
-    const effectiveRole = role || "customer";
-    const frontendUrl = (process.env.FRONTEND_URL || "http://localhost:5173").replace(/\/$/, "");
-
-    // Send welcome email (non-blocking; signup succeeds even if email fails)
-    try {
-      if (effectiveRole === "business" && businessData) {
-        await emailService.sendBusinessWelcomeEmail(user.email, {
-          businessOwnerName: user.username,
-          businessName: businessData.businessName,
-          verificationLink: `${frontendUrl}/login/business`,
-          dashboardLink: `${frontendUrl}/business/dashboard`,
-        });
-      } else {
-        await emailService.sendWelcomeVerificationEmail(user.email, {
-          userName: user.username,
-          verificationLink: `${frontendUrl}/login/customer`,
-        });
-      }
-    } catch (emailErr: any) {
-      console.error("[Signup] Welcome email failed:", emailErr?.message || emailErr);
+    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+    if (user.role === "customer") {
+      emailService.sendWelcomeVerificationEmail(user.email, {
+        userName: user.username,
+        verificationLink: `${frontendUrl}/`,
+      }).catch((e) => console.error("[auth/signup] Welcome email failed:", e));
+    } else if (user.role === "business") {
+      const businessName = businessData?.businessName || user.username;
+      emailService.sendBusinessWelcomeEmail(user.email, {
+        businessOwnerName: user.username,
+        businessName,
+        verificationLink: `${frontendUrl}/`,
+        dashboardLink: `${frontendUrl}/business/dashboard`,
+      }).catch((e) => console.error("[auth/signup] Business welcome email failed:", e));
     }
 
     // Auto-login after signup
@@ -404,6 +398,29 @@ router.get("/auth/google/callback",
       const role = (req.session as any)?.googleAuthRole || "customer";
       delete (req.session as any).googleAuthRole;
 
+      const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+      if ((user as any)._isNewUser) {
+        delete (user as any)._isNewUser;
+        if (user.role === "customer") {
+          emailService.sendWelcomeVerificationEmail(user.email, {
+            userName: user.username,
+            verificationLink: `${frontendUrl}/`,
+          }).catch((e) => console.error("[Google Auth] Welcome email failed:", e));
+        } else if (user.role === "business") {
+          pool.query("SELECT business_name FROM businesses WHERE user_id = $1", [user.id])
+            .then((result) => {
+              const businessName = result.rows[0]?.business_name || user.username;
+              return emailService.sendBusinessWelcomeEmail(user.email, {
+                businessOwnerName: user.username,
+                businessName,
+                verificationLink: `${frontendUrl}/`,
+                dashboardLink: `${frontendUrl}/business/dashboard`,
+              });
+            })
+            .catch((e) => console.error("[Google Auth] Business welcome email failed:", e));
+        }
+      }
+
       // Explicitly save session to ensure cookie is set
       req.session.save((err) => {
         if (err) {
@@ -562,6 +579,26 @@ router.post("/auth/google/mobile", async (req, res, next) => {
 
     // Create new user from Google profile
     user = await storage.createUserFromGoogle(googleId, email, displayName, userRole);
+
+    const frontendUrlMobile = process.env.FRONTEND_URL || "http://localhost:5173";
+    if (user.role === "customer") {
+      emailService.sendWelcomeVerificationEmail(user.email, {
+        userName: user.username,
+        verificationLink: `${frontendUrlMobile}/`,
+      }).catch((e) => console.error("[Google Auth Mobile] Welcome email failed:", e));
+    } else if (user.role === "business") {
+      pool.query("SELECT business_name FROM businesses WHERE user_id = $1", [user.id])
+        .then((result) => {
+          const businessName = result.rows[0]?.business_name || user.username;
+          return emailService.sendBusinessWelcomeEmail(user.email, {
+            businessOwnerName: user.username,
+            businessName,
+            verificationLink: `${frontendUrlMobile}/`,
+            dashboardLink: `${frontendUrlMobile}/business/dashboard`,
+          });
+        })
+        .catch((e) => console.error("[Google Auth Mobile] Business welcome email failed:", e));
+    }
 
     // Log in the new user
     req.login(user, (err) => {
