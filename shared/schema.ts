@@ -104,6 +104,14 @@ export interface Product {
   squareItemId?: string;
   shopifyProductId?: string;
   lastEposSyncAt?: Date;
+  // Business location (for product detail / maps)
+  business_name?: string | null;
+  business_username?: string | null;
+  business_address?: string | null;
+  city?: string | null;
+  postcode?: string | null;
+  business_latitude?: number | null;
+  business_longitude?: number | null;
 }
 
 // Cart item schema

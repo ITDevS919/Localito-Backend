@@ -289,8 +289,10 @@ export class ProductService {
 
   async getProductById(id: string): Promise<Product | undefined> {
     const result = await pool.query(
-      `SELECT p.*, b.business_name as business_name, b.id as business_user_id,
-              b.is_suspended, b.postcode, b.city, u.username as business_username,
+      `SELECT p.*, b.business_name as business_name, b.business_address as business_address,
+              b.latitude as business_latitude, b.longitude as business_longitude,
+              b.id as business_user_id, b.is_suspended, b.postcode, b.city,
+              u.username as business_username,
               COALESCE(p.review_count, 0) as review_count,
               COALESCE(p.average_rating, 0) as average_rating,
               p.sync_from_epos, p.square_item_id, p.shopify_product_id, p.last_epos_sync_at,
@@ -346,8 +348,11 @@ export class ProductService {
       lastEposSyncAt: row.last_epos_sync_at || null,
       business_name: row.business_name || null,
       business_username: row.business_username || null,
+      business_address: row.business_address || null,
       city: row.city || null,
       postcode: row.postcode || null,
+      business_latitude: row.business_latitude != null ? parseFloat(row.business_latitude) : null,
+      business_longitude: row.business_longitude != null ? parseFloat(row.business_longitude) : null,
     };
   }
 

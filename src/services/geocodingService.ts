@@ -1,58 +1,61 @@
 /**
- * Geocoding service to convert addresses to coordinates
- * Uses OpenStreetMap Nominatim API (free, no API key required)
- * For production, consider using Google Maps Geocoding API or similar
+ * Geocoding service to convert addresses to coordinates.
+ * Uses Google Maps Geocoding API or Mapbox Geocoding API (set one in .env).
  */
 
-interface GeocodeResult {
+export interface GeocodeResult {
   latitude: number;
   longitude: number;
 }
 
+type GeocodeProvider = "google" | "mapbox";
+
 export class GeocodingService {
-  private readonly baseUrl = "https://nominatim.openstreetmap.org/search";
-  private readonly userAgent = "Marketplace-Hub/1.0"; // Required by Nominatim
+  private readonly googleKey = process.env.GOOGLE_MAPS_API_KEY?.trim() || "";
+  private readonly mapboxToken = process.env.MAPBOX_ACCESS_TOKEN?.trim() || "";
+
+  private getProvider(): GeocodeProvider | null {
+    if (this.googleKey) return "google";
+    if (this.mapboxToken) return "mapbox";
+    return null;
+  }
 
   /**
-   * Geocode an address (postcode, city, or full address)
-   * Returns latitude and longitude coordinates
-   * Tries multiple query strategies for better results
+   * Geocode an address (postcode, city, or full address).
+   * Returns latitude and longitude. Tries multiple query strategies.
    */
   async geocodeAddress(
     postcode?: string,
     city?: string,
     fullAddress?: string
   ): Promise<GeocodeResult | null> {
+    const provider = this.getProvider();
+    if (!provider) {
+      console.warn(
+        "[Geocoding] No provider configured. Set GOOGLE_MAPS_API_KEY or MAPBOX_ACCESS_TOKEN in .env"
+      );
+      return null;
+    }
+
     try {
-      // Build multiple query strategies to try (ordered by reliability)
       const queries: string[] = [];
-      
-      // Strategy 1: Postcode + City (most reliable, works for most countries)
+
       if (postcode && city && postcode !== city) {
         queries.push(`${postcode}, ${city}`);
       }
-      
-      // Strategy 2: Just postcode (works well for UK, US zip codes, etc.)
       if (postcode) {
         queries.push(postcode);
-        // For US zip codes, also try with "USA" suffix
         if (/^\d{5}(-\d{4})?$/.test(postcode.trim())) {
           queries.push(`${postcode}, USA`);
           queries.push(`${postcode}, United States`);
         }
       }
-      
-      // Strategy 3: City + Postcode (alternative order)
       if (city && postcode && city !== postcode) {
         queries.push(`${city}, ${postcode}`);
       }
-      
-      // Strategy 4: Just city (less precise but often works)
       if (city) {
         queries.push(city);
       }
-      
-      // Strategy 5: Full address (try last as it's often too specific)
       if (fullAddress) {
         queries.push(fullAddress);
       }
@@ -62,95 +65,107 @@ export class GeocodingService {
         return null;
       }
 
-      // Try each query strategy until one works
       for (const query of queries) {
         console.log(`[Geocoding] Attempting to geocode: "${query}"`);
-        
-        const result = await this.tryGeocodeQuery(query);
-        if (result) {
-          return result;
-        }
-        
-        // Wait a bit between requests to respect rate limits
+        const result = await this.tryGeocodeQuery(query, provider);
+        if (result) return result;
         if (queries.indexOf(query) < queries.length - 1) {
-          await new Promise(resolve => setTimeout(resolve, 500));
+          await new Promise((r) => setTimeout(r, 300));
         }
       }
 
-      console.warn(`[Geocoding] All geocoding strategies failed for provided address`);
+      console.warn("[Geocoding] All geocoding strategies failed for provided address");
       return null;
-    } catch (error: any) {
+    } catch (error: unknown) {
       console.error("[Geocoding] Error during geocoding:", error);
-      console.error("[Geocoding] Error stack:", error?.stack);
-      if (error?.message) {
-        console.error("[Geocoding] Error message:", error.message);
-      }
       return null;
     }
   }
 
   /**
-   * Try to geocode a single query string
+   * Geocode a single query string using the configured provider.
    */
-  private async tryGeocodeQuery(query: string): Promise<GeocodeResult | null> {
+  private async tryGeocodeQuery(
+    query: string,
+    provider: GeocodeProvider
+  ): Promise<GeocodeResult | null> {
+    if (provider === "google") {
+      return this.geocodeWithGoogle(query);
+    }
+    return this.geocodeWithMapbox(query);
+  }
+
+  /**
+   * Google Maps Geocoding API:
+   * https://maps.googleapis.com/maps/api/geocode/json?address=...&key=...
+   * Response: data.results[0].geometry.location -> { lat, lng }
+   */
+  private async geocodeWithGoogle(query: string): Promise<GeocodeResult | null> {
     try {
-      // Construct URL with proper encoding
-      const params = new URLSearchParams({
-        q: query,
-        format: "json",
-        limit: "1",
-        addressdetails: "1",
-      });
+      const addressParam = encodeURIComponent(query);
+      const url = `https://maps.googleapis.com/maps/api/geocode/json?address=${addressParam}&key=${this.googleKey}`;
 
-      const url = `${this.baseUrl}?${params.toString()}`;
-      console.log(`[Geocoding] Request URL: ${url}`);
+      const res = await fetch(url);
+      const data = (await res.json()) as {
+        status: string;
+        results?: Array<{ geometry: { location: { lat: number; lng: number } } }>;
+      };
 
-      // Use native fetch (Node.js 18+ has it built-in)
-      console.log(`[Geocoding] Making request to Nominatim API...`);
-      const response = await fetch(url, {
-        headers: {
-          "User-Agent": this.userAgent,
-          "Accept": "application/json",
-        },
-      });
-
-      console.log(`[Geocoding] Response status: ${response.status} ${response.statusText}`);
-
-      if (!response.ok) {
-        const errorText = await response.text().catch(() => "Unable to read error");
-        console.error(`[Geocoding] API error: ${response.status} ${response.statusText}`);
-        console.error(`[Geocoding] Error details: ${errorText}`);
+      if (data.status !== "OK" || !data.results?.length) {
+        console.warn(`[Geocoding] Google: no results for "${query}" (status: ${data.status})`);
         return null;
       }
 
-      const data = await response.json();
-      console.log(`[Geocoding] Received ${Array.isArray(data) ? data.length : 0} result(s)`);
-
-      if (!Array.isArray(data) || data.length === 0) {
-        console.warn(`[Geocoding] No results found for: "${query}"`);
+      const { lat, lng } = data.results[0].geometry.location;
+      const latitude = Number(lat);
+      const longitude = Number(lng);
+      if (Number.isNaN(latitude) || Number.isNaN(longitude)) {
         return null;
       }
-
-      const result = data[0];
-      const lat = parseFloat(result.lat);
-      const lon = parseFloat(result.lon);
-
-      if (isNaN(lat) || isNaN(lon)) {
-        console.error(`[Geocoding] Invalid coordinates: lat=${result.lat}, lon=${result.lon}`);
-        return null;
-      }
-
-      console.log(`[Geocoding] ✓ Successfully geocoded "${query}" to: ${lat}, ${lon}`);
-      return { latitude: lat, longitude: lon };
-    } catch (error: any) {
-      console.error(`[Geocoding] Error geocoding query "${query}":`, error?.message);
+      console.log(`[Geocoding] ✓ Google geocoded "${query}" to: ${latitude}, ${longitude}`);
+      return { latitude, longitude };
+    } catch (err) {
+      console.error(`[Geocoding] Google error for "${query}":`, err);
       return null;
     }
   }
 
   /**
-   * Calculate distance between two coordinates using Haversine formula
-   * Returns distance in kilometers
+   * Mapbox Geocoding API v5:
+   * https://api.mapbox.com/geocoding/v5/mapbox.places/{query}.json?access_token=...
+   * Response: data.features[0].center -> [lng, lat]
+   */
+  private async geocodeWithMapbox(query: string): Promise<GeocodeResult | null> {
+    try {
+      const encodedQuery = encodeURIComponent(query);
+      const url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodedQuery}.json?access_token=${this.mapboxToken}&limit=1`;
+
+      const res = await fetch(url);
+      const data = (await res.json()) as {
+        features?: Array<{ center: [number, number] }>;
+      };
+
+      if (!data.features?.length) {
+        console.warn(`[Geocoding] Mapbox: no results for "${query}"`);
+        return null;
+      }
+
+      const [lng, lat] = data.features[0].center;
+      const latitude = Number(lat);
+      const longitude = Number(lng);
+      if (Number.isNaN(latitude) || Number.isNaN(longitude)) {
+        return null;
+      }
+      console.log(`[Geocoding] ✓ Mapbox geocoded "${query}" to: ${latitude}, ${longitude}`);
+      return { latitude, longitude };
+    } catch (err) {
+      console.error(`[Geocoding] Mapbox error for "${query}":`, err);
+      return null;
+    }
+  }
+
+  /**
+   * Distance between two coordinates in kilometers (Haversine).
    */
   calculateDistance(
     lat1: number,
@@ -158,21 +173,17 @@ export class GeocodingService {
     lat2: number,
     lon2: number
   ): number {
-    const R = 6371; // Earth's radius in kilometers
+    const R = 6371;
     const dLat = this.toRadians(lat2 - lat1);
     const dLon = this.toRadians(lon2 - lon1);
-
     const a =
       Math.sin(dLat / 2) * Math.sin(dLat / 2) +
       Math.cos(this.toRadians(lat1)) *
         Math.cos(this.toRadians(lat2)) *
         Math.sin(dLon / 2) *
         Math.sin(dLon / 2);
-
     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    const distance = R * c;
-
-    return distance;
+    return R * c;
   }
 
   private toRadians(degrees: number): number {
@@ -181,4 +192,3 @@ export class GeocodingService {
 }
 
 export const geocodingService = new GeocodingService();
-

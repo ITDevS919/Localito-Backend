@@ -643,6 +643,36 @@ import * as shopifyService from "../services/shopifyService";
 import { ShopifyTokenError } from "../services/shopifyService";
 import { pool } from "../db/connection";
 
+/**
+ * If a business has postcode/city but no latitude/longitude, geocode and persist.
+ * Returns { latitude, longitude } or null. Used so MapView can work from address-only data.
+ */
+async function ensureBusinessGeocoded(businessId: string): Promise<{ latitude: number; longitude: number } | null> {
+  const biz = await pool.query(
+    "SELECT id, postcode, city, business_address, latitude, longitude FROM businesses WHERE id = $1",
+    [businessId]
+  );
+  if (biz.rows.length === 0) return null;
+  const row = biz.rows[0];
+  if (row.latitude != null && row.longitude != null) return { latitude: row.latitude, longitude: row.longitude };
+  const postcode = row.postcode?.trim() || "";
+  const city = row.city?.trim() || "";
+  const fullAddress = row.business_address?.trim() || undefined;
+  if (!postcode && !city) return null;
+  try {
+    const result = await geocodingService.geocodeAddress(postcode || undefined, city || undefined, fullAddress);
+    if (!result) return null;
+    await pool.query(
+      "UPDATE businesses SET latitude = $1, longitude = $2 WHERE id = $3",
+      [result.latitude, result.longitude, businessId]
+    );
+    return { latitude: result.latitude, longitude: result.longitude };
+  } catch (e) {
+    console.error("[ensureBusinessGeocoded]", e);
+    return null;
+  }
+}
+
 // Get products (public)
 router.get("/products", async (req, res, next) => {
   try {
@@ -816,6 +846,16 @@ router.get("/products/:id", async (req, res, next) => {
     const product = await productService.getProductById(req.params.id);
     if (!product) {
       return res.status(404).json({ success: false, message: "Product not found" });
+    }
+    // Lazy geocode business so MapView has coordinates when only postcode/city are stored
+    const hasAddress = product.business_address || product.city || product.postcode;
+    const missingCoords = (product as any).business_latitude == null || (product as any).business_longitude == null;
+    if (product.businessId && hasAddress && missingCoords) {
+      const coords = await ensureBusinessGeocoded(product.businessId);
+      if (coords) {
+        (product as any).business_latitude = coords.latitude;
+        (product as any).business_longitude = coords.longitude;
+      }
     }
     res.json({ success: true, data: product });
   } catch (error) {
@@ -1727,7 +1767,8 @@ router.get("/services/pending", isAuthenticated, async (req, res, next) => {
 router.get("/services/:id", async (req, res, next) => {
   try {
     const result = await pool.query(
-      `SELECT s.*, b.business_name as business_name, b.business_address, b.city, b.postcode
+      `SELECT s.*, b.business_name as business_name, b.business_address, b.city, b.postcode,
+              b.latitude as business_latitude, b.longitude as business_longitude
        FROM services s
        JOIN businesses b ON s.business_id = b.id
        WHERE s.id = $1 AND s.is_approved = true`,
@@ -1738,7 +1779,19 @@ router.get("/services/:id", async (req, res, next) => {
       return res.status(404).json({ success: false, message: "Service not found" });
     }
 
-    res.json({ success: true, data: result.rows[0] });
+    const row = result.rows[0];
+    const hasAddress = row.business_address || row.city || row.postcode;
+    const missingCoords = row.business_latitude == null || row.business_longitude == null;
+    const serviceBusinessId = row.business_id;
+    if (serviceBusinessId && hasAddress && missingCoords) {
+      const coords = await ensureBusinessGeocoded(serviceBusinessId);
+      if (coords) {
+        row.business_latitude = coords.latitude;
+        row.business_longitude = coords.longitude;
+      }
+    }
+
+    res.json({ success: true, data: row });
   } catch (error) {
     next(error);
   }
@@ -5633,6 +5686,15 @@ router.get("/business/:identifier/public", async (req, res, next) => {
 
     const business = result.rows[0];
     const businessId = business.id;
+
+    // Lazy geocode: if business has postcode/city but no lat/lng, geocode and attach (for MapView)
+    if ((business.latitude == null || business.longitude == null) && (business.postcode || business.city)) {
+      const coords = await ensureBusinessGeocoded(businessId);
+      if (coords) {
+        business.latitude = coords.latitude;
+        business.longitude = coords.longitude;
+      }
+    }
 
     // Check if user is following (if authenticated)
     let isFollowing = false;
