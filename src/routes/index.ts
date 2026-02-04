@@ -136,6 +136,28 @@ router.post("/auth/signup", async (req, res, next) => {
       businessData: role === "business" ? businessData : undefined
     });
 
+    const effectiveRole = role || "customer";
+    const frontendUrl = (process.env.FRONTEND_URL || "http://localhost:5173").replace(/\/$/, "");
+
+    // Send welcome email (non-blocking; signup succeeds even if email fails)
+    try {
+      if (effectiveRole === "business" && businessData) {
+        await emailService.sendBusinessWelcomeEmail(user.email, {
+          businessOwnerName: user.username,
+          businessName: businessData.businessName,
+          verificationLink: `${frontendUrl}/login/business`,
+          dashboardLink: `${frontendUrl}/business/dashboard`,
+        });
+      } else {
+        await emailService.sendWelcomeVerificationEmail(user.email, {
+          userName: user.username,
+          verificationLink: `${frontendUrl}/login/customer`,
+        });
+      }
+    } catch (emailErr: any) {
+      console.error("[Signup] Welcome email failed:", emailErr?.message || emailErr);
+    }
+
     // Auto-login after signup
     req.login(user, (err) => {
       if (err) {
