@@ -12,7 +12,6 @@
     "update-categories": "tsx scripts/update-categories.ts",
     "test:commission-tiers": "tsx scripts/test-commission-tiers.ts",
     "test:stripe-connect": "tsx scripts/test-stripe-connect.ts"
-
   },
   "dependencies": {
     "@react-email/components": "^1.0.6",
@@ -27,6 +26,7 @@
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
     "express-session": "^1.18.1",
+    "firebase-admin": "^13.6.0",
     "google-auth-library": "^10.5.0",
     "jimp": "^1.6.0",
     "jsqr": "^1.4.0",

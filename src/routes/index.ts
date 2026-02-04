@@ -18,6 +18,7 @@ import { stripeService, COMMISSION_TIERS } from "../services/stripeService";
 import { rewardsService } from '../services/rewardsService';
 import { AvailabilityService } from '../services/availabilityService';
 import { emailService } from '../services/emailService';
+import { getAdminFirestore, listBuyerSellerRooms, getRoomMessages } from '../services/firebaseAdmin';
 
 // Create require function for ES modules
 const require = createRequire(import.meta.url);
@@ -4127,6 +4128,47 @@ router.get("/admin/users", isAuthenticated, async (req, res, next) => {
         totalPages: Math.ceil(total / limit),
       },
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Admin: List all buyer-seller conversations (read-only; requires Firebase Admin)
+router.get("/admin/conversations", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ success: false, message: "Only admins can access this" });
+    }
+    if (!getAdminFirestore()) {
+      return res.status(503).json({
+        success: false,
+        message: "Firebase Admin is not configured. Set FIREBASE_SERVICE_ACCOUNT_JSON to enable viewing buyer-seller conversations.",
+      });
+    }
+    const rooms = await listBuyerSellerRooms();
+    res.json({ success: true, data: rooms });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Admin: Get messages for a buyer-seller conversation (read-only)
+router.get("/admin/conversations/:roomId/messages", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ success: false, message: "Only admins can access this" });
+    }
+    if (!getAdminFirestore()) {
+      return res.status(503).json({
+        success: false,
+        message: "Firebase Admin is not configured. Set FIREBASE_SERVICE_ACCOUNT_JSON to enable viewing buyer-seller conversations.",
+      });
+    }
+    const { roomId } = req.params;
+    const messages = await getRoomMessages(roomId);
+    res.json({ success: true, data: messages });
   } catch (error) {
     next(error);
   }
