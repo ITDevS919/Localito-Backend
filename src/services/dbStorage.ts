@@ -231,16 +231,17 @@ export class DbStorage {
   }
 
   async createUserFromGoogle(googleId: string, email: string, displayName: string, role: string = "customer"): Promise<User> {
-    // Generate unique username from display name or email
-    let baseUsername = displayName?.replace(/\s+/g, '').toLowerCase() || 
-                      email.split('@')[0] || 
-                      `user_${Date.now()}`;
-    
+    // Use display name with proper formatting (preserve capitals and spaces, e.g. "Sheng Fulai")
+    const normalizedDisplayName = displayName?.trim().replace(/\s+/g, ' ');
+    let baseUsername = (normalizedDisplayName && normalizedDisplayName.length >= 3)
+      ? normalizedDisplayName
+      : email.split('@')[0] || `user_${Date.now()}`;
+
     // Ensure username is unique
     let uniqueUsername = baseUsername;
     let counter = 1;
     while (await this.getUserByUsername(uniqueUsername)) {
-      uniqueUsername = `${baseUsername}${counter}`;
+      uniqueUsername = `${baseUsername} ${counter}`;
       counter++;
     }
 
