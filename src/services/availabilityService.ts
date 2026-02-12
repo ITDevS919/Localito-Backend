@@ -39,6 +39,8 @@ export class AvailabilityService {
     durationMinutes: number = 60,
     slotIntervalMinutes: number = 30
   ): Promise<TimeSlot[]> {
+    // Automatically clean up expired locks before calculating available slots
+    await this.cleanupExpiredLocks();
     const slots: TimeSlot[] = [];
     const currentDate = new Date(startDate);
     
@@ -91,7 +93,18 @@ export class AvailabilityService {
         
         // If cutoff time is set and current time is past cutoff, skip today
         if (cutoffTime) {
-          const [cutoffHour, cutoffMin] = cutoffTime.split(':').map(Number);
+          // Defensive parsing with validation
+          const cutoffParts = cutoffTime.split(':');
+          if (cutoffParts.length < 2) {
+            console.warn(`[Availability] Invalid cutoff time format: ${cutoffTime}`);
+            continue; // Skip this day if invalid
+          }
+          const cutoffHour = parseInt(cutoffParts[0], 10);
+          const cutoffMin = parseInt(cutoffParts[1], 10);
+          if (isNaN(cutoffHour) || isNaN(cutoffMin)) {
+            console.warn(`[Availability] Invalid cutoff time values: ${cutoffTime}`);
+            continue; // Skip this day if invalid
+          }
           const cutoffDate = new Date();
           cutoffDate.setHours(cutoffHour, cutoffMin || 0, 0, 0);
           
@@ -114,12 +127,33 @@ export class AvailabilityService {
         for (const slot of slotsForDay) {
           // For same-day slots, check if we're past cutoff time
           if (isToday && cutoffTime) {
-            const [cutoffHour, cutoffMin] = cutoffTime.split(':').map(Number);
+            // Defensive parsing with validation
+            const cutoffParts = cutoffTime.split(':');
+            if (cutoffParts.length < 2) {
+              console.warn(`[Availability] Invalid cutoff time format: ${cutoffTime}`);
+              continue;
+            }
+            const cutoffHour = parseInt(cutoffParts[0], 10);
+            const cutoffMin = parseInt(cutoffParts[1], 10);
+            if (isNaN(cutoffHour) || isNaN(cutoffMin)) {
+              console.warn(`[Availability] Invalid cutoff time values: ${cutoffTime}`);
+              continue;
+            }
             const cutoffDate = new Date();
             cutoffDate.setHours(cutoffHour, cutoffMin || 0, 0, 0);
             
-            // Parse slot time (HH:MM format)
-            const [slotHour, slotMin] = slot.split(':').map(Number);
+            // Parse slot time (HH:MM format) with validation
+            const slotParts = slot.split(':');
+            if (slotParts.length < 2) {
+              console.warn(`[Availability] Invalid slot time format: ${slot}`);
+              continue;
+            }
+            const slotHour = parseInt(slotParts[0], 10);
+            const slotMin = parseInt(slotParts[1], 10);
+            if (isNaN(slotHour) || isNaN(slotMin)) {
+              console.warn(`[Availability] Invalid slot time values: ${slot}`);
+              continue;
+            }
             const slotDate = new Date();
             slotDate.setHours(slotHour, slotMin || 0, 0, 0);
             
@@ -184,14 +218,28 @@ export class AvailabilityService {
         return false;
       }
       
-      await pool.query(
+      // Use a more robust locking mechanism with proper race condition handling
+      // Try to insert new lock, or update if expired
+      const result = await pool.query(
         `INSERT INTO booking_locks (business_id, booking_date, booking_time, locked_by, expires_at)
          VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (business_id, booking_date, booking_time) 
-         DO UPDATE SET locked_by = $4, expires_at = $5
-         WHERE booking_locks.expires_at < NOW()`,
+         DO UPDATE SET 
+           locked_by = EXCLUDED.locked_by,
+           expires_at = EXCLUDED.expires_at,
+           created_at = CURRENT_TIMESTAMP
+         WHERE booking_locks.expires_at < NOW()
+         RETURNING id`,
         [businessId, date, time, userId, expiresAt]
       );
+      
+      // If no rows returned, the lock exists and is not expired (conflict with active lock)
+      if (result.rowCount === 0) {
+        console.log(`[Availability] Slot already locked for business ${businessId} on ${date} at ${time}`);
+        return false;
+      }
+      
+      console.log(`[Availability] Successfully locked slot for business ${businessId} on ${date} at ${time} for user ${userId}`);
       return true;
     } catch (error) {
       console.error('Failed to lock slot:', error);
@@ -237,7 +285,18 @@ export class AvailabilityService {
       const today = new Date();
       today.setHours(0, 0, 0, 0);
       
-      const [cutoffHour, cutoffMin] = cutoffTime.split(':').map(Number);
+      // Defensive parsing with validation
+      const cutoffParts = cutoffTime.split(':');
+      if (cutoffParts.length < 2) {
+        console.warn(`[Availability] Invalid cutoff time format: ${cutoffTime}`);
+        return { allowed: false, reason: "Invalid cutoff time configuration" };
+      }
+      const cutoffHour = parseInt(cutoffParts[0], 10);
+      const cutoffMin = parseInt(cutoffParts[1], 10);
+      if (isNaN(cutoffHour) || isNaN(cutoffMin)) {
+        console.warn(`[Availability] Invalid cutoff time values: ${cutoffTime}`);
+        return { allowed: false, reason: "Invalid cutoff time configuration" };
+      }
       const cutoffDate = new Date();
       cutoffDate.setHours(cutoffHour, cutoffMin || 0, 0, 0);
       
@@ -266,8 +325,25 @@ export class AvailabilityService {
     intervalMinutes: number
   ): string[] {
     const slots: string[] = [];
-    const [startHour, startMin] = startTime.split(':').map(Number);
-    const [endHour, endMin] = endTime.split(':').map(Number);
+    
+    // Defensive parsing with validation
+    const startParts = startTime.split(':');
+    const endParts = endTime.split(':');
+    
+    if (startParts.length < 2 || endParts.length < 2) {
+      console.warn(`[Availability] Invalid time format - start: ${startTime}, end: ${endTime}`);
+      return slots; // Return empty array if invalid
+    }
+    
+    const startHour = parseInt(startParts[0], 10);
+    const startMin = parseInt(startParts[1], 10);
+    const endHour = parseInt(endParts[0], 10);
+    const endMin = parseInt(endParts[1], 10);
+    
+    if (isNaN(startHour) || isNaN(startMin) || isNaN(endHour) || isNaN(endMin)) {
+      console.warn(`[Availability] Invalid time values - start: ${startTime}, end: ${endTime}`);
+      return slots; // Return empty array if invalid
+    }
     
     let current = new Date();
     current.setHours(startHour, startMin, 0, 0);

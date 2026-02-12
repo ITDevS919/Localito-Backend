@@ -1,6 +1,7 @@
 import Stripe from "stripe";
 import { pool } from "../db/connection";
 import { rewardsService } from "./rewardsService";
+import { emailService } from "./emailService";
 
 /**
  * Stripe Connect Architecture:
@@ -914,6 +915,15 @@ export class StripeService {
     customerEmail?: string
   ) {
     try {
+      // Validate amount - Stripe requires minimum amount (50 pence for GBP)
+      const minAmount = currency.toLowerCase() === 'gbp' ? 0.50 : 0.50;
+      if (amount <= 0) {
+        throw new Error("Payment amount must be greater than zero");
+      }
+      if (amount < minAmount) {
+        throw new Error(`Payment amount must be at least £${minAmount.toFixed(2)}`);
+      }
+
       // Get THIS business's specific Stripe account ID
       const accountResult = await pool.query(
         "SELECT stripe_account_id, charges_enabled FROM stripe_connect_accounts WHERE business_id = $1",
@@ -921,67 +931,195 @@ export class StripeService {
       );
 
       if (accountResult.rows.length === 0) {
-        throw new Error("Business Stripe account not found");
+        // This should not happen if auto-creation is working, but provide helpful error
+        throw new Error("Business Stripe account not found. Please contact support to set up payment processing.");
       }
 
       // Each business has their own account ID
       const stripeAccountId = accountResult.rows[0].stripe_account_id;
       const chargesEnabled = accountResult.rows[0].charges_enabled;
 
-      if (!chargesEnabled) {
-        throw new Error("Business Stripe account is not ready to accept payments");
+      // Fetch order details for user-friendly checkout display
+      const orderDetailsResult = await pool.query(
+        `SELECT 
+          b.business_name,
+          COALESCE(
+            (SELECT string_agg(p.name, ', ' ORDER BY oi.id)
+             FROM order_items oi
+             JOIN products p ON oi.product_id = p.id
+             WHERE oi.order_id = $1
+             LIMIT 3),
+            ''
+          ) as product_names,
+          COALESCE(
+            (SELECT string_agg(s.name, ', ' ORDER BY osi.id)
+             FROM order_service_items osi
+             JOIN services s ON osi.service_id = s.id
+             WHERE osi.order_id = $1
+             LIMIT 3),
+            ''
+          ) as service_names,
+          (SELECT COUNT(*) FROM order_items WHERE order_id = $1) as product_count,
+          (SELECT COUNT(*) FROM order_service_items WHERE order_id = $1) as service_count
+         FROM orders o
+         JOIN businesses b ON o.business_id = b.id
+         WHERE o.id = $1`,
+        [orderId]
+      );
+
+      // Build user-friendly order name
+      let orderName = `Order from ${orderDetailsResult.rows[0]?.business_name || 'Business'}`;
+      let orderDescription = `Payment for your order`;
+      
+      if (orderDetailsResult.rows.length > 0) {
+        const orderDetails = orderDetailsResult.rows[0];
+        const productNames = orderDetails.product_names || '';
+        const serviceNames = orderDetails.service_names || '';
+        const productCount = parseInt(orderDetails.product_count || '0');
+        const serviceCount = parseInt(orderDetails.service_count || '0');
+        
+        // Create descriptive name with product/service names
+        const itemNames: string[] = [];
+        if (productNames) {
+          if (productCount > 3) {
+            itemNames.push(`${productNames} and ${productCount - 3} more item${productCount - 3 > 1 ? 's' : ''}`);
+          } else {
+            itemNames.push(productNames);
+          }
+        }
+        if (serviceNames) {
+          if (serviceCount > 3) {
+            itemNames.push(`${serviceNames} and ${serviceCount - 3} more service${serviceCount - 3 > 1 ? 's' : ''}`);
+          } else {
+            itemNames.push(serviceNames);
+          }
+        }
+        
+        if (itemNames.length > 0) {
+          orderName = `Order from ${orderDetails.business_name}: ${itemNames.join(', ')}`;
+          orderDescription = `Payment for your order from ${orderDetails.business_name}`;
+        }
       }
 
       const commissionRate = await this.getCommissionRateForBusiness(businessId);
       const platformCommission = amount * commissionRate;
       const businessAmount = amount - platformCommission;
 
-      // Payment goes to THIS business's specific account
-      // IMPORTANT: Use the platform Stripe instance to create the PaymentIntent so
-      // webhooks arrive on the platform account. Funds still flow to the business
-      // via transfer_data.destination.
-      const session = await this.stripe.checkout.sessions.create({
-        payment_method_types: ["card"],
-        line_items: [
-          {
-            price_data: {
-              currency: currency.toLowerCase(),
-              product_data: {
-                name: `Order ${orderId}`,
-                description: `Payment for order ${orderId}`,
+      // If business has charges_enabled, use Destination Charges (direct to business account)
+      // Otherwise, use Direct Charges (platform collects, funds held in escrow until onboarding)
+      if (chargesEnabled) {
+        // Destination Charges: Payment goes directly to business account
+        const session = await this.stripe.checkout.sessions.create({
+          payment_method_types: ["card"],
+          line_items: [
+            {
+              price_data: {
+                currency: currency.toLowerCase(),
+                product_data: {
+                  name: orderName,
+                  description: orderDescription,
+                },
+                unit_amount: Math.round(amount * 100),
               },
-              unit_amount: Math.round(amount * 100),
+              quantity: 1,
             },
-            quantity: 1,
-          },
-        ],
-        mode: "payment",
-        success_url: successUrl,
-        cancel_url: cancelUrl,
-        customer_email: customerEmail,
-        payment_intent_data: {
-          application_fee_amount: Math.round(platformCommission * 100), // Platform commission
-          transfer_data: {
-            destination: stripeAccountId, // <-- Payment goes to THIS business's account, not platform
+          ],
+          mode: "payment",
+          success_url: successUrl,
+          cancel_url: cancelUrl,
+          customer_email: customerEmail,
+          payment_intent_data: {
+            application_fee_amount: Math.round(platformCommission * 100), // Platform commission
+            transfer_data: {
+              destination: stripeAccountId, // <-- Payment goes to THIS business's account
+            },
+            metadata: {
+              order_id: orderId,
+              business_id: businessId,
+              payment_mode: "destination_charge",
+            },
           },
           metadata: {
             order_id: orderId,
             business_id: businessId,
+            payment_mode: "destination_charge",
           },
-        },
-        metadata: {
-          order_id: orderId,
-          business_id: businessId,
-        },
-        automatic_tax: {
-          enabled: false,
-        },
-      });
-
-      return session;
+          automatic_tax: {
+            enabled: false,
+          },
+        });
+        return session;
+      } else {
+        // Direct Charges: Platform collects payment, funds held in escrow until business completes onboarding
+        // Business can sell immediately, but must complete Stripe onboarding to withdraw funds
+        console.log(`[Stripe] Business ${businessId} has charges_enabled=false, using Direct Charges (escrow mode)`);
+        
+        // Add escrow note to description
+        const escrowDescription = orderDescription + (orderDescription.includes('funds held') ? '' : ' (funds held until business completes verification)');
+        
+        const session = await this.stripe.checkout.sessions.create({
+          payment_method_types: ["card"],
+          line_items: [
+            {
+              price_data: {
+                currency: currency.toLowerCase(),
+                product_data: {
+                  name: orderName,
+                  description: escrowDescription,
+                },
+                unit_amount: Math.round(amount * 100),
+              },
+              quantity: 1,
+            },
+          ],
+          mode: "payment",
+          success_url: successUrl,
+          cancel_url: cancelUrl,
+          customer_email: customerEmail,
+          // No transfer_data - payment goes to platform account
+          // We'll track escrow balance and transfer after onboarding
+          payment_intent_data: {
+            metadata: {
+              order_id: orderId,
+              business_id: businessId,
+              payment_mode: "direct_charge_escrow",
+              business_amount: businessAmount.toString(),
+              platform_commission: platformCommission.toString(),
+            },
+          },
+          metadata: {
+            order_id: orderId,
+            business_id: businessId,
+            payment_mode: "direct_charge_escrow",
+            business_amount: businessAmount.toString(),
+            platform_commission: platformCommission.toString(),
+          },
+          automatic_tax: {
+            enabled: false,
+          },
+        });
+        return session;
+      }
     } catch (error: any) {
       console.error("[Stripe] Failed to create checkout session:", error);
       throw error;
+    }
+  }
+
+  /**
+   * Expire a Stripe checkout session
+   */
+  async expireCheckoutSession(sessionId: string): Promise<void> {
+    try {
+      await this.stripe.checkout.sessions.expire(sessionId);
+      console.log(`[Stripe] Expired checkout session: ${sessionId}`);
+    } catch (error: any) {
+      // Session might already be expired or not found - that's okay
+      if (error.code === 'resource_missing') {
+        console.log(`[Stripe] Session ${sessionId} already expired or not found`);
+      } else {
+        throw error;
+      }
     }
   }
 
@@ -1008,31 +1146,115 @@ export class StripeService {
       const stripeAccountId = accountResult.rows[0].stripe_account_id;
       const chargesEnabled = accountResult.rows[0].charges_enabled;
 
-      if (!chargesEnabled) {
-        throw new Error("Business Stripe account is not ready to accept payments");
+      // Fetch order details for user-friendly payment display
+      const orderDetailsResult = await pool.query(
+        `SELECT 
+          b.business_name,
+          COALESCE(
+            (SELECT string_agg(p.name, ', ' ORDER BY oi.id)
+             FROM order_items oi
+             JOIN products p ON oi.product_id = p.id
+             WHERE oi.order_id = $1
+             LIMIT 3),
+            ''
+          ) as product_names,
+          COALESCE(
+            (SELECT string_agg(s.name, ', ' ORDER BY osi.id)
+             FROM order_service_items osi
+             JOIN services s ON osi.service_id = s.id
+             WHERE osi.order_id = $1
+             LIMIT 3),
+            ''
+          ) as service_names,
+          (SELECT COUNT(*) FROM order_items WHERE order_id = $1) as product_count,
+          (SELECT COUNT(*) FROM order_service_items WHERE order_id = $1) as service_count
+         FROM orders o
+         JOIN businesses b ON o.business_id = b.id
+         WHERE o.id = $1`,
+        [orderId]
+      );
+
+      // Build user-friendly order name (same logic as checkout session)
+      let orderDescription = `Order from ${orderDetailsResult.rows[0]?.business_name || 'Business'}`;
+      
+      if (orderDetailsResult.rows.length > 0) {
+        const orderDetails = orderDetailsResult.rows[0];
+        const productNames = orderDetails.product_names || '';
+        const serviceNames = orderDetails.service_names || '';
+        const productCount = parseInt(orderDetails.product_count || '0');
+        const serviceCount = parseInt(orderDetails.service_count || '0');
+        
+        const itemNames: string[] = [];
+        if (productNames) {
+          if (productCount > 3) {
+            itemNames.push(`${productNames} and ${productCount - 3} more item${productCount - 3 > 1 ? 's' : ''}`);
+          } else {
+            itemNames.push(productNames);
+          }
+        }
+        if (serviceNames) {
+          if (serviceCount > 3) {
+            itemNames.push(`${serviceNames} and ${serviceCount - 3} more service${serviceCount - 3 > 1 ? 's' : ''}`);
+          } else {
+            itemNames.push(serviceNames);
+          }
+        }
+        
+        if (itemNames.length > 0) {
+          orderDescription = `Order from ${orderDetails.business_name}: ${itemNames.join(', ')}`;
+        }
       }
 
       const commissionRate = await this.getCommissionRateForBusiness(businessId);
       const platformCommission = amount * commissionRate;
+      const businessAmount = amount - platformCommission;
 
-      const paymentIntent = await this.stripe.paymentIntents.create({
-        amount: Math.round(amount * 100),
-        currency: currency.toLowerCase(),
-        application_fee_amount: Math.round(platformCommission * 100),
-        transfer_data: {
-          destination: stripeAccountId,
-        },
-        metadata: {
-          order_id: orderId,
-          business_id: businessId,
-        },
-        receipt_email: customerEmail,
-        automatic_payment_methods: {
-          enabled: true,
-        },
-      });
-
-      return paymentIntent;
+      if (chargesEnabled) {
+        // Destination Charges: Payment goes directly to business account
+        const paymentIntent = await this.stripe.paymentIntents.create({
+          amount: Math.round(amount * 100),
+          currency: currency.toLowerCase(),
+          description: orderDescription,
+          application_fee_amount: Math.round(platformCommission * 100),
+          transfer_data: {
+            destination: stripeAccountId,
+          },
+          metadata: {
+            order_id: orderId,
+            business_id: businessId,
+            payment_mode: "destination_charge",
+          },
+          receipt_email: customerEmail,
+          automatic_payment_methods: {
+            enabled: true,
+          },
+        });
+        return paymentIntent;
+      } else {
+        // Direct Charges: Platform collects payment, funds held in escrow
+        console.log(`[Stripe] Business ${businessId} has charges_enabled=false, using Direct Charges (escrow mode) for mobile`);
+        
+        const escrowDescription = orderDescription + (orderDescription.includes('funds held') ? '' : ' (funds held until business completes verification)');
+        
+        const paymentIntent = await this.stripe.paymentIntents.create({
+          amount: Math.round(amount * 100),
+          currency: currency.toLowerCase(),
+          description: escrowDescription,
+          // No transfer_data - payment goes to platform account
+          metadata: {
+            order_id: orderId,
+            business_id: businessId,
+            payment_mode: "direct_charge_escrow",
+            business_amount: businessAmount.toString(),
+            platform_commission: platformCommission.toString(),
+          },
+          receipt_email: customerEmail,
+          automatic_payment_methods: {
+            enabled: true,
+          },
+        });
+        return paymentIntent;
+      }
     } catch (error: any) {
       console.error("[Stripe] Failed to create payment intent:", error);
       throw error;
@@ -1075,26 +1297,195 @@ export class StripeService {
     return this.stripe.webhooks.constructEvent(payload, signature, secret);
   }
 
+  /**
+   * Manually sync payment status from Stripe
+   * Used when webhook fails or is delayed
+   * @param orderId - The order ID to sync
+   * @returns Payment status and whether order was updated
+   */
+  async syncPaymentStatusFromStripe(orderId: string): Promise<{
+    success: boolean;
+    paymentStatus: 'succeeded' | 'pending' | 'failed' | 'not_found';
+    orderUpdated: boolean;
+    message: string;
+  }> {
+    try {
+      // Get order with payment info
+      const orderResult = await pool.query(
+        `SELECT id, status, stripe_payment_intent_id, stripe_session_id, business_id, total
+         FROM orders WHERE id = $1`,
+        [orderId]
+      );
+
+      if (orderResult.rows.length === 0) {
+        return {
+          success: false,
+          paymentStatus: 'not_found',
+          orderUpdated: false,
+          message: 'Order not found',
+        };
+      }
+
+      const order = orderResult.rows[0];
+      let paymentIntentId: string | null = order.stripe_payment_intent_id;
+
+      // If we have a session_id but no payment_intent_id, get payment_intent from session
+      if (!paymentIntentId && order.stripe_session_id) {
+        try {
+          const session = await this.stripe.checkout.sessions.retrieve(order.stripe_session_id);
+          paymentIntentId = session.payment_intent as string | null;
+          
+          // Update order with payment_intent_id if we found it
+          if (paymentIntentId) {
+            await pool.query(
+              `UPDATE orders SET stripe_payment_intent_id = $1 WHERE id = $2`,
+              [paymentIntentId, orderId]
+            );
+          }
+        } catch (error: any) {
+          console.error(`[Stripe Sync] Failed to retrieve session ${order.stripe_session_id}:`, error.message);
+          return {
+            success: false,
+            paymentStatus: 'not_found',
+            orderUpdated: false,
+            message: `Failed to retrieve checkout session: ${error.message}`,
+          };
+        }
+      }
+
+      if (!paymentIntentId) {
+        return {
+          success: false,
+          paymentStatus: 'not_found',
+          orderUpdated: false,
+          message: 'No payment intent or session found for this order',
+        };
+      }
+
+      // Retrieve payment intent from Stripe
+      const paymentIntent = await this.stripe.paymentIntents.retrieve(paymentIntentId);
+
+      console.log(`[Stripe Sync] Retrieved payment intent ${paymentIntentId} for order ${orderId}`, {
+        status: paymentIntent.status,
+        amount: paymentIntent.amount,
+        currency: paymentIntent.currency,
+      });
+
+      // If payment succeeded and order is still awaiting_payment, process it
+      if (paymentIntent.status === 'succeeded' && order.status === 'awaiting_payment') {
+        console.log(`[Stripe Sync] Payment succeeded but order still awaiting_payment. Processing manually...`);
+        
+        // Manually trigger payment succeeded handler (this will also send emails)
+        await this.handlePaymentSucceeded(paymentIntent);
+        
+        return {
+          success: true,
+          paymentStatus: 'succeeded',
+          orderUpdated: true,
+          message: 'Payment verified, order status updated, and confirmation emails sent',
+        };
+      }
+
+      // If payment succeeded but order is already processed, just return status
+      if (paymentIntent.status === 'succeeded' && order.status !== 'awaiting_payment') {
+        return {
+          success: true,
+          paymentStatus: 'succeeded',
+          orderUpdated: false,
+          message: `Payment succeeded. Order status is already: ${order.status}`,
+        };
+      }
+
+      // If payment is pending
+      if (paymentIntent.status === 'requires_payment_method' || paymentIntent.status === 'requires_confirmation') {
+        return {
+          success: true,
+          paymentStatus: 'pending',
+          orderUpdated: false,
+          message: 'Payment is still pending',
+        };
+      }
+
+      // If payment failed
+      if (paymentIntent.status === 'canceled' || paymentIntent.status === 'requires_capture') {
+        return {
+          success: true,
+          paymentStatus: 'failed',
+          orderUpdated: false,
+          message: `Payment status: ${paymentIntent.status}`,
+        };
+      }
+
+      return {
+        success: true,
+        paymentStatus: paymentIntent.status as any,
+        orderUpdated: false,
+        message: `Payment status: ${paymentIntent.status}`,
+      };
+    } catch (error: any) {
+      console.error(`[Stripe Sync] Failed to sync payment status for order ${orderId}:`, error);
+      return {
+        success: false,
+        paymentStatus: 'not_found',
+        orderUpdated: false,
+        message: `Sync failed: ${error.message}`,
+      };
+    }
+  }
+
   private async handleCheckoutCompleted(session: Stripe.Checkout.Session) {
     const orderId = session.metadata?.order_id;
     if (!orderId) return;
+
+    // Extract payment intent from session (if available)
+    const paymentIntentId = session.payment_intent as string | null;
 
     await pool.query(
       `UPDATE orders 
        SET status = 'processing', 
            stripe_session_id = $1,
+           stripe_payment_intent_id = COALESCE($2, stripe_payment_intent_id),
            updated_at = CURRENT_TIMESTAMP
-       WHERE id = $2`,
-      [session.id, orderId]
+       WHERE id = $3`,
+      [session.id, paymentIntentId, orderId]
     );
+
+    // If we have a payment intent, also trigger handlePaymentSucceeded for consistency
+    // This ensures emails are sent and order is fully processed
+    if (paymentIntentId) {
+      try {
+        const paymentIntent = await this.stripe.paymentIntents.retrieve(paymentIntentId);
+        if (paymentIntent.status === 'succeeded') {
+          // Call handlePaymentSucceeded to ensure full processing (emails, stock, etc.)
+          await this.handlePaymentSucceeded(paymentIntent);
+        }
+      } catch (error: any) {
+        console.error(`[Stripe] Failed to retrieve payment intent ${paymentIntentId} from session:`, error.message);
+        // Continue - order status is already updated
+      }
+    }
   }
 
-  private async handlePaymentSucceeded(paymentIntent: Stripe.PaymentIntent) {
+  async handlePaymentSucceeded(paymentIntent: Stripe.PaymentIntent) {
     const orderId = paymentIntent.metadata?.order_id;
     const businessId = paymentIntent.metadata?.business_id;
     
+    console.log(`[Stripe Webhook] Processing payment_intent.succeeded`, {
+      eventId: paymentIntent.id,
+      paymentIntentId: paymentIntent.id,
+      orderId,
+      businessId,
+      amount: paymentIntent.amount,
+      currency: paymentIntent.currency,
+      status: paymentIntent.status,
+      timestamp: new Date().toISOString(),
+    });
+    
     if (!orderId || !businessId) {
-      console.error(`[Stripe] Missing order_id or business_id in payment intent metadata`);
+      console.error(`[Stripe] Missing order_id or business_id in payment intent metadata`, {
+        paymentIntentId: paymentIntent.id,
+        metadata: paymentIntent.metadata,
+      });
       return;
     }
 
@@ -1103,105 +1494,439 @@ export class StripeService {
     const platformCommission = totalAmount * commissionRate;
     const businessAmount = totalAmount - platformCommission;
 
-    // Get order details - must be in 'awaiting_payment' status
+    // Get order details for initial validation
     const orderResult = await pool.query(
-      `SELECT user_id, total, status, points_used, discount_amount 
+      `SELECT user_id, total, status, points_used, discount_amount, stripe_payment_intent_id
        FROM orders WHERE id = $1`,
       [orderId]
     );
 
     if (orderResult.rows.length === 0) {
-      console.error(`[Stripe] Order ${orderId} not found when processing payment`);
+      console.error(`[Stripe] Order ${orderId} not found when processing payment`, {
+        paymentIntentId: paymentIntent.id,
+      });
       return;
     }
 
-    const order = orderResult.rows[0];
-    const userId = order.user_id;
-    const orderTotal = parseFloat(order.total);
+    // Check if this payment intent was already processed (idempotency)
+    const existingOrder = orderResult.rows[0];
+    if (existingOrder.stripe_payment_intent_id === paymentIntent.id) {
+      console.log(`[Stripe] Payment intent ${paymentIntent.id} already processed for order ${orderId}. Skipping.`, {
+        currentStatus: existingOrder.status,
+      });
+      return;
+    }
 
-    // Only process orders that are awaiting payment
-    if (order.status !== 'awaiting_payment') {
-      console.log(`[Stripe] Order ${orderId} is not in 'awaiting_payment' status (current: ${order.status}). Skipping finalization.`);
-      // Still update payment info but don't finalize
-      await pool.query(
+    console.log(`[Stripe] Processing payment for order ${orderId}`, {
+      currentStatus: existingOrder.status,
+      paymentIntentId: paymentIntent.id,
+      totalAmount,
+      platformCommission,
+      businessAmount,
+    });
+
+    // Use database transaction to ensure atomicity of critical operations
+    // IMPORTANT: Status check must be INSIDE transaction to prevent race conditions
+    const client = await pool.connect();
+    const stockIssues: string[] = [];
+    
+    try {
+      await client.query('BEGIN');
+
+      // Re-fetch order inside transaction to get latest status (prevents race conditions)
+      // FOR UPDATE locks the row to prevent concurrent modifications
+      const orderCheckResult = await client.query(
+        `SELECT user_id, total, status, points_used, discount_amount, stripe_payment_intent_id
+         FROM orders WHERE id = $1 FOR UPDATE`,
+        [orderId]
+      );
+
+      if (orderCheckResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        console.error(`[Stripe] Order ${orderId} not found in transaction`);
+        return;
+      }
+
+      const orderInTx = orderCheckResult.rows[0];
+      
+      // Check if this payment intent was already processed (idempotency check inside transaction)
+      if (orderInTx.stripe_payment_intent_id === paymentIntent.id) {
+        await client.query('ROLLBACK');
+        console.log(`[Stripe] Payment intent ${paymentIntent.id} already processed for order ${orderId}. Skipping.`);
+        return;
+      }
+      
+      // Only process orders that are awaiting payment (atomic check inside transaction)
+      if (orderInTx.status !== 'awaiting_payment') {
+        await client.query('ROLLBACK');
+        console.warn(`[Stripe] Order ${orderId} is not in 'awaiting_payment' status (current: ${orderInTx.status}). Still updating payment metadata.`, {
+          paymentIntentId: paymentIntent.id,
+          currentStatus: orderInTx.status,
+          action: 'updating_payment_metadata_only',
+        });
+        // Still update payment info but don't finalize (outside transaction)
+        // This ensures payment metadata is recorded even if status is different
+        await pool.query(
+          `UPDATE orders 
+           SET stripe_payment_intent_id = $1,
+               platform_commission = $2,
+               business_amount = $3,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = $4`,
+          [paymentIntent.id, platformCommission, businessAmount, orderId]
+        );
+        console.log(`[Stripe] Payment metadata updated for order ${orderId} (status: ${orderInTx.status})`);
+        return;
+      }
+
+      console.log(`[Stripe] Finalizing order ${orderId} after payment confirmation`);
+
+      // FINALIZE ORDER: Update status to 'processing' and payment info
+      // Use WHERE status = 'awaiting_payment' to make it atomic and prevent duplicate processing
+      const updateResult = await client.query(
         `UPDATE orders 
          SET stripe_payment_intent_id = $1,
              platform_commission = $2,
              business_amount = $3,
+             status = 'processing',
              updated_at = CURRENT_TIMESTAMP
-         WHERE id = $4`,
+         WHERE id = $4 AND status = 'awaiting_payment'
+         RETURNING user_id, total, points_used`,
         [paymentIntent.id, platformCommission, businessAmount, orderId]
       );
-      return;
-    }
 
-    console.log(`[Stripe] Finalizing order ${orderId} after payment confirmation`);
-
-    // FINALIZE ORDER: Update status to 'processing' and payment info
-    await pool.query(
-      `UPDATE orders 
-       SET stripe_payment_intent_id = $1,
-           platform_commission = $2,
-           business_amount = $3,
-           status = 'processing',
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = $4`,
-      [paymentIntent.id, platformCommission, businessAmount, orderId]
-    );
-
-    if (paymentIntent.transfer_data?.destination) {
-      await pool.query(
-        `UPDATE orders SET stripe_transfer_id = $1 WHERE id = $2`,
-        [paymentIntent.transfer_data.destination, orderId]
-      );
-    }
-
-    // NOW deduct stock for products (this was deferred until payment succeeded)
-    const orderItemsResult = await pool.query(
-      `SELECT product_id, quantity FROM order_items WHERE order_id = $1`,
-      [orderId]
-    );
-
-    for (const item of orderItemsResult.rows) {
-      await pool.query(
-        `UPDATE products SET stock = stock - $1 WHERE id = $2`,
-        [item.quantity, item.product_id]
-      );
-      console.log(`[Stripe] Deducted ${item.quantity} units from product ${item.product_id}`);
-    }
-
-    // NOW clear cart (this was deferred until payment succeeded)
-    await pool.query(
-      `DELETE FROM cart_items WHERE user_id = $1`,
-      [userId]
-    );
-    await pool.query(
-      `DELETE FROM cart_service_items WHERE user_id = $1`,
-      [userId]
-    );
-    console.log(`[Stripe] Cleared cart for user ${userId}`);
-
-    // NOW redeem points if they were specified (this was deferred until payment succeeded)
-    if (order.points_used && parseFloat(order.points_used) > 0) {
-      try {
-        await rewardsService.redeemPoints(userId, orderId, parseFloat(order.points_used));
-        console.log(`[Stripe] Redeemed ${order.points_used} points for order ${orderId}`);
-      } catch (error: any) {
-        console.error(`[Stripe] Failed to redeem points for order ${orderId}:`, error);
-        // Don't throw - points redemption failure shouldn't fail the order
+      // Check if update succeeded (prevents duplicate processing)
+      if (updateResult.rowCount === 0) {
+        await client.query('ROLLBACK');
+        console.warn(`[Stripe] Order ${orderId} status changed during processing. Another webhook may have processed it.`, {
+          paymentIntentId: paymentIntent.id,
+          attemptedStatus: 'processing',
+          actualStatus: orderInTx.status,
+        });
+        return;
       }
-    }
 
-    // Award cashback points (1% of total order amount)
-    try {
-      await rewardsService.awardCashback(userId, orderId, orderTotal);
-      console.log(`[Stripe] Awarded cashback for order ${orderId}`);
+      console.log(`[Stripe] Order ${orderId} status updated to 'processing'`, {
+        paymentIntentId: paymentIntent.id,
+        userId: updateResult.rows[0].user_id,
+        orderTotal: updateResult.rows[0].total,
+      });
+
+      // Use the order data from the update result (from transaction)
+      const userId = updateResult.rows[0].user_id;
+      const orderTotal = parseFloat(updateResult.rows[0].total);
+      const pointsUsed = updateResult.rows[0].points_used;
+
+      if (paymentIntent.transfer_data?.destination) {
+        await client.query(
+          `UPDATE orders SET stripe_transfer_id = $1 WHERE id = $2`,
+          [paymentIntent.transfer_data.destination, orderId]
+        );
+      }
+
+      // NOW deduct stock for products (this was deferred until payment succeeded)
+      const orderItemsResult = await client.query(
+        `SELECT oi.product_id, oi.quantity, p.name as product_name, p.stock as current_stock
+         FROM order_items oi
+         JOIN products p ON oi.product_id = p.id
+         WHERE oi.order_id = $1`,
+        [orderId]
+      );
+
+      for (const item of orderItemsResult.rows) {
+        // Atomic stock deduction with validation - only deduct if sufficient stock
+        const result = await client.query(
+          `UPDATE products 
+           SET stock = stock - $1, updated_at = CURRENT_TIMESTAMP 
+           WHERE id = $2 AND stock >= $1
+           RETURNING stock`,
+          [item.quantity, item.product_id]
+        );
+
+        if (result.rowCount === 0) {
+          // Stock was insufficient - this is a critical issue
+          // Business decision: Complete the order (customer already paid) but flag for business attention
+          // Alternative: Could fail the order and refund, but that requires additional payment processing
+          const issue = `Product ${item.product_name} (ID: ${item.product_id}): Insufficient stock. Needed ${item.quantity}, available ${item.current_stock}`;
+          stockIssues.push(issue);
+          console.error(`[Stripe] ${issue}`);
+          
+          // Set stock to 0 to prevent negative values and ensure product shows as out of stock
+          await client.query(
+            `UPDATE products SET stock = 0, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+            [item.product_id]
+          );
+          
+          // TODO: Send urgent notification to business about stock issue requiring immediate attention
+        } else {
+          console.log(`[Stripe] Deducted ${item.quantity} units from product ${item.product_name} (${item.product_id}). New stock: ${result.rows[0].stock}`);
+        }
+      }
+
+      // Log stock issues if any occurred
+      if (stockIssues.length > 0) {
+        console.warn(`[Stripe] Order ${orderId} completed but with stock issues:`, stockIssues);
+        // Store stock issues in order notes or send email to business
+        await client.query(
+          `UPDATE orders 
+           SET notes = COALESCE(notes || E'\n\n', '') || $1
+           WHERE id = $2`,
+          [`STOCK WARNING: ${stockIssues.join('; ')}`, orderId]
+        );
+      }
+
+      // NOW clear cart (this was deferred until payment succeeded)
+      await client.query(
+        `DELETE FROM cart_items WHERE user_id = $1`,
+        [userId]
+      );
+      await client.query(
+        `DELETE FROM cart_service_items WHERE user_id = $1`,
+        [userId]
+      );
+      console.log(`[Stripe] Cleared cart for user ${userId}`);
+
+      // NOW redeem points if they were specified (inside transaction for atomicity)
+      if (pointsUsed && parseFloat(pointsUsed) > 0) {
+        const pointsToRedeem = parseFloat(pointsUsed);
+        try {
+          // Atomic points deduction with balance check
+          const deductResult = await client.query(
+            `UPDATE user_points 
+             SET balance = balance - $1,
+                 total_redeemed = total_redeemed + $1,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE user_id = $2 AND balance >= $1
+             RETURNING balance`,
+            [pointsToRedeem, userId]
+          );
+
+          if (deductResult.rowCount === 0) {
+            // Insufficient balance - log but don't fail order (points were already calculated in order total)
+            console.warn(`[Stripe] Insufficient points balance for order ${orderId}. User ${userId} tried to redeem ${pointsToRedeem} points.`);
+          } else {
+            // Record transaction
+            await client.query(
+              `INSERT INTO points_transactions (user_id, order_id, transaction_type, amount, description)
+               VALUES ($1, $2, 'redeemed', $3, $4)`,
+              [userId, orderId, pointsToRedeem, `Points redeemed for order ${orderId}`]
+            );
+            console.log(`[Stripe] Redeemed ${pointsToRedeem} points for order ${orderId}. New balance: ${deductResult.rows[0].balance}`);
+          }
+        } catch (error: any) {
+          console.error(`[Stripe] Failed to redeem points for order ${orderId}:`, error);
+          // Don't throw - points redemption failure shouldn't fail the order
+        }
+      }
+
+      // Award cashback points (1% of total order amount) - inside transaction
+      try {
+        const cashbackAmount = orderTotal * 0.01; // 1% cashback
+        
+        // Get or create user points record
+        let pointsResult = await client.query(
+          'SELECT * FROM user_points WHERE user_id = $1',
+          [userId]
+        );
+
+        if (pointsResult.rows.length === 0) {
+          await client.query(
+            `INSERT INTO user_points (user_id, balance, total_earned)
+             VALUES ($1, $2, $2)`,
+            [userId, cashbackAmount]
+          );
+        } else {
+          await client.query(
+            `UPDATE user_points 
+             SET balance = balance + $1,
+                 total_earned = total_earned + $1,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE user_id = $2`,
+            [cashbackAmount, userId]
+          );
+        }
+
+        // Record transaction
+        await client.query(
+          `INSERT INTO points_transactions (user_id, order_id, transaction_type, amount, description)
+           VALUES ($1, $2, 'earned', $3, $4)`,
+          [userId, orderId, cashbackAmount, `1% cashback on order ${orderId}`]
+        );
+
+        // Update order with points earned
+        await client.query(
+          'UPDATE orders SET points_earned = $1 WHERE id = $2',
+          [cashbackAmount, orderId]
+        );
+
+        console.log(`[Stripe] Awarded ${cashbackAmount} cashback points for order ${orderId}`);
+      } catch (error: any) {
+        console.error(`[Stripe] Failed to award cashback for order ${orderId}:`, error);
+        // Don't throw - cashback is a bonus feature
+      }
+
+      // Commit the transaction
+      await client.query('COMMIT');
+      console.log(`[Stripe] Transaction committed successfully for order ${orderId}`);
     } catch (error: any) {
-      console.error(`[Stripe] Failed to award cashback for order ${orderId}:`, error);
-      // Don't throw - cashback is a bonus feature
+      // Rollback on any error
+      await client.query('ROLLBACK');
+      console.error(`[Stripe] Transaction rolled back for order ${orderId}:`, {
+        error: error.message,
+        stack: error.stack,
+        paymentIntentId: paymentIntent.id,
+        orderStatus: orderInTx?.status || 'unknown',
+        timestamp: new Date().toISOString(),
+      });
+      throw error;
+    } finally {
+      // Release the client back to the pool
+      client.release();
     }
 
     console.log(`[Stripe] Order ${orderId} finalized successfully`);
+
+    // Send order confirmation emails (outside transaction - non-blocking)
+    // This happens after payment succeeds and order is finalized
+    try {
+      // Get order details with customer and business info
+      const orderDetailsResult = await pool.query(
+        `SELECT o.*, 
+                u.username, u.email as customer_email,
+                b.business_name, b.business_address, b.postcode, b.city,
+                b.user_id as business_user_id
+         FROM orders o
+         JOIN users u ON o.user_id = u.id
+         JOIN businesses b ON o.business_id = b.id
+         WHERE o.id = $1`,
+        [orderId]
+      );
+
+      if (orderDetailsResult.rows.length === 0) {
+        console.error(`[Stripe] Order ${orderId} not found when sending confirmation emails`);
+        return;
+      }
+
+      const orderDetails = orderDetailsResult.rows[0];
+
+      // Get order items (products)
+      const itemsResult = await pool.query(
+        `SELECT oi.*, p.name as product_name
+         FROM order_items oi
+         JOIN products p ON oi.product_id = p.id
+         WHERE oi.order_id = $1`,
+        [orderId]
+      );
+
+      // Get order service items
+      const servicesResult = await pool.query(
+        `SELECT osi.*, s.name as service_name
+         FROM order_service_items osi
+         JOIN services s ON osi.service_id = s.id
+         WHERE osi.order_id = $1`,
+        [orderId]
+      );
+
+      // Combine all items for email
+      const allItems = [
+        ...itemsResult.rows.map((item: any) => ({
+          name: item.product_name,
+          quantity: item.quantity,
+          price: parseFloat(item.price),
+        })),
+        ...servicesResult.rows.map((item: any) => ({
+          name: item.service_name,
+          quantity: item.quantity,
+          price: parseFloat(item.price),
+        })),
+      ];
+
+      // Build business address
+      const businessAddressParts = [
+        orderDetails.business_address,
+        orderDetails.postcode,
+        orderDetails.city,
+      ].filter(Boolean);
+      const businessAddress = businessAddressParts.join(", ");
+
+      // Build Google Maps link
+      const googleMapsLink = businessAddress
+        ? `https://maps.google.com/?q=${encodeURIComponent(businessAddress)}`
+        : undefined;
+
+      // Get QR code if available (from order metadata or generate)
+      const qrCodeUrl = orderDetails.qr_code || undefined;
+
+      // Calculate cashback amount (1% of total)
+      const cashbackAmount = parseFloat(orderDetails.points_earned || "0");
+
+      // Send customer confirmation email
+      await emailService.sendOrderConfirmationEmail(
+        orderDetails.customer_email,
+        {
+          customerName: orderDetails.username,
+          orderId: orderId,
+          items: allItems,
+          totalAmount: parseFloat(orderDetails.total),
+          cashbackAmount: cashbackAmount,
+          businessName: orderDetails.business_name,
+          businessAddress: businessAddress,
+          googleMapsLink: googleMapsLink,
+          pickupTime: orderDetails.booking_date && orderDetails.booking_time
+            ? `${orderDetails.booking_date} at ${orderDetails.booking_time}`
+            : "Ready for pickup - check order status for updates",
+          qrCodeUrl: qrCodeUrl,
+        }
+      );
+      console.log(`[Stripe] Order confirmation email sent to customer for order ${orderId}`);
+
+      // Get business email
+      const businessUserResult = await pool.query(
+        `SELECT email FROM users WHERE id = $1`,
+        [orderDetails.business_user_id]
+      );
+
+      if (businessUserResult.rows.length > 0) {
+        const businessEmail = businessUserResult.rows[0].email;
+
+        // Get business owner name
+        const businessOwnerResult = await pool.query(
+          `SELECT username FROM users WHERE id = $1`,
+          [orderDetails.business_user_id]
+        );
+        const businessOwnerName = businessOwnerResult.rows[0]?.username || orderDetails.business_name;
+
+        // Send business new order alert email
+        await emailService.sendNewOrderAlertEmail(businessEmail, {
+          businessOwnerName: businessOwnerName,
+          businessName: orderDetails.business_name,
+          orderId: orderId,
+          customerName: orderDetails.username,
+          customerContact: orderDetails.customer_email,
+          items: allItems,
+          totalAmount: parseFloat(orderDetails.total),
+          collectionTimeSlot: orderDetails.booking_date && orderDetails.booking_time
+            ? `${orderDetails.booking_date} at ${orderDetails.booking_time}`
+            : orderDetails.pickup_time_slot || "To be confirmed",
+          businessAddress: businessAddress,
+          manageOrderLink: `${process.env.FRONTEND_URL || "http://localhost:5173"}/business/orders/${orderId}`,
+        });
+        console.log(`[Stripe] New order alert email sent to business for order ${orderId}`);
+      } else {
+        console.warn(`[Stripe] Business user not found for order ${orderId}, skipping business email`);
+      }
+    } catch (emailError: any) {
+      // Log but don't fail - email is non-critical
+      console.error(
+        `[Stripe] Failed to send order confirmation emails for order ${orderId}:`,
+        {
+          error: emailError.message,
+          stack: emailError.stack,
+          resendConfigured: !!process.env.RESEND_API_KEY,
+          smtpConfigured: !!(process.env.SMTP_USER && process.env.SMTP_PASSWORD),
+        }
+      );
+    }
   }
 
   private async handlePaymentFailed(paymentIntent: Stripe.PaymentIntent) {

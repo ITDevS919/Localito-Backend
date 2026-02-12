@@ -45,6 +45,7 @@ router.get("/health", async (_req, res) => {
     services: {
       database: "unknown",
       stripe: "unknown",
+      email: "unknown",
     },
   };
 
@@ -62,6 +63,17 @@ router.get("/health", async (_req, res) => {
     health.services.stripe = `configured (${keyType})`;
   } else {
     health.services.stripe = "not configured";
+  }
+
+  // Check Email Service
+  const hasResend = !!process.env.RESEND_API_KEY;
+  const hasSMTP = !!(process.env.SMTP_USER && process.env.SMTP_PASSWORD);
+  if (hasResend) {
+    health.services.email = "configured (Resend)";
+  } else if (hasSMTP) {
+    health.services.email = "configured (SMTP)";
+  } else {
+    health.services.email = "not configured";
   }
 
   res.json(health);
@@ -1580,11 +1592,43 @@ router.post("/cart", isAuthenticated, async (req, res, next) => {
       return res.status(400).json({ success: false, message: "Invalid product or quantity" });
     }
 
+    // Check product stock availability
+    const productResult = await pool.query(
+      "SELECT stock, name FROM products WHERE id = $1",
+      [productId]
+    );
+
+    if (productResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Product not found" });
+    }
+
+    const product = productResult.rows[0];
+    // Handle null/undefined stock - default to 0 (stock is INTEGER NOT NULL in DB, but be defensive)
+    const availableStock = product.stock != null ? parseInt(product.stock) : 0;
+
     // Check if item already in cart
     const existing = await pool.query(
       "SELECT * FROM cart_items WHERE user_id = $1 AND product_id = $2",
       [user.id, productId]
     );
+
+    const currentCartQuantity = existing.rows.length > 0 ? existing.rows[0].quantity : 0;
+    const newTotalQuantity = currentCartQuantity + quantity;
+
+    // Validate stock availability
+    if (availableStock <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "This product is currently out of stock",
+      });
+    }
+
+    if (newTotalQuantity > availableStock) {
+      return res.status(400).json({
+        success: false,
+        message: `Only ${availableStock} items available in stock${currentCartQuantity > 0 ? ` (you already have ${currentCartQuantity} in your cart)` : ''}`,
+      });
+    }
 
     if (existing.rows.length > 0) {
       // Update quantity
@@ -2612,7 +2656,14 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
       total = Math.max(0, total - businessDiscount - businessPoints);
 
       // Build pickup location from business address
-      const business = items[0] || serviceItems[0];
+      // Defensive check: ensure we have at least one item or service item
+      const business = items.length > 0 ? items[0] : (serviceItems.length > 0 ? serviceItems[0] : null);
+      if (!business) {
+        // This shouldn't happen, but handle gracefully
+        console.error(`[Order] No items or services found for business ${businessId} in order creation`);
+        continue; // Skip this business
+      }
+      
       const pickupLocationParts: string[] = [];
       if (business.business_address) pickupLocationParts.push(business.business_address);
       if (business.postcode) pickupLocationParts.push(business.postcode);
@@ -2625,7 +2676,7 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
       // Determine if this is a service order (has services)
       const isServiceOrder = serviceItems.length > 0;
       const bookingDuration = isServiceOrder && serviceItems.length > 0
-        ? serviceItems[0].duration_minutes
+        ? (serviceItems[0]?.duration_minutes || null)
         : null;
 
       // Get booking date/time for this business
@@ -2815,13 +2866,58 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
     const paymentIntents = [];
 
     for (const order of createdOrders) {
-      // Check if business has Stripe Connect
-      const stripeAccount = await pool.query(
+      // Check if business has Stripe Connect account (even if charges_enabled = false)
+      // Businesses can sell immediately, funds held in escrow until onboarding complete
+      let stripeAccount = await pool.query(
         `SELECT sca.stripe_account_id, sca.charges_enabled
          FROM stripe_connect_accounts sca
-         WHERE sca.business_id = $1 AND sca.charges_enabled = true`,
+         WHERE sca.business_id = $1`,
         [order.business_id]
       );
+
+      // If business doesn't have Stripe account, create one on-the-fly (Option A: Stripe-aligned)
+      // This allows businesses to accept payments immediately, even if they signed up before auto-creation
+      if (stripeAccount.rows.length === 0) {
+        try {
+          console.log(`[Order] Business ${order.business_id} has no Stripe account, creating one on-the-fly`);
+          
+          // Get business owner email for Stripe account creation
+          const businessOwnerResult = await pool.query(
+            `SELECT u.email, b.business_name
+             FROM businesses b
+             JOIN users u ON b.user_id = u.id
+             WHERE b.id = $1`,
+            [order.business_id]
+          );
+
+          if (businessOwnerResult.rows.length > 0) {
+            const owner = businessOwnerResult.rows[0];
+            const country = 'GB'; // Localito is UK-focused for MVP
+            
+            // Create Express account
+            await stripeService.createExpressAccount(
+              order.business_id,
+              owner.email,
+              country
+            );
+
+            // Re-fetch the account we just created
+            stripeAccount = await pool.query(
+              `SELECT sca.stripe_account_id, sca.charges_enabled
+               FROM stripe_connect_accounts sca
+               WHERE sca.business_id = $1`,
+              [order.business_id]
+            );
+
+            console.log(`[Order] ✓ Stripe account created for business ${order.business_id}`);
+          } else {
+            console.error(`[Order] Could not find business owner for business ${order.business_id}`);
+          }
+        } catch (error: any) {
+          console.error(`[Order] Failed to create Stripe account for business ${order.business_id}:`, error);
+          // Continue - will show error below
+        }
+      }
 
       if (stripeAccount.rows.length > 0) {
         try {
@@ -2842,7 +2938,7 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
 
             // Update order with payment intent ID
             await pool.query(
-              'UPDATE orders SET stripe_session_id = $1 WHERE id = $2',
+              'UPDATE orders SET stripe_payment_intent_id = $1 WHERE id = $2',
               [paymentIntent.id, order.id]
             );
 
@@ -3052,6 +3148,302 @@ router.get("/orders/:id", isAuthenticated, async (req, res, next) => {
   }
 });
 
+// Quick status check endpoint for polling (customer only)
+router.get("/orders/:id/status", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "customer") {
+      return res.status(403).json({ success: false, message: "Only customers can check order status" });
+    }
+
+    const orderId = req.params.id;
+    
+    const result = await pool.query(
+      `SELECT id, status, stripe_payment_intent_id, stripe_session_id, updated_at
+       FROM orders WHERE id = $1 AND user_id = $2`,
+      [orderId, user.id]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+    
+    const order = result.rows[0];
+    res.json({
+      success: true,
+      data: {
+        status: order.status,
+        hasPaymentIntent: !!order.stripe_payment_intent_id,
+        hasSession: !!order.stripe_session_id,
+        updatedAt: order.updated_at,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Cancel incomplete orders (customer only) - for back button cleanup
+router.post("/orders/cancel-incomplete", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "customer") {
+      return res.status(403).json({ success: false, message: "Only customers can cancel incomplete orders" });
+    }
+
+    // Find all incomplete orders for this user
+    const incompleteOrders = await pool.query(
+      `SELECT o.*, oi.service_id
+       FROM orders o
+       LEFT JOIN order_service_items osi ON o.id = osi.order_id
+       LEFT JOIN order_items oi ON o.id = oi.order_id
+       WHERE o.user_id = $1 AND o.status = 'awaiting_payment'`,
+      [user.id]
+    );
+
+    if (incompleteOrders.rows.length === 0) {
+      return res.json({ 
+        success: true, 
+        message: "No incomplete orders to cancel",
+        data: { cancelledCount: 0 }
+      });
+    }
+
+    const orderIds = [...new Set(incompleteOrders.rows.map(o => o.id))];
+    let cancelledCount = 0;
+    const releasedBookings: string[] = [];
+
+    // Cancel each order and clean up
+    for (const orderId of orderIds) {
+      const order = incompleteOrders.rows.find(o => o.id === orderId);
+      
+      // Cancel the order
+      await pool.query(
+        `UPDATE orders SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+        [orderId]
+      );
+
+      // Expire Stripe session if exists
+      if (order?.stripe_session_id) {
+        try {
+          await stripeService.expireCheckoutSession(order.stripe_session_id);
+        } catch (error: any) {
+          console.warn(`[Cancel Incomplete] Failed to expire Stripe session ${order.stripe_session_id}:`, error.message);
+        }
+      }
+
+      // Release booking slots for services
+      const serviceBookings = await pool.query(
+        `SELECT osi.booking_date, osi.booking_time, osi.booking_duration_minutes, osi.service_id
+         FROM order_service_items osi
+         WHERE osi.order_id = $1 AND osi.booking_date IS NOT NULL AND osi.booking_time IS NOT NULL`,
+        [orderId]
+      );
+
+      for (const booking of serviceBookings.rows) {
+        try {
+          // Get business_id from service
+          const serviceResult = await pool.query(
+            `SELECT business_id FROM services WHERE id = $1`,
+            [booking.service_id]
+          );
+
+          if (serviceResult.rows.length > 0) {
+            const businessId = serviceResult.rows[0].business_id;
+            // Release the booking slot
+            await pool.query(
+              `DELETE FROM business_availability_blocks 
+               WHERE business_id = $1 
+               AND blocked_date = $2 
+               AND blocked_time = $3 
+               AND reason = 'booking'`,
+              [businessId, booking.booking_date, booking.booking_time]
+            );
+            releasedBookings.push(`${booking.booking_date} ${booking.booking_time}`);
+          }
+        } catch (error: any) {
+          console.warn(`[Cancel Incomplete] Failed to release booking for order ${orderId}:`, error.message);
+        }
+      }
+
+      cancelledCount++;
+    }
+
+    res.json({
+      success: true,
+      message: `Cancelled ${cancelledCount} incomplete order${cancelledCount > 1 ? 's' : ''}`,
+      data: {
+        cancelledCount,
+        orderIds,
+        releasedBookings: releasedBookings.length > 0 ? releasedBookings : undefined,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Cancel a single awaiting_payment order (customer only)
+router.post("/orders/:id/cancel", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "customer") {
+      return res.status(403).json({ success: false, message: "Only customers can cancel orders" });
+    }
+
+    const orderId = req.params.id;
+
+    // Load the order for this customer
+    const orderResult = await pool.query(
+      `SELECT * FROM orders WHERE id = $1 AND user_id = $2`,
+      [orderId, user.id]
+    );
+
+    if (orderResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+
+    const order = orderResult.rows[0];
+
+    // SECURITY: Prevent cancelling orders that have been paid (double-check)
+    if (order.stripe_payment_intent_id) {
+      return res.status(400).json({
+        success: false,
+        message: "This order has already been paid and cannot be cancelled online. Please contact the business for assistance.",
+      });
+    }
+
+    // For MVP we only allow cancelling unpaid / awaiting_payment orders via self-service
+    if (order.status !== "awaiting_payment") {
+      return res.status(400).json({
+        success: false,
+        message: "Only orders waiting for payment can be cancelled online. Please contact the business for help with other orders.",
+      });
+    }
+
+    // Mark order as cancelled
+    await pool.query(
+      `UPDATE orders SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [orderId]
+    );
+
+    // Expire Stripe session if exists (defensive – for abandoned checkouts)
+    if (order.stripe_session_id) {
+      try {
+        await stripeService.expireCheckoutSession(order.stripe_session_id);
+      } catch (error: any) {
+        console.warn(
+          `[Cancel Order] Failed to expire Stripe session ${order.stripe_session_id}:`,
+          error.message
+        );
+      }
+    }
+
+    // Release any booking slots for service items on this order
+    try {
+      const serviceBookings = await pool.query(
+        `SELECT osi.booking_date, osi.booking_time, osi.booking_duration_minutes, osi.service_id
+         FROM order_service_items osi
+         WHERE osi.order_id = $1 AND osi.booking_date IS NOT NULL AND osi.booking_time IS NOT NULL`,
+        [orderId]
+      );
+
+      for (const booking of serviceBookings.rows) {
+        try {
+          const serviceResult = await pool.query(
+            `SELECT business_id FROM services WHERE id = $1`,
+            [booking.service_id]
+          );
+
+          if (serviceResult.rows.length > 0) {
+            const businessId = serviceResult.rows[0].business_id;
+            await pool.query(
+              `DELETE FROM business_availability_blocks 
+               WHERE business_id = $1 
+               AND blocked_date = $2 
+               AND blocked_time = $3 
+               AND reason = 'booking'`,
+              [businessId, booking.booking_date, booking.booking_time]
+            );
+          }
+        } catch (error: any) {
+          console.warn(
+            `[Cancel Order] Failed to release booking for order ${orderId}:`,
+            error.message
+          );
+        }
+      }
+    } catch (error: any) {
+      console.warn(
+        `[Cancel Order] Failed to load service bookings for order ${orderId}:`,
+        error.message
+      );
+    }
+
+    return res.json({
+      success: true,
+      message: "Order cancelled",
+      data: { orderId },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Automatically verify payment status from Stripe (customer only) - called automatically by frontend
+router.post("/orders/:id/verify-payment", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "customer") {
+      return res.status(403).json({ success: false, message: "Only customers can verify payment status" });
+    }
+
+    const orderId = req.params.id;
+
+    // Verify order belongs to user
+    const orderResult = await pool.query(
+      `SELECT id, status, stripe_payment_intent_id, stripe_session_id
+       FROM orders WHERE id = $1 AND user_id = $2`,
+      [orderId, user.id]
+    );
+
+    if (orderResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+
+    const order = orderResult.rows[0];
+
+    // Only allow sync for awaiting_payment orders
+    if (order.status !== 'awaiting_payment') {
+      return res.status(400).json({
+        success: false,
+        message: `Order is not awaiting payment (current status: ${order.status})`,
+      });
+    }
+
+    // Sync payment status from Stripe
+    const syncResult = await stripeService.syncPaymentStatusFromStripe(orderId);
+
+    if (!syncResult.success) {
+      return res.status(400).json({
+        success: false,
+        message: syncResult.message,
+      });
+    }
+
+    res.json({
+      success: true,
+      message: syncResult.message,
+      data: {
+        paymentStatus: syncResult.paymentStatus,
+        orderUpdated: syncResult.orderUpdated,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Retry payment for abandoned orders (customer only)
 router.post("/orders/:id/retry-payment", isAuthenticated, async (req, res, next) => {
   try {
@@ -3089,18 +3481,18 @@ router.post("/orders/:id/retry-payment", isAuthenticated, async (req, res, next)
       });
     }
 
-    // Check if business has Stripe Connect
+    // Check if business has Stripe Connect (even if charges_enabled = false, they can still accept payments via Direct Charges)
     const stripeAccount = await pool.query(
       `SELECT sca.stripe_account_id, sca.charges_enabled
        FROM stripe_connect_accounts sca
-       WHERE sca.business_id = $1 AND sca.charges_enabled = true`,
+       WHERE sca.business_id = $1`,
       [order.business_id]
     );
 
     if (stripeAccount.rows.length === 0) {
       return res.status(400).json({ 
         success: false, 
-        message: "Payment processing is not available for this business" 
+        message: "Payment processing is not available for this business. Please contact support." 
       });
     }
 
@@ -3234,6 +3626,173 @@ router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
        WHERE oi.order_id = $1`,
       [order.id]
     );
+
+    // Get service items
+    const serviceItemsResult = await pool.query(
+      `SELECT osi.*, s.name as service_name
+       FROM order_service_items osi
+       JOIN services s ON osi.service_id = s.id
+       WHERE osi.order_id = $1`,
+      [order.id]
+    );
+
+    // Send emails based on status change
+    if (status === "ready_for_pickup") {
+      try {
+        // Get customer and business details
+        const customerResult = await pool.query(
+          `SELECT u.email as customer_email, u.username as customer_name
+           FROM users u
+           JOIN orders o ON u.id = o.user_id
+           WHERE o.id = $1`,
+          [order.id]
+        );
+
+        const businessResult = await pool.query(
+          `SELECT b.business_name, b.opening_hours
+           FROM businesses b
+           JOIN orders o ON b.id = o.business_id
+           WHERE o.id = $1`,
+          [order.id]
+        );
+
+        if (customerResult.rows.length > 0 && businessResult.rows.length > 0) {
+          const customer = customerResult.rows[0];
+          const business = businessResult.rows[0];
+
+          // Combine all items
+          const allItems = [
+            ...itemsResult.rows.map((item: any) => ({
+              name: item.product_name,
+              quantity: item.quantity,
+              price: parseFloat(item.price),
+            })),
+            ...serviceItemsResult.rows.map((item: any) => ({
+              name: item.service_name,
+              quantity: item.quantity,
+              price: parseFloat(item.price),
+            })),
+          ];
+
+          // Calculate totals
+          const totalAmount = parseFloat(order.total);
+          const cashbackAmount = parseFloat(order.points_earned || "0");
+
+          // Get business address
+          const businessAddressResult = await pool.query(
+            `SELECT business_address, postcode, city
+             FROM businesses
+             WHERE id = (SELECT business_id FROM orders WHERE id = $1)`,
+            [order.id]
+          );
+          const businessAddress = businessAddressResult.rows[0]
+            ? [
+                businessAddressResult.rows[0].business_address,
+                businessAddressResult.rows[0].postcode,
+                businessAddressResult.rows[0].city,
+              ]
+                .filter(Boolean)
+                .join(", ")
+            : "";
+
+          // Build Google Maps link
+          const googleMapsLink = businessAddress
+            ? `https://maps.google.com/?q=${encodeURIComponent(businessAddress)}`
+            : undefined;
+
+          // Get QR code if available
+          const qrCodeUrl = order.qr_code || undefined;
+
+          await emailService.sendOrderReadyForPickupEmail(
+            customer.customer_email,
+            {
+              customerName: customer.customer_name,
+              orderId: order.id,
+              items: allItems,
+              totalAmount: totalAmount,
+              cashbackAmount: cashbackAmount,
+              businessName: business.business_name,
+              businessAddress: businessAddress,
+              openingHours: business.opening_hours || "Check business profile for hours",
+              googleMapsLink: googleMapsLink,
+              qrCodeUrl: qrCodeUrl,
+            }
+          );
+          console.log(`[Order Status] Order ready for pickup email sent for order ${order.id}`);
+        }
+      } catch (emailError: any) {
+        console.error(`[Order Status] Failed to send ready for pickup email for order ${order.id}:`, emailError);
+        // Don't fail the status update if email fails
+      }
+    }
+
+    if (status === "picked_up") {
+      try {
+        // Get customer details and points balance
+        const customerResult = await pool.query(
+          `SELECT u.email as customer_email, u.username as customer_name, u.id as user_id
+           FROM users u
+           JOIN orders o ON u.id = o.user_id
+           WHERE o.id = $1`,
+          [order.id]
+        );
+
+        if (customerResult.rows.length > 0) {
+          const customer = customerResult.rows[0];
+
+          // Get current points balance
+          const pointsResult = await pool.query(
+            `SELECT balance FROM user_points WHERE user_id = $1`,
+            [customer.user_id]
+          );
+          const currentBalance = pointsResult.rows[0]?.balance || 0;
+
+          // Combine all items
+          const allItems = [
+            ...itemsResult.rows.map((item: any) => ({
+              name: item.product_name,
+              quantity: item.quantity,
+              price: parseFloat(item.price),
+            })),
+            ...serviceItemsResult.rows.map((item: any) => ({
+              name: item.service_name,
+              quantity: item.quantity,
+              price: parseFloat(item.price),
+            })),
+          ];
+
+          // Get business name
+          const businessResult = await pool.query(
+            `SELECT b.business_name
+             FROM businesses b
+             JOIN orders o ON b.id = o.business_id
+             WHERE o.id = $1`,
+            [order.id]
+          );
+          const businessName = businessResult.rows[0]?.business_name || "Business";
+
+          const totalAmount = parseFloat(order.total);
+          const cashbackAmount = parseFloat(order.points_earned || "0");
+
+          await emailService.sendOrderCollectionConfirmedEmail(
+            customer.customer_email,
+            {
+              customerName: customer.customer_name,
+              orderId: order.id,
+              items: allItems,
+              totalAmount: totalAmount,
+              cashbackAmount: cashbackAmount,
+              newCashbackBalance: parseFloat(currentBalance.toString()),
+              businessName: businessName,
+            }
+          );
+          console.log(`[Order Status] Collection confirmation email sent for order ${order.id}`);
+        }
+      } catch (emailError: any) {
+        console.error(`[Order Status] Failed to send collection confirmation email for order ${order.id}:`, emailError);
+        // Don't fail the status update if email fails
+      }
+    }
 
     res.json({
       success: true,
@@ -3463,6 +4022,69 @@ router.post("/orders/verify-qr", isAuthenticated, async (req, res, next) => {
        WHERE oi.order_id = $1`,
       [orderId]
     );
+
+    // Get service items
+    const serviceItemsResult = await pool.query(
+      `SELECT osi.*, s.name as service_name
+       FROM order_service_items osi
+       JOIN services s ON osi.service_id = s.id
+       WHERE osi.order_id = $1`,
+      [orderId]
+    );
+
+    // Send collection confirmation email
+    try {
+      // Get customer points balance
+      const pointsResult = await pool.query(
+        `SELECT balance FROM user_points WHERE user_id = $1`,
+        [order.user_id]
+      );
+      const currentBalance = pointsResult.rows[0]?.balance || 0;
+
+      // Combine all items
+      const allItems = [
+        ...itemsResult.rows.map((item: any) => ({
+          name: item.product_name,
+          quantity: item.quantity,
+          price: parseFloat(item.price),
+        })),
+        ...serviceItemsResult.rows.map((item: any) => ({
+          name: item.service_name,
+          quantity: item.quantity,
+          price: parseFloat(item.price),
+        })),
+      ];
+
+      // Get business name
+      const businessResult = await pool.query(
+        `SELECT b.business_name
+         FROM businesses b
+         JOIN orders o ON b.id = o.business_id
+         WHERE o.id = $1`,
+        [orderId]
+      );
+      const businessName = businessResult.rows[0]?.business_name || "Business";
+
+      const totalAmount = parseFloat(updateResult.rows[0].total);
+      const cashbackAmount = parseFloat(updateResult.rows[0].points_earned || "0");
+
+      await emailService.sendOrderCollectionConfirmedEmail(
+        order.customer_email,
+        {
+          customerName: order.customer_name,
+          orderId: orderId,
+          items: allItems,
+          totalAmount: totalAmount,
+          cashbackAmount: cashbackAmount,
+          newCashbackBalance: parseFloat(currentBalance.toString()),
+          businessName: businessName,
+        }
+      );
+      console.log(`[QR Scan] Collection confirmation email sent for order ${orderId}`);
+    } catch (emailError: any) {
+      console.error(`[QR Scan] Failed to send collection confirmation email for order ${orderId}:`, emailError);
+      // Don't fail the QR scan if email fails
+    }
 
     res.json({
       success: true,
@@ -4497,7 +5119,7 @@ router.get("/admin/orders", isAuthenticated, async (req, res, next) => {
 
     const result = await pool.query(query, params);
 
-    // Get order items for each order
+    // Get order items for each order (products + services)
     const ordersWithItems = await Promise.all(
       result.rows.map(async (order) => {
         const itemsResult = await pool.query(
@@ -4507,9 +5129,17 @@ router.get("/admin/orders", isAuthenticated, async (req, res, next) => {
            WHERE oi.order_id = $1`,
           [order.id]
         );
+        const serviceItemsResult = await pool.query(
+          `SELECT osi.*, s.name as service_name, s.images
+           FROM order_service_items osi
+           JOIN services s ON osi.service_id = s.id
+           WHERE osi.order_id = $1`,
+          [order.id]
+        );
         return {
           ...order,
           items: itemsResult.rows,
+          serviceItems: serviceItemsResult.rows,
         };
       })
     );
@@ -6123,51 +6753,77 @@ router.post("/business/payouts/request", isAuthenticated, async (req, res, next)
 
     const amountBase = toBaseCurrency(amount, payoutCurrency);
 
-    // Calculate available balance in base currency (GBP):
-    // - use business_amount when present (excludes platform commission), fall back to total
-    // - only count orders that are beyond "pending" and not cancelled
-    // - subtract both completed and in-flight payouts to avoid double requesting
-    const revenueResult = await pool.query(
-      `SELECT COALESCE(SUM(COALESCE(business_amount, total)), 0) AS total_revenue
+    // Calculate available balance and create payout in a single atomic query
+    // This prevents race conditions where multiple payouts could be requested simultaneously
+    // Use a CTE to calculate available balance, then conditionally insert the payout
+    const result = await pool.query(
+      `WITH balance_calc AS (
+        SELECT 
+          COALESCE(SUM(COALESCE(business_amount, total)), 0) AS total_revenue
        FROM orders 
        WHERE business_id = $1 
-         AND status NOT IN ('cancelled', 'pending')`,
-      [businessId]
-    );
-
-    const completedPayoutsResult = await pool.query(
-      `SELECT COALESCE(SUM(COALESCE(amount_base, amount)), 0) AS total_payouts
+          AND status NOT IN ('cancelled', 'pending', 'awaiting_payment')
+      ),
+      payouts_calc AS (
+        SELECT 
+          COALESCE(SUM(COALESCE(amount_base, amount)), 0) AS total_payouts
        FROM payouts 
-       WHERE business_id = $1 AND status = 'completed'`,
-      [businessId]
-    );
-
-    const pendingPayoutsResult = await pool.query(
-      `SELECT COALESCE(SUM(COALESCE(amount_base, amount)), 0) AS pending_payouts
-       FROM payouts 
-       WHERE business_id = $1 AND status IN ('pending', 'processing')`,
-      [businessId]
-    );
-
-    const totalRevenue = parseFloat(revenueResult.rows[0].total_revenue);
-    const totalPayouts = parseFloat(completedPayoutsResult.rows[0].total_payouts);
-    const pendingPayouts = parseFloat(pendingPayoutsResult.rows[0].pending_payouts);
-    const availableBalance = totalRevenue - totalPayouts - pendingPayouts;
-
-    if (amountBase > availableBalance) {
-      return res.status(400).json({
-        success: false,
-        message: `Insufficient balance. Available: £${availableBalance.toFixed(2)} (base currency)`,
-      });
-    }
-
-    // Record payout
-    const result = await pool.query(
-      `INSERT INTO payouts (business_id, amount, currency, amount_base, payout_method, notes)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING *`,
+        WHERE business_id = $1 AND status = 'completed'
+      ),
+      pending_calc AS (
+        SELECT 
+          COALESCE(SUM(COALESCE(amount_base, amount)), 0) AS pending_payouts
+        FROM payouts 
+        WHERE business_id = $1 AND status IN ('pending', 'processing')
+      ),
+      available_balance AS (
+        SELECT 
+          (SELECT total_revenue FROM balance_calc) - 
+          (SELECT total_payouts FROM payouts_calc) - 
+          (SELECT pending_payouts FROM pending_calc) AS balance
+      )
+      INSERT INTO payouts (business_id, amount, currency, amount_base, payout_method, notes)
+      SELECT $1, $2, $3, $4, $5, $6
+      FROM available_balance
+      WHERE balance >= $4
+      RETURNING *, (SELECT balance FROM available_balance) AS available_balance`,
       [businessId, amount, payoutCurrency, amountBase, payoutMethod, notes || null]
     );
+
+    // Check if insert succeeded (balance was sufficient)
+    if (result.rowCount === 0) {
+      // Get the actual available balance for error message
+      const balanceCheck = await pool.query(
+        `WITH balance_calc AS (
+          SELECT COALESCE(SUM(COALESCE(business_amount, total)), 0) AS total_revenue
+          FROM orders 
+          WHERE business_id = $1 AND status NOT IN ('cancelled', 'pending', 'awaiting_payment')
+        ),
+        payouts_calc AS (
+          SELECT COALESCE(SUM(COALESCE(amount_base, amount)), 0) AS total_payouts
+       FROM payouts 
+          WHERE business_id = $1 AND status = 'completed'
+        ),
+        pending_calc AS (
+          SELECT COALESCE(SUM(COALESCE(amount_base, amount)), 0) AS pending_payouts
+          FROM payouts 
+          WHERE business_id = $1 AND status IN ('pending', 'processing')
+        )
+        SELECT 
+          (SELECT total_revenue FROM balance_calc) - 
+          (SELECT total_payouts FROM payouts_calc) - 
+          (SELECT pending_payouts FROM pending_calc) AS available_balance`,
+      [businessId]
+    );
+
+      const availableBalance = balanceCheck.rows[0]?.available_balance != null 
+        ? parseFloat(balanceCheck.rows[0].available_balance) 
+        : 0;
+      return res.status(400).json({
+        success: false,
+        message: `Insufficient balance. Available: £${availableBalance.toFixed(2)}, Requested: £${amountBase.toFixed(2)}`,
+      });
+    }
 
     const payoutRow = result.rows[0];
 

@@ -58,25 +58,33 @@ export class RewardsService {
    */
   async redeemPoints(userId: string, orderId: string, pointsToRedeem: number) {
     try {
-      // Check user balance
-      const pointsResult = await pool.query(
-        'SELECT balance FROM user_points WHERE user_id = $1',
-        [userId]
-      );
-
-      if (pointsResult.rows.length === 0 || pointsResult.rows[0].balance < pointsToRedeem) {
-        throw new Error('Insufficient points balance');
-      }
-
-      // Deduct points
-      await pool.query(
+      // Atomic points deduction with balance check
+      // Only deduct if sufficient balance exists
+      const deductResult = await pool.query(
         `UPDATE user_points 
          SET balance = balance - $1,
              total_redeemed = total_redeemed + $1,
              updated_at = CURRENT_TIMESTAMP
-         WHERE user_id = $2`,
+         WHERE user_id = $2 AND balance >= $1
+         RETURNING balance`,
         [pointsToRedeem, userId]
       );
+
+      if (deductResult.rowCount === 0) {
+        // Either user not found or insufficient balance
+        const checkResult = await pool.query(
+          'SELECT balance FROM user_points WHERE user_id = $1',
+          [userId]
+        );
+        
+        if (checkResult.rows.length === 0) {
+          throw new Error('User points record not found');
+        } else {
+          throw new Error(`Insufficient points balance. Available: ${checkResult.rows[0].balance}, Requested: ${pointsToRedeem}`);
+        }
+      }
+
+      console.log(`[Rewards] Deducted ${pointsToRedeem} points for user ${userId}. New balance: ${deductResult.rows[0].balance}`);
 
       // Record transaction
       await pool.query(

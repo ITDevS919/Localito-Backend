@@ -3,6 +3,7 @@ import { type User, type InsertUser, type Business } from "../../shared/schema";
 import { pool } from "../db/connection";
 import bcrypt from "bcrypt";
 import { geocodingService } from "./geocodingService";
+import { stripeService } from "./stripeService";
 
 export class DbStorage {
   async getUser(id: string): Promise<User | undefined> {
@@ -142,9 +143,10 @@ export class DbStorage {
         // Continue without coordinates - not critical for signup
       }
 
-      await pool.query(
+      const businessResult = await pool.query(
         `INSERT INTO businesses (user_id, business_name, business_address, postcode, city, phone, latitude, longitude, is_approved, business_type) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         RETURNING id`,
         [
           row.id,
           businessData.businessName,
@@ -158,6 +160,25 @@ export class DbStorage {
           businessData.businessType || null
         ]
       );
+
+      const businessId = businessResult.rows[0].id;
+
+      // Auto-create Stripe Express account for new business
+      // This allows businesses to sell immediately, even before completing onboarding
+      try {
+        console.log(`[Business Signup] Auto-creating Stripe Express account for business ${businessId}`);
+        const country = 'GB'; // Localito is UK-focused for MVP
+        await stripeService.createExpressAccount(
+          businessId,
+          insertUser.email,
+          country
+        );
+        console.log(`[Business Signup] ✓ Stripe Express account created for business ${businessId}`);
+      } catch (error: any) {
+        // Log error but don't fail signup - business can create account later
+        console.error(`[Business Signup] Failed to auto-create Stripe account for business ${businessId}:`, error);
+        console.error(`[Business Signup] Business can still sign up and create Stripe account later via /business/payouts`);
+      }
     }
 
     return {
