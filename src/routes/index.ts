@@ -501,25 +501,38 @@ router.post("/auth/google/mobile", async (req, res, next) => {
     // Verify Google ID token
     const { OAuth2Client } = require('google-auth-library');
     
-    // Use WEB Client ID for verification (works for all platforms with Expo AuthSession)
-    // The frontend uses webClientId, androidClientId, and iosClientId, but all generate
-    // ID tokens that can be verified with the Web Client ID
-    const clientId = process.env.GOOGLE_CLIENT_ID_MOBILE;
-    
-    if (!clientId) {
+    /**
+     * IMPORTANT:
+     * On mobile we can get ID tokens issued for any of these client IDs:
+     * - GOOGLE_CLIENT_ID_MOBILE (Web client used by Expo AuthSession)
+     * - GOOGLE_CLIENT_ID_ANDROID (Android native client)
+     * - GOOGLE_CLIENT_ID_IOS (iOS native client)
+     *
+     * The "aud" claim in the ID token will match the client that issued it,
+     * so we must allow verification against ALL of them.
+     */
+    const possibleAudiences = [
+      process.env.GOOGLE_CLIENT_ID_MOBILE,
+      process.env.GOOGLE_CLIENT_ID_ANDROID,
+      process.env.GOOGLE_CLIENT_ID_IOS,
+      process.env.GOOGLE_CLIENT_ID,
+    ].filter(Boolean);
+
+    if (!possibleAudiences.length) {
       return res.status(500).json({ 
         success: false, 
-        message: "Google Client ID not configured. Please set GOOGLE_CLIENT_ID_MOBILE or GOOGLE_CLIENT_ID." 
+        message: "Google Client ID not configured. Please set GOOGLE_CLIENT_ID_MOBILE / GOOGLE_CLIENT_ID_ANDROID / GOOGLE_CLIENT_ID_IOS." 
       });
     }
 
     // Verify ID token using google-auth-library
     let ticket;
     try {
-      const client = new OAuth2Client(clientId);
+      const client = new OAuth2Client(possibleAudiences[0]);
       ticket = await client.verifyIdToken({
         idToken,
-        audience: clientId,
+        // Accept any of the configured client IDs as a valid audience
+        audience: possibleAudiences,
       });
     } catch (error: any) {
       console.error('[Google Auth] Token verification error:', error);
