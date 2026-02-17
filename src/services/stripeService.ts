@@ -1771,11 +1771,12 @@ export class StripeService {
     } catch (error: any) {
       // Rollback on any error
       await client.query('ROLLBACK');
+      const orderStatus = (await pool.query('SELECT status FROM orders WHERE id = $1', [orderId])).rows[0]?.status || 'unknown';
       console.error(`[Stripe] Transaction rolled back for order ${orderId}:`, {
         error: error.message,
         stack: error.stack,
         paymentIntentId: paymentIntent.id,
-        orderStatus: orderInTx?.status || 'unknown',
+        orderStatus: orderStatus,
         timestamp: new Date().toISOString(),
       });
       throw error;

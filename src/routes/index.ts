@@ -515,7 +515,6 @@ router.post("/auth/google/mobile", async (req, res, next) => {
       process.env.GOOGLE_CLIENT_ID_MOBILE,
       process.env.GOOGLE_CLIENT_ID_ANDROID,
       process.env.GOOGLE_CLIENT_ID_IOS,
-      process.env.GOOGLE_CLIENT_ID,
     ].filter(Boolean);
 
     if (!possibleAudiences.length) {
@@ -5158,6 +5157,68 @@ router.get("/admin/orders", isAuthenticated, async (req, res, next) => {
     );
 
     res.json({ success: true, data: ordersWithItems });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Admin: Fix stuck orders (awaiting_payment) by syncing with Stripe and triggering emails
+router.post("/admin/orders/fix-stuck", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ success: false, message: "Only admins can access this" });
+    }
+
+    // Find orders that are still awaiting payment
+    const stuckOrdersResult = await pool.query(
+      `SELECT id
+       FROM orders
+       WHERE status = 'awaiting_payment'
+       ORDER BY created_at DESC`
+    );
+
+    if (stuckOrdersResult.rows.length === 0) {
+      return res.json({
+        success: true,
+        message: "No stuck orders found (status = 'awaiting_payment')",
+        data: { processed: 0, results: [] },
+      });
+    }
+
+    const results: any[] = [];
+
+    for (const row of stuckOrdersResult.rows) {
+      const orderId = row.id as string;
+      try {
+        const syncResult = await stripeService.syncPaymentStatusFromStripe(orderId);
+        results.push({
+          orderId,
+          success: syncResult.success,
+          paymentStatus: syncResult.paymentStatus,
+          orderUpdated: syncResult.orderUpdated,
+          message: syncResult.message,
+        });
+      } catch (error: any) {
+        console.error(`[Admin] Failed to fix stuck order ${orderId}:`, error);
+        results.push({
+          orderId,
+          success: false,
+          paymentStatus: "not_found",
+          orderUpdated: false,
+          message: error?.message || "Unknown error while syncing payment status",
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      message: "Stuck orders processed",
+      data: {
+        processed: results.length,
+        results,
+      },
+    });
   } catch (error) {
     next(error);
   }
