@@ -213,9 +213,9 @@ router.post("/auth/login", (req, res, next) => {
         success: false,
         message:
           requestedRole === "customer"
-            ? "This login form is for customers only. Please use the business login for business accounts."
+            ? "Access denied. This login form is for customers only."
             : requestedRole === "business"
-            ? "This login form is for businesses only. Please use the customer login for shopper accounts."
+            ? "Access denied. This login form is for businesses only."
             : "Access denied for this login form.",
       });
     }
