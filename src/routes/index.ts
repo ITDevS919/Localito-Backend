@@ -188,7 +188,7 @@ router.post("/auth/signup", async (req, res, next) => {
   }
 });
 
-// Login
+// Login (customer / business)
 router.post("/auth/login", (req, res, next) => {
   // Validate input
   const validationResult = loginSchema.safeParse(req.body);
@@ -200,9 +200,24 @@ router.post("/auth/login", (req, res, next) => {
     });
   }
 
+  const { role: requestedRole } = validationResult.data;
+
   passport.authenticate("local", (err: any, user: User, info: any) => {
     if (err) {
       return next(err);
+    }
+
+    // If a specific role was requested (e.g. customer vs business), enforce it
+    if (requestedRole && user.role !== requestedRole) {
+      return res.status(403).json({
+        success: false,
+        message:
+          requestedRole === "customer"
+            ? "This login form is for customers only. Please use the business login for business accounts."
+            : requestedRole === "business"
+            ? "This login form is for businesses only. Please use the customer login for shopper accounts."
+            : "Access denied for this login form.",
+      });
     }
     if (!user) {
       return res.status(401).json({

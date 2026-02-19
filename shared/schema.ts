@@ -58,6 +58,8 @@ export const insertUserSchema = z.object({
 export const loginSchema = z.object({
   username: z.string().min(1, "Username is required"),
   password: z.string().min(1, "Password is required"),
+  // Optional role hint so we can enforce that the correct login form is used
+  role: z.enum(["customer", "business", "admin"]).optional(),
 });
 
 // Business schema
