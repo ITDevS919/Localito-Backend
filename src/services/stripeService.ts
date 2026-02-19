@@ -1396,7 +1396,27 @@ export class StripeService {
         };
       }
 
-      // If payment is pending
+      // If payment is processing (async payment methods - will eventually succeed or fail)
+      if (paymentIntent.status === 'processing') {
+        return {
+          success: true,
+          paymentStatus: 'pending',
+          orderUpdated: false,
+          message: 'Payment is being processed. This may take a few moments.',
+        };
+      }
+
+      // If payment requires action (e.g., 3D Secure authentication)
+      if (paymentIntent.status === 'requires_action') {
+        return {
+          success: true,
+          paymentStatus: 'pending',
+          orderUpdated: false,
+          message: 'Payment requires authentication. Please complete the verification.',
+        };
+      }
+
+      // If payment is pending (needs payment method or confirmation)
       if (paymentIntent.status === 'requires_payment_method' || paymentIntent.status === 'requires_confirmation') {
         return {
           success: true,
@@ -1407,20 +1427,44 @@ export class StripeService {
       }
 
       // If payment failed
-      if (paymentIntent.status === 'canceled' || paymentIntent.status === 'requires_capture') {
+      if (paymentIntent.status === 'canceled') {
         return {
           success: true,
           paymentStatus: 'failed',
           orderUpdated: false,
-          message: `Payment status: ${paymentIntent.status}`,
+          message: `Payment was canceled`,
         };
       }
 
+      // If payment requires capture (authorized but not captured yet)
+      // This is actually a success state - payment is authorized and ready to capture
+      if (paymentIntent.status === 'requires_capture') {
+        // Treat as succeeded since the payment is authorized
+        if (order.status === 'awaiting_payment') {
+          console.log(`[Stripe Sync] Payment requires capture but order still awaiting_payment. Processing manually...`);
+          await this.handlePaymentSucceeded(paymentIntent);
+          return {
+            success: true,
+            paymentStatus: 'succeeded',
+            orderUpdated: true,
+            message: 'Payment authorized and order status updated',
+          };
+        }
+        return {
+          success: true,
+          paymentStatus: 'succeeded',
+          orderUpdated: false,
+          message: `Payment authorized. Order status is already: ${order.status}`,
+        };
+      }
+
+      // Unknown status - log it and return as pending to allow retry
+      console.warn(`[Stripe Sync] Unknown payment intent status: ${paymentIntent.status} for order ${orderId}`);
       return {
         success: true,
-        paymentStatus: paymentIntent.status as any,
+        paymentStatus: 'pending',
         orderUpdated: false,
-        message: `Payment status: ${paymentIntent.status}`,
+        message: `Payment status: ${paymentIntent.status}. Please wait or contact support.`,
       };
     } catch (error: any) {
       console.error(`[Stripe Sync] Failed to sync payment status for order ${orderId}:`, error);
@@ -1549,11 +1593,18 @@ export class StripeService {
 
       const orderInTx = orderCheckResult.rows[0];
       
-      // Check if this payment intent was already processed (idempotency check inside transaction)
-      if (orderInTx.stripe_payment_intent_id === paymentIntent.id) {
+      // Check if this payment intent was already processed AND order status is not awaiting_payment
+      // This handles the case where payment intent ID was stored but status update failed
+      if (orderInTx.stripe_payment_intent_id === paymentIntent.id && orderInTx.status !== 'awaiting_payment') {
         await client.query('ROLLBACK');
-        console.log(`[Stripe] Payment intent ${paymentIntent.id} already processed for order ${orderId}. Skipping.`);
+        console.log(`[Stripe] Payment intent ${paymentIntent.id} already processed for order ${orderId}. Order status: ${orderInTx.status}`);
         return;
+      }
+      
+      // If payment intent ID matches but status is still awaiting_payment, continue processing
+      // This handles edge cases where payment intent was stored but status update failed
+      if (orderInTx.stripe_payment_intent_id === paymentIntent.id && orderInTx.status === 'awaiting_payment') {
+        console.log(`[Stripe] Payment intent ${paymentIntent.id} found but order still awaiting_payment. Updating status...`);
       }
       
       // Only process orders that are awaiting payment (atomic check inside transaction)

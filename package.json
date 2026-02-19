@@ -11,7 +11,9 @@
     "create-admin": "tsx scripts/create-admin.ts",
     "update-categories": "tsx scripts/update-categories.ts",
     "test:commission-tiers": "tsx scripts/test-commission-tiers.ts",
-    "test:stripe-connect": "tsx scripts/test-stripe-connect.ts"
+    "test:stripe-connect": "tsx scripts/test-stripe-connect.ts",
+    "test:customer-conversion": "tsx scripts/test-customer-conversion-bmad.ts",
+    "test:customer-conversion-verify": "tsx scripts/test-customer-conversion-bmad-verify.ts"
   },
   "dependencies": {
     "@react-email/components": "^1.0.6",

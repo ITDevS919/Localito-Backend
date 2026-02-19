@@ -5167,6 +5167,195 @@ router.post("/admin/setup", async (req, res, next) => {
   }
 });
 
+// Admin: Change user role (customer ↔ business)
+router.put("/admin/users/:id/role", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ success: false, message: "Only admins can access this" });
+    }
+
+    const userId = req.params.id;
+    const { role, businessName } = req.body;
+
+    // Validate role
+    if (!role || !["customer", "business"].includes(role)) {
+      return res.status(400).json({
+        success: false,
+        message: "Role must be 'customer' or 'business'",
+      });
+    }
+
+    // Get current user data
+    const currentUserResult = await pool.query(
+      `SELECT id, username, email, role FROM users WHERE id = $1`,
+      [userId]
+    );
+
+    if (currentUserResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    const currentUser = currentUserResult.rows[0];
+
+    // Cannot change admin role
+    if (currentUser.role === "admin") {
+      return res.status(403).json({
+        success: false,
+        message: "Cannot change admin role",
+      });
+    }
+
+    // If role is same, no change needed
+    if (currentUser.role === role) {
+      return res.json({
+        success: true,
+        message: `User is already a ${role}`,
+        data: { user: currentUser },
+      });
+    }
+
+    // Update user role
+    await pool.query(
+      `UPDATE users SET role = $1 WHERE id = $2`,
+      [role, userId]
+    );
+
+    let businessRecord = null;
+
+    // If converting to business, create business record if it doesn't exist
+    if (role === "business") {
+      const existingBusiness = await pool.query(
+        `SELECT id, business_name, is_approved FROM businesses WHERE user_id = $1`,
+        [userId]
+      );
+
+      if (existingBusiness.rows.length > 0) {
+        businessRecord = existingBusiness.rows[0];
+      } else {
+        // Create new business record
+        const businessNameToUse = businessName || currentUser.username || "Business Name Pending";
+        const newBusinessResult = await pool.query(
+          `INSERT INTO businesses (user_id, business_name, is_approved)
+           VALUES ($1, $2, $3)
+           RETURNING id, business_name, is_approved`,
+          [userId, businessNameToUse, false]
+        );
+        businessRecord = newBusinessResult.rows[0];
+
+        // Optionally create Stripe Express account (if auto-creation is enabled)
+        try {
+          await stripeService.createExpressAccount(
+            businessRecord.id,
+            currentUser.email,
+            'GB'
+          );
+          console.log(`[Admin] Stripe account created for converted business ${businessRecord.id}`);
+        } catch (stripeError: any) {
+          // Log but don't fail - Stripe account can be created later
+          console.warn(`[Admin] Failed to create Stripe account for business ${businessRecord.id}:`, stripeError.message);
+        }
+      }
+    }
+
+    // Get updated user data
+    const updatedUserResult = await pool.query(
+      `SELECT id, username, email, role, created_at FROM users WHERE id = $1`,
+      [userId]
+    );
+
+    res.json({
+      success: true,
+      message: `User role updated to ${role}`,
+      data: {
+        user: updatedUserResult.rows[0],
+        business: businessRecord,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Admin: Delete customer account (reset for re-registration)
+router.delete("/admin/users/:id", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ success: false, message: "Only admins can access this" });
+    }
+
+    const userId = req.params.id;
+
+    // Get user data to verify role
+    const userResult = await pool.query(
+      `SELECT id, username, email, role FROM users WHERE id = $1`,
+      [userId]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    const userToDelete = userResult.rows[0];
+
+    // Only allow deletion of customer accounts
+    if (userToDelete.role !== "customer") {
+      return res.status(403).json({
+        success: false,
+        message: `Cannot delete ${userToDelete.role} accounts. Only customer accounts can be deleted.`,
+      });
+    }
+
+    // Count dependent records for reporting
+    const cartCountResult = await pool.query(
+      `SELECT COUNT(*) as count FROM cart WHERE user_id = $1`,
+      [userId]
+    );
+    const cartCount = parseInt(cartCountResult.rows[0].count);
+
+    const wishlistCountResult = await pool.query(
+      `SELECT COUNT(*) as count FROM wishlist WHERE user_id = $1`,
+      [userId]
+    );
+    const wishlistCount = parseInt(wishlistCountResult.rows[0].count);
+
+    const ordersCountResult = await pool.query(
+      `SELECT COUNT(*) as count FROM orders WHERE user_id = $1`,
+      [userId]
+    );
+    const ordersCount = parseInt(ordersCountResult.rows[0].count);
+
+    // Delete dependent records (cart and wishlist)
+    await pool.query(`DELETE FROM cart WHERE user_id = $1`, [userId]);
+    await pool.query(`DELETE FROM wishlist WHERE user_id = $1`, [userId]);
+
+    // Delete user account (orders and messages are preserved for historical data)
+    await pool.query(`DELETE FROM users WHERE id = $1`, [userId]);
+
+    res.json({
+      success: true,
+      message: "Customer account deleted successfully",
+      data: {
+        deletedUserId: userId,
+        deletedRecords: {
+          cartItems: cartCount,
+          wishlistItems: wishlistCount,
+          orders: ordersCount, // Kept for historical data
+        },
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Get support admin ID for chat
 router.get("/admin/support", async (req, res, next) => {
   try {
