@@ -1443,8 +1443,8 @@ export class StripeService {
         if (order.status === 'awaiting_payment') {
           console.log(`[Stripe Sync] Payment requires capture but order still awaiting_payment. Processing manually...`);
           await this.handlePaymentSucceeded(paymentIntent);
-          return {
-            success: true,
+      return {
+        success: true,
             paymentStatus: 'succeeded',
             orderUpdated: true,
             message: 'Payment authorized and order status updated',
@@ -1453,7 +1453,7 @@ export class StripeService {
         return {
           success: true,
           paymentStatus: 'succeeded',
-          orderUpdated: false,
+        orderUpdated: false,
           message: `Payment authorized. Order status is already: ${order.status}`,
         };
       }
@@ -1552,13 +1552,19 @@ export class StripeService {
       return;
     }
 
-    // Check if this payment intent was already processed (idempotency)
+    // Check if this payment intent was already processed AND status was updated (idempotency)
     const existingOrder = orderResult.rows[0];
-    if (existingOrder.stripe_payment_intent_id === paymentIntent.id) {
-      console.log(`[Stripe] Payment intent ${paymentIntent.id} already processed for order ${orderId}. Skipping.`, {
-        currentStatus: existingOrder.status,
-      });
+    // Only skip if payment intent ID matches AND status is NOT awaiting_payment
+    // This handles cases where payment intent ID was stored but status update failed
+    if (existingOrder.stripe_payment_intent_id === paymentIntent.id && existingOrder.status !== 'awaiting_payment') {
+      console.log(`[Stripe] Payment intent ${paymentIntent.id} already processed for order ${orderId}. Order status: ${existingOrder.status}`);
       return;
+    }
+    
+    // If payment intent ID matches but status is still awaiting_payment, continue processing
+    // This handles edge cases where payment intent was stored but status update failed
+    if (existingOrder.stripe_payment_intent_id === paymentIntent.id && existingOrder.status === 'awaiting_payment') {
+      console.log(`[Stripe] Payment intent ${paymentIntent.id} found but order still awaiting_payment. Will update status in transaction...`);
     }
 
     console.log(`[Stripe] Processing payment for order ${orderId}`, {
