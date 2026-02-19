@@ -1479,20 +1479,69 @@ export class StripeService {
 
   private async handleCheckoutCompleted(session: Stripe.Checkout.Session) {
     const orderId = session.metadata?.order_id;
-    if (!orderId) return;
+    if (!orderId) {
+      console.error(`[Stripe] checkout.session.completed event missing order_id in metadata`, {
+        sessionId: session.id,
+        metadata: session.metadata,
+      });
+      return;
+    }
+
+    console.log(`[Stripe Webhook] Processing checkout.session.completed`, {
+      sessionId: session.id,
+      orderId,
+      paymentStatus: session.payment_status,
+      status: session.status,
+    });
 
     // Extract payment intent from session (if available)
     const paymentIntentId = session.payment_intent as string | null;
 
-    await pool.query(
+    // Use atomic update to only process if order is still awaiting_payment
+    // This prevents race conditions with success redirect or duplicate webhooks
+    const updateResult = await pool.query(
       `UPDATE orders 
        SET status = 'processing', 
            stripe_session_id = $1,
            stripe_payment_intent_id = COALESCE($2, stripe_payment_intent_id),
            updated_at = CURRENT_TIMESTAMP
-       WHERE id = $3`,
+       WHERE id = $3 AND status = 'awaiting_payment'
+       RETURNING id, status`,
       [session.id, paymentIntentId, orderId]
     );
+
+    // Check if update succeeded (order was still awaiting_payment)
+    if (updateResult.rowCount === 0) {
+      // Order was already processed (either by success redirect or another webhook)
+      console.log(`[Stripe] Order ${orderId} already processed (not awaiting_payment). Updating payment metadata only.`);
+      
+      // Still update payment IDs if not set (idempotent)
+      await pool.query(
+        `UPDATE orders 
+         SET stripe_session_id = COALESCE($1, stripe_session_id),
+             stripe_payment_intent_id = COALESCE($2, stripe_payment_intent_id),
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = $3`,
+        [session.id, paymentIntentId, orderId]
+      );
+      
+      // If we have payment intent, still trigger handlePaymentSucceeded for emails/stock
+      // It will handle idempotency internally
+      if (paymentIntentId) {
+        try {
+          const paymentIntent = await this.stripe.paymentIntents.retrieve(paymentIntentId);
+          if (paymentIntent.status === 'succeeded') {
+            // This is idempotent - will only process if still needed
+            await this.handlePaymentSucceeded(paymentIntent);
+          }
+        } catch (error: any) {
+          console.error(`[Stripe] Failed to retrieve payment intent ${paymentIntentId} from session:`, error.message);
+        }
+      }
+      return;
+    }
+
+    console.log(`[Stripe] Order ${orderId} status updated to 'processing' from checkout.session.completed`);
 
     // If we have a payment intent, also trigger handlePaymentSucceeded for consistency
     // This ensures emails are sent and order is fully processed
@@ -1501,6 +1550,7 @@ export class StripeService {
         const paymentIntent = await this.stripe.paymentIntents.retrieve(paymentIntentId);
         if (paymentIntent.status === 'succeeded') {
           // Call handlePaymentSucceeded to ensure full processing (emails, stock, etc.)
+          // It will handle idempotency (won't process if already done)
           await this.handlePaymentSucceeded(paymentIntent);
         }
       } catch (error: any) {
@@ -2078,6 +2128,32 @@ export class StripeService {
       return account;
     } catch (error: any) {
       console.error("[Stripe] Failed to get account status:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * Retrieve a checkout session from Stripe (official Stripe approach for success page verification)
+   */
+  async retrieveCheckoutSession(sessionId: string): Promise<Stripe.Checkout.Session> {
+    try {
+      const session = await this.stripe.checkout.sessions.retrieve(sessionId);
+      return session;
+    } catch (error: any) {
+      console.error(`[Stripe] Failed to retrieve checkout session ${sessionId}:`, error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Retrieve a payment intent from Stripe
+   */
+  async retrievePaymentIntent(paymentIntentId: string): Promise<Stripe.PaymentIntent> {
+    try {
+      const paymentIntent = await this.stripe.paymentIntents.retrieve(paymentIntentId);
+      return paymentIntent;
+    } catch (error: any) {
+      console.error(`[Stripe] Failed to retrieve payment intent ${paymentIntentId}:`, error.message);
       throw error;
     }
   }

@@ -7584,16 +7584,75 @@ router.get("/business/stripe/dashboard-link", isAuthenticated, async (req, res, 
 });
 
 // Stripe checkout success redirect (handles both mobile and web)
+// Official Stripe approach: Verify checkout session status on success page
+// Webhooks are primary, but this provides immediate verification for better UX
 router.get("/stripe/success", async (req, res) => {
   try {
-    const { orderId } = req.query;
+    const { orderId, session_id } = req.query;
     
     if (!orderId) {
       return res.status(400).send("Missing order ID");
     }
 
-    // Note: Payment verification is handled by Stripe webhook
-    // This endpoint just redirects to the appropriate page
+    // Official Stripe approach: Retrieve and verify checkout session status
+    // This provides immediate verification while webhooks handle fulfillment
+    try {
+      // Get order to find session_id if not provided in URL
+      const orderResult = await pool.query(
+        `SELECT id, status, stripe_session_id FROM orders WHERE id = $1`,
+        [orderId]
+      );
+
+      if (orderResult.rows.length === 0) {
+        console.error(`[Stripe Success] Order ${orderId} not found`);
+        const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+        return res.redirect(302, `${frontendUrl}/orders?error=order_not_found`);
+      }
+
+      const order = orderResult.rows[0];
+      const sessionId = (session_id as string) || order.stripe_session_id;
+
+      // If we have a session ID, verify the session status (official Stripe way)
+      if (sessionId && order.status === 'awaiting_payment') {
+        try {
+          const session = await stripeService.retrieveCheckoutSession(sessionId);
+          
+          // Official Stripe status check: 'complete' means payment succeeded
+          if (session.status === 'complete' && session.payment_status === 'paid') {
+            console.log(`[Stripe Success] Session ${sessionId} verified as complete for order ${orderId}`);
+            
+            // Trigger fulfillment idempotently (same logic as webhook)
+            // This ensures order is updated even if webhook is delayed
+            if (session.payment_intent) {
+              const paymentIntentId = typeof session.payment_intent === 'string' 
+                ? session.payment_intent 
+                : session.payment_intent.id;
+              
+              try {
+                const paymentIntent = await stripeService.retrievePaymentIntent(paymentIntentId);
+                if (paymentIntent.status === 'succeeded') {
+                  // This is idempotent - will only update if still awaiting_payment
+                  await stripeService.handlePaymentSucceeded(paymentIntent);
+                  console.log(`[Stripe Success] Order ${orderId} fulfillment triggered from success page`);
+                }
+              } catch (error: any) {
+                console.error(`[Stripe Success] Failed to process payment intent ${paymentIntentId}:`, error.message);
+                // Continue - webhook will handle it
+              }
+            }
+          } else if (session.status === 'open') {
+            // Payment failed or was canceled
+            console.log(`[Stripe Success] Session ${sessionId} status is 'open' - payment may have failed`);
+          }
+        } catch (error: any) {
+          console.error(`[Stripe Success] Failed to retrieve session ${sessionId}:`, error.message);
+          // Continue - webhook will handle fulfillment
+        }
+      }
+    } catch (error: any) {
+      console.error(`[Stripe Success] Error verifying session:`, error.message);
+      // Continue - webhook will handle fulfillment
+    }
 
     // Check if there are more orders to pay for (multi-business scenario)
     // We'll pass this info to the frontend so it can handle sequential payments
