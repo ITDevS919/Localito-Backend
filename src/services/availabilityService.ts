@@ -256,6 +256,29 @@ export class AvailabilityService {
     expiresAt.setMinutes(expiresAt.getMinutes() + 15);
     
     try {
+      // If this slot is already locked by the SAME user and not expired, treat as success.
+      const existingLockResult = await pool.query(
+        `SELECT locked_by, expires_at 
+         FROM booking_locks 
+         WHERE business_id = $1 AND booking_date = $2 AND booking_time = $3`,
+        [businessId, date, time]
+      );
+      if (existingLockResult.rows.length > 0) {
+        const existing = existingLockResult.rows[0];
+        const expires = new Date(existing.expires_at);
+        if (expires > new Date()) {
+          if (existing.locked_by === userId) {
+            // Already locked by this user – allow re-use (e.g. second lock during order placement)
+            console.log(`[Availability] Slot already locked by same user ${userId} for business ${businessId} on ${date} at ${time}`);
+            return true;
+          } else {
+            // Locked and still valid by a different user
+            console.log(`[Availability] Slot already locked by another user for business ${businessId} on ${date} at ${time}`);
+            return false;
+          }
+        }
+      }
+
       // First check if slot is actually available
       const slots = await this.getAvailableSlots(
         businessId,
@@ -387,7 +410,14 @@ export class AvailabilityService {
        WHERE business_id = $1 AND block_date BETWEEN $2 AND $3`,
       [businessId, startDate, endDate]
     );
-    const blocks = blocksResult.rows;
+    const blocks = blocksResult.rows.map((row: any) => ({
+      ...row,
+      block_date: row.block_date instanceof Date
+        ? row.block_date.toISOString().split('T')[0]
+        : String(row.block_date),
+      start_time: row.start_time ? this.timeToHHMM(row.start_time) : null,
+      end_time: row.end_time ? this.timeToHHMM(row.end_time) : null,
+    }));
     const bookings = await this.getBookings(businessId, startDate, endDate);
     const locks = await this.getActiveLocks(businessId, startDate, endDate);
     const todayStr = new Date().toISOString().split('T')[0];
@@ -564,7 +594,14 @@ export class AvailabilityService {
        AND block_date BETWEEN $2 AND $3`,
       [businessId, startDate, endDate]
     );
-    return result.rows;
+    return result.rows.map((row: any) => ({
+      ...row,
+      block_date: row.block_date instanceof Date
+        ? row.block_date.toISOString().split('T')[0]
+        : String(row.block_date),
+      start_time: row.start_time ? this.timeToHHMM(row.start_time) : null,
+      end_time: row.end_time ? this.timeToHHMM(row.end_time) : null,
+    }));
   }
 
   private async getBookings(businessId: string, startDate: Date, endDate: Date) {
@@ -577,30 +614,42 @@ export class AvailabilityService {
        AND booking_date IS NOT NULL`,
       [businessId, startDate, endDate]
     );
-    return result.rows.map((row: { booking_date: string; booking_time: string }) => ({
-      booking_date: row.booking_date,
+    return result.rows.map((row: any) => ({
+      booking_date: row.booking_date instanceof Date
+        ? row.booking_date.toISOString().split('T')[0]
+        : String(row.booking_date),
       booking_time: this.timeToHHMM(row.booking_time),
     }));
   }
 
   private async getActiveLocks(businessId: string, startDate: Date, endDate: Date) {
     const result = await pool.query(
-      `SELECT booking_date, booking_time, expires_at
+      `SELECT booking_date, booking_time, expires_at, locked_by
        FROM booking_locks
        WHERE business_id = $1
        AND booking_date BETWEEN $2 AND $3
        AND expires_at > NOW()`,
       [businessId, startDate, endDate]
     );
-    return result.rows;
+    return result.rows.map((row: any) => ({
+      booking_date: row.booking_date instanceof Date
+        ? row.booking_date.toISOString().split('T')[0]
+        : String(row.booking_date),
+      booking_time: this.timeToHHMM(row.booking_time),
+      expires_at: row.expires_at,
+      locked_by: row.locked_by,
+    }));
   }
 
   private isSlotBlocked(block: any, date: string, time: string): boolean {
-    if (block.block_date !== date) return false;
+    const blockDate = block.block_date instanceof Date
+      ? block.block_date.toISOString().split('T')[0]
+      : String(block.block_date);
+    if (blockDate !== date) return false;
     if (block.is_all_day) return true;
     
-    const blockStart = block.start_time || '00:00';
-    const blockEnd = block.end_time || '23:59';
+    const blockStart = block.start_time ? this.timeToHHMM(block.start_time) : '00:00';
+    const blockEnd = block.end_time ? this.timeToHHMM(block.end_time) : '23:59';
     
     return time >= blockStart && time < blockEnd;
   }
