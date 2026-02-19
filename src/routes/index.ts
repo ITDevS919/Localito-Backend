@@ -2253,6 +2253,82 @@ router.delete("/business/availability/blocks/:id", isAuthenticated, async (req, 
   }
 });
 
+// Get slot grid for seller dashboard (available | booked | blocked | locked)
+router.get("/business/availability/slot-grid", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can access this" });
+    }
+    const businessId = await productService.getBusinessIdByUserId(user.id);
+    if (!businessId) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
+    }
+    const { startDate, endDate, slotIntervalMinutes, durationMinutes } = req.query;
+    if (!startDate || !endDate) {
+      return res.status(400).json({ success: false, message: "startDate and endDate are required (YYYY-MM-DD)" });
+    }
+    const grid = await availabilityService.getSlotGrid(
+      businessId,
+      new Date(startDate as string),
+      new Date(endDate as string),
+      slotIntervalMinutes ? parseInt(slotIntervalMinutes as string) : 60,
+      durationMinutes ? parseInt(durationMinutes as string) : 60
+    );
+    res.json({ success: true, data: grid });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Get explicit time slots by day (for seller UI)
+router.get("/business/availability/slots", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can access this" });
+    }
+    const businessId = await productService.getBusinessIdByUserId(user.id);
+    if (!businessId) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
+    }
+    const slotsByDay = await availabilityService.getExplicitSlots(businessId);
+    res.json({ success: true, data: slotsByDay });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Set explicit time slots (slotsByDay: { [dayOfWeek]: { time: string, enabled: boolean }[] })
+router.put("/business/availability/slots", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can update slots" });
+    }
+    const businessId = await productService.getBusinessIdByUserId(user.id);
+    if (!businessId) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
+    }
+    const { slotsByDay } = req.body;
+    if (!slotsByDay || typeof slotsByDay !== "object") {
+      return res.status(400).json({ success: false, message: "slotsByDay object is required" });
+    }
+    for (const dayOfWeekStr of Object.keys(slotsByDay)) {
+      const dayOfWeek = parseInt(dayOfWeekStr, 10);
+      if (isNaN(dayOfWeek) || dayOfWeek < 0 || dayOfWeek > 6) continue;
+      const slots = slotsByDay[dayOfWeekStr];
+      if (Array.isArray(slots)) {
+        await availabilityService.setExplicitSlotsForDay(businessId, dayOfWeek, slots);
+      }
+    }
+    const updated = await availabilityService.getExplicitSlots(businessId);
+    res.json({ success: true, data: updated });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Lock a booking slot (during checkout)
 router.post("/bookings/lock", isAuthenticated, async (req, res, next) => {
   try {

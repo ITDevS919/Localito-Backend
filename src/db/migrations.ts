@@ -1176,6 +1176,24 @@ export async function runMigrations() {
         WHERE booking_date IS NOT NULL
     `);
 
+    // Explicit time slots per day (e.g. only 9am, 1pm, 4pm). When set, only these slots are offered instead of full range.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS business_availability_slots (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+        day_of_week INTEGER NOT NULL CHECK (day_of_week >= 0 AND day_of_week <= 6),
+        slot_time TIME NOT NULL,
+        enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(business_id, day_of_week, slot_time)
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_business_availability_slots_business_day 
+        ON business_availability_slots(business_id, day_of_week)
+    `);
+
     // Update location_type constraint to match frontend values
     await client.query(`
       DO $$ 

@@ -6,6 +6,15 @@ export interface TimeSlot {
   available: boolean;
 }
 
+export type SlotStatus = 'available' | 'booked' | 'blocked' | 'locked';
+
+export interface SlotGridEntry {
+  date: string;
+  time: string;
+  status: SlotStatus;
+  blockId?: string; // when status === 'blocked', id of the block (for unblock)
+}
+
 export interface AvailabilitySchedule {
   dayOfWeek: number;
   startTime: string;
@@ -29,6 +38,40 @@ export class AvailabilityService {
       endTime: row.end_time,
       isAvailable: row.is_available,
     }));
+  }
+
+  // Get explicit time slots for a day (e.g. only 9:00, 13:00, 16:00). Returns null if no explicit slots set.
+  async getExplicitSlotsForDay(businessId: string, dayOfWeek: number): Promise<string[] | null> {
+    const result = await pool.query(
+      `SELECT slot_time FROM business_availability_slots
+       WHERE business_id = $1 AND day_of_week = $2 AND enabled = TRUE
+       ORDER BY slot_time`,
+      [businessId, dayOfWeek]
+    );
+    if (result.rows.length === 0) return null;
+    return result.rows.map((row: { slot_time: string }) => this.timeToHHMM(row.slot_time));
+  }
+
+  // Get all explicit slot definitions for a business (for dashboard). Returns map dayOfWeek -> { time, enabled }[].
+  async getExplicitSlots(businessId: string): Promise<Record<number, { time: string; enabled: boolean }[]>> {
+    const result = await pool.query(
+      `SELECT day_of_week, slot_time, enabled FROM business_availability_slots
+       WHERE business_id = $1 ORDER BY day_of_week, slot_time`,
+      [businessId]
+    );
+    const byDay: Record<number, { time: string; enabled: boolean }[]> = {};
+    for (const row of result.rows) {
+      const day = row.day_of_week;
+      if (!byDay[day]) byDay[day] = [];
+      byDay[day].push({ time: this.timeToHHMM(row.slot_time), enabled: row.enabled });
+    }
+    return byDay;
+  }
+
+  private timeToHHMM(t: string): string {
+    if (typeof t !== 'string') return '';
+    const s = String(t);
+    return s.length >= 5 ? s.slice(0, 5) : s;
   }
 
   // Get available time slots for a date range
@@ -116,14 +159,23 @@ export class AvailabilityService {
         }
       }
       
-      if (daySchedule && daySchedule.isAvailable && daySchedule.startTime && daySchedule.endTime) {
-        const slotsForDay = this.generateTimeSlots(
-          daySchedule.startTime,
-          daySchedule.endTime,
-          durationMinutes,
-          slotIntervalMinutes
-        );
-        
+      if (daySchedule && daySchedule.isAvailable) {
+        let slotsForDay: string[];
+        const explicitSlots = await this.getExplicitSlotsForDay(businessId, dayOfWeek);
+        if (explicitSlots && explicitSlots.length > 0) {
+          slotsForDay = explicitSlots;
+        } else if (daySchedule.startTime && daySchedule.endTime) {
+          slotsForDay = this.generateTimeSlots(
+            daySchedule.startTime,
+            daySchedule.endTime,
+            durationMinutes,
+            slotIntervalMinutes
+          );
+        } else {
+          currentDate.setDate(currentDate.getDate() + 1);
+          continue;
+        }
+
         for (const slot of slotsForDay) {
           // For same-day slots, check if we're past cutoff time
           if (isToday && cutoffTime) {
@@ -168,9 +220,9 @@ export class AvailabilityService {
             this.isSlotBlocked(block, dateStr, slot)
           );
           
-          // Check if already booked
+          // Check if already booked (normalize booking_time to HH:MM for comparison)
           const isBooked = bookings.some(booking =>
-            booking.booking_date === dateStr && booking.booking_time === slot
+            booking.booking_date === dateStr && this.timeToHHMM(booking.booking_time) === slot
           );
           
           // Check if locked
@@ -318,6 +370,145 @@ export class AvailabilityService {
     );
   }
 
+  // Get slot grid for seller dashboard: each slot has status (available | booked | blocked | locked).
+  async getSlotGrid(
+    businessId: string,
+    startDate: Date,
+    endDate: Date,
+    slotIntervalMinutes: number = 60,
+    durationMinutes: number = 60
+  ): Promise<SlotGridEntry[]> {
+    await this.cleanupExpiredLocks();
+    const schedule = await this.getWeeklySchedule(businessId);
+    const scheduleMap = new Map(schedule.map(s => [s.dayOfWeek, s]));
+    const blocksResult = await pool.query(
+      `SELECT id, block_date, start_time, end_time, is_all_day
+       FROM business_availability_blocks
+       WHERE business_id = $1 AND block_date BETWEEN $2 AND $3`,
+      [businessId, startDate, endDate]
+    );
+    const blocks = blocksResult.rows;
+    const bookings = await this.getBookings(businessId, startDate, endDate);
+    const locks = await this.getActiveLocks(businessId, startDate, endDate);
+    const todayStr = new Date().toISOString().split('T')[0];
+    const now = new Date();
+
+    const businessResult = await pool.query(
+      `SELECT same_day_pickup_allowed, cutoff_time FROM businesses WHERE id = $1`,
+      [businessId]
+    );
+    const business = businessResult.rows[0];
+    const sameDayPickupAllowed = business?.same_day_pickup_allowed !== false;
+    const cutoffTime = business?.cutoff_time;
+
+    const grid: SlotGridEntry[] = [];
+    const currentDate = new Date(startDate);
+
+    while (currentDate <= endDate) {
+      const dayOfWeek = currentDate.getDay();
+      const dateStr = currentDate.toISOString().split('T')[0];
+      const daySchedule = scheduleMap.get(dayOfWeek);
+      const isToday = dateStr === todayStr;
+
+      if (isToday) {
+        if (!sameDayPickupAllowed) {
+          currentDate.setDate(currentDate.getDate() + 1);
+          continue;
+        }
+        if (cutoffTime) {
+          const [ch, cm] = cutoffTime.split(':').map((x: string) => parseInt(x, 10));
+          const cutoff = new Date();
+          cutoff.setHours(ch || 0, cm || 0, 0, 0);
+          if (now >= cutoff) {
+            currentDate.setDate(currentDate.getDate() + 1);
+            continue;
+          }
+        }
+      }
+
+      if (!daySchedule || !daySchedule.isAvailable) {
+        currentDate.setDate(currentDate.getDate() + 1);
+        continue;
+      }
+
+      let slotsForDay: string[];
+      const explicitSlots = await this.getExplicitSlotsForDay(businessId, dayOfWeek);
+      if (explicitSlots && explicitSlots.length > 0) {
+        slotsForDay = explicitSlots;
+      } else if (daySchedule.startTime && daySchedule.endTime) {
+        slotsForDay = this.generateTimeSlots(
+          daySchedule.startTime,
+          daySchedule.endTime,
+          durationMinutes,
+          slotIntervalMinutes
+        );
+      } else {
+        currentDate.setDate(currentDate.getDate() + 1);
+        continue;
+      }
+
+      for (const slot of slotsForDay) {
+        if (isToday && cutoffTime) {
+          const [ch, cm] = cutoffTime.split(':').map((x: string) => parseInt(x, 10));
+          const cutoff = new Date();
+          cutoff.setHours(ch || 0, cm || 0, 0, 0);
+          const [sh, sm] = slot.split(':').map((x: string) => parseInt(x, 10));
+          const slotDate = new Date();
+          slotDate.setHours(sh, sm || 0, 0, 0);
+          if (now >= cutoff) continue;
+        }
+
+        const block = blocks.find((b: any) => {
+          if (b.block_date !== dateStr) return false;
+          if (b.is_all_day) return true;
+          const start = this.timeToHHMM(b.start_time);
+          const end = b.end_time ? this.timeToHHMM(b.end_time) : '23:59';
+          return slot >= start && slot < end;
+        });
+        const isBooked = bookings.some(
+          (b: { booking_date: string; booking_time: string }) =>
+            b.booking_date === dateStr && b.booking_time === slot
+        );
+        const isLocked = locks.some(
+          (l: { booking_date: string; booking_time: string; expires_at: string }) =>
+            l.booking_date === dateStr && this.timeToHHMM(l.booking_time) === slot && new Date(l.expires_at) > new Date()
+        );
+
+        let status: SlotStatus = 'available';
+        let blockId: string | undefined;
+        if (block) {
+          status = 'blocked';
+          blockId = block.id;
+        } else if (isBooked) status = 'booked';
+        else if (isLocked) status = 'locked';
+        grid.push({ date: dateStr, time: slot, status, blockId });
+      }
+      currentDate.setDate(currentDate.getDate() + 1);
+    }
+    return grid;
+  }
+
+  // Set explicit time slots for a day. slots: { time: string, enabled: boolean }[].
+  async setExplicitSlotsForDay(
+    businessId: string,
+    dayOfWeek: number,
+    slots: { time: string; enabled: boolean }[]
+  ): Promise<void> {
+    await pool.query(
+      `DELETE FROM business_availability_slots WHERE business_id = $1 AND day_of_week = $2`,
+      [businessId, dayOfWeek]
+    );
+    for (const s of slots) {
+      const timeVal = s.time.length === 5 ? s.time + ':00' : s.time;
+      await pool.query(
+        `INSERT INTO business_availability_slots (business_id, day_of_week, slot_time, enabled, updated_at)
+         VALUES ($1, $2, $3::TIME, $4, CURRENT_TIMESTAMP)
+         ON CONFLICT (business_id, day_of_week, slot_time) DO UPDATE SET enabled = $4, updated_at = CURRENT_TIMESTAMP`,
+        [businessId, dayOfWeek, timeVal, s.enabled]
+      );
+    }
+  }
+
   private generateTimeSlots(
     startTime: string,
     endTime: string,
@@ -386,7 +577,10 @@ export class AvailabilityService {
        AND booking_date IS NOT NULL`,
       [businessId, startDate, endDate]
     );
-    return result.rows;
+    return result.rows.map((row: { booking_date: string; booking_time: string }) => ({
+      booking_date: row.booking_date,
+      booking_time: this.timeToHHMM(row.booking_time),
+    }));
   }
 
   private async getActiveLocks(businessId: string, startDate: Date, endDate: Date) {
