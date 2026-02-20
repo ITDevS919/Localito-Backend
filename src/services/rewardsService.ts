@@ -165,9 +165,36 @@ export class RewardsService {
   }
 
   /**
-   * Validate discount code
+   * Get participating business IDs for a discount code. Returns null if site-wide (no rows in discount_code_businesses).
    */
-  async validateDiscountCode(code: string, orderTotal: number) {
+  async getParticipatingBusinessIds(code: string): Promise<string[] | null> {
+    const codeResult = await pool.query(
+      'SELECT id FROM discount_codes WHERE code = $1',
+      [code.toUpperCase()]
+    );
+    if (codeResult.rows.length === 0) return null;
+    const discountCodeId = codeResult.rows[0].id;
+    const bizResult = await pool.query(
+      'SELECT business_id FROM discount_code_businesses WHERE discount_code_id = $1',
+      [discountCodeId]
+    );
+    if (bizResult.rows.length === 0) return null; // site-wide (backward compat: no rows = all businesses)
+    return bizResult.rows.map((r: { business_id: string }) => r.business_id);
+  }
+
+  /**
+   * Whether this discount code applies to the given business. Site-wide codes (no participating rows) apply to all.
+   */
+  async codeAppliesToBusiness(code: string, businessId: string): Promise<boolean> {
+    const participating = await this.getParticipatingBusinessIds(code);
+    if (participating === null) return true; // site-wide
+    return participating.includes(businessId);
+  }
+
+  /**
+   * Validate discount code. If businessIds is provided, code is valid only if it applies to at least one of those businesses.
+   */
+  async validateDiscountCode(code: string, orderTotal: number, businessIds?: string[]) {
     try {
       const result = await pool.query(
         `SELECT * FROM discount_codes 
@@ -183,6 +210,20 @@ export class RewardsService {
       }
 
       const discount = result.rows[0];
+
+      // If businessIds provided, code must apply to at least one of them
+      if (businessIds && businessIds.length > 0) {
+        const participating = await this.getParticipatingBusinessIds(code);
+        if (participating !== null) {
+          const applies = businessIds.some((id) => participating.includes(id));
+          if (!applies) {
+            return {
+              valid: false,
+              message: 'This discount code is not valid for any business in your cart',
+            };
+          }
+        }
+      }
 
       // Check minimum purchase amount
       if (orderTotal < parseFloat(discount.min_purchase_amount || 0)) {
@@ -203,6 +244,8 @@ export class RewardsService {
         discountAmount = parseFloat(discount.discount_value);
       }
 
+      let participatingBusinessIds: string[] | null = await this.getParticipatingBusinessIds(code);
+
       return {
         valid: true,
         discount: {
@@ -211,6 +254,7 @@ export class RewardsService {
           amount: discountAmount,
           type: discount.discount_type,
         },
+        participatingBusinessIds,
       };
     } catch (error: any) {
       console.error('[Rewards] Failed to validate discount code:', error);
@@ -219,17 +263,24 @@ export class RewardsService {
   }
 
   /**
-   * Apply discount code to order
+   * Apply discount code to order. Fails if the code does not apply to the order's business.
    */
   async applyDiscountCode(orderId: string, code: string) {
     try {
-      const orderResult = await pool.query('SELECT total FROM orders WHERE id = $1', [orderId]);
+      const orderResult = await pool.query('SELECT total, business_id FROM orders WHERE id = $1', [orderId]);
       if (orderResult.rows.length === 0) {
         throw new Error('Order not found');
       }
 
       const orderTotal = parseFloat(orderResult.rows[0].total);
-      const validation = await this.validateDiscountCode(code, orderTotal);
+      const businessId = orderResult.rows[0].business_id;
+
+      const applies = await this.codeAppliesToBusiness(code, businessId);
+      if (!applies) {
+        throw new Error('This discount code is not valid for this order');
+      }
+
+      const validation = await this.validateDiscountCode(code, orderTotal, [businessId]);
 
       if (!validation.valid) {
         throw new Error(validation.message);

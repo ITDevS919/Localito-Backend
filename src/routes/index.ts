@@ -2734,15 +2734,26 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
     );
     const totalBeforeDiscount = productsTotal + servicesTotal;
 
-    // Validate and apply discount code
+    // Combine all businesses (products + services) for discount validation
+    const allBusinessIdsForDiscount = new Set([
+      ...Array.from(businessGroups.keys()),
+      ...Array.from(serviceBusinessGroups.keys()),
+    ]);
+
+    // Validate and apply discount code (scoped to businesses in cart)
+    let discountParticipatingBusinessIds: string[] | null = null; // null = site-wide (all get share)
     if (discountCode) {
       try {
-        const validation = await rewardsService.validateDiscountCode(discountCode, totalBeforeDiscount);
+        const validation = await rewardsService.validateDiscountCode(
+          discountCode,
+          totalBeforeDiscount,
+          Array.from(allBusinessIdsForDiscount)
+        );
         if (validation.valid) {
           discountAmount = validation.discount!.amount;
+          discountParticipatingBusinessIds = validation.participatingBusinessIds ?? null;
         }
       } catch (err) {
-        // Discount code invalid, continue without it
         console.error('Discount code validation error:', err);
       }
     }
@@ -2767,6 +2778,13 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
     ]);
     const totalBusinesses = allBusinessIds.size;
 
+    // Which businesses get a share of the discount (only participating businesses in cart)
+    const discountEligibleBusinessIds =
+      discountParticipatingBusinessIds === null
+        ? Array.from(allBusinessIds)
+        : Array.from(allBusinessIds).filter((id) => discountParticipatingBusinessIds!.includes(id));
+    const discountEligibleCount = discountEligibleBusinessIds.length;
+
     // Create orders for each business
     const createdOrders = [];
 
@@ -2778,11 +2796,12 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
       const productsTotal = items.reduce((sum, item) => sum + parseFloat(item.price) * item.quantity, 0);
       const servicesTotal = serviceItems.reduce((sum, item) => sum + parseFloat(item.price) * item.quantity, 0);
       let total = productsTotal + servicesTotal;
-      
-      // Apply discount proportionally (if multiple businesses, split discount)
-      const businessDiscount = totalBusinesses > 1 
-        ? (discountAmount / totalBusinesses) 
-        : discountAmount;
+
+      // Discount only for businesses that participate in the code; split among eligible only
+      const getsDiscount = discountEligibleCount > 0 && discountEligibleBusinessIds.includes(businessId);
+      const businessDiscount = getsDiscount && discountAmount > 0
+        ? discountAmount / discountEligibleCount
+        : 0;
       const businessPoints = totalBusinesses > 1
         ? (pointsRedeemed / totalBusinesses)
         : pointsRedeemed;
@@ -8288,16 +8307,20 @@ router.get("/user/points/transactions", isAuthenticated, async (req, res, next) 
   }
 });
 
-// Validate discount code
+// Validate discount code (optionally scoped to businesses in cart)
 router.post("/discount-codes/validate", async (req, res, next) => {
   try {
-    const { code, orderTotal } = req.body;
+    const { code, orderTotal, businessIds } = req.body;
 
     if (!code) {
       return res.status(400).json({ success: false, message: "Discount code is required" });
     }
 
-    const validation = await rewardsService.validateDiscountCode(code, orderTotal || 0);
+    const validation = await rewardsService.validateDiscountCode(
+      code,
+      orderTotal || 0,
+      Array.isArray(businessIds) ? businessIds : undefined
+    );
     res.json({ success: validation.valid, data: validation });
   } catch (error) {
     next(error);
@@ -8321,7 +8344,7 @@ router.post("/orders/:orderId/discount-code", isAuthenticated, async (req, res, 
   }
 });
 
-// Admin: Create discount code
+// Admin: Create discount code (with participating businesses)
 router.post("/admin/discount-codes", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
@@ -8338,28 +8361,51 @@ router.post("/admin/discount-codes", isAuthenticated, async (req, res, next) => 
       maxDiscountAmount,
       usageLimit,
       validUntil,
+      participatingBusinessIds,
     } = req.body;
 
-    const result = await pool.query(
-      `INSERT INTO discount_codes 
-       (code, description, discount_type, discount_value, min_purchase_amount, max_discount_amount, usage_limit, valid_until)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       RETURNING *`,
-      [
-        code.toUpperCase(),
-        description || null,
-        discountType,
-        discountValue,
-        minPurchaseAmount || 0,
-        maxDiscountAmount || null,
-        usageLimit || null,
-        validUntil || null,
-      ]
-    );
+    const businessIds = Array.isArray(participatingBusinessIds)
+      ? participatingBusinessIds.filter((id: string) => typeof id === "string" && id)
+      : [];
+    if (businessIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Select at least one participating business for this discount code",
+      });
+    }
 
-    res.status(201).json({ success: true, data: result.rows[0] });
+    const client = await pool.connect();
+    try {
+      const result = await client.query(
+        `INSERT INTO discount_codes 
+         (code, description, discount_type, discount_value, min_purchase_amount, max_discount_amount, usage_limit, valid_until)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING *`,
+        [
+          code.toUpperCase(),
+          description || null,
+          discountType,
+          discountValue,
+          minPurchaseAmount || 0,
+          maxDiscountAmount || null,
+          usageLimit || null,
+          validUntil || null,
+        ]
+      );
+      const discountCodeId = result.rows[0].id;
+      for (const businessId of businessIds) {
+        await client.query(
+          `INSERT INTO discount_code_businesses (discount_code_id, business_id) VALUES ($1, $2)
+           ON CONFLICT (discount_code_id, business_id) DO NOTHING`,
+          [discountCodeId, businessId]
+        );
+      }
+      res.status(201).json({ success: true, data: result.rows[0] });
+    } finally {
+      client.release();
+    }
   } catch (error: any) {
-    if (error.code === '23505') { // Unique violation
+    if (error.code === "23505") {
       res.status(400).json({ success: false, message: "Discount code already exists" });
     } else {
       next(error);
@@ -8367,7 +8413,7 @@ router.post("/admin/discount-codes", isAuthenticated, async (req, res, next) => 
   }
 });
 
-// Admin: Get all discount codes
+// Admin: Get all discount codes (with participating business IDs)
 router.get("/admin/discount-codes", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
@@ -8376,10 +8422,21 @@ router.get("/admin/discount-codes", isAuthenticated, async (req, res, next) => {
     }
 
     const result = await pool.query(
-      `SELECT * FROM discount_codes ORDER BY created_at DESC`
+      `SELECT dc.*,
+        COALESCE(
+          (SELECT json_agg(dcb.business_id) FROM discount_code_businesses dcb WHERE dcb.discount_code_id = dc.id),
+          '[]'::json
+        ) as participating_business_ids
+       FROM discount_codes dc
+       ORDER BY dc.created_at DESC`
     );
 
-    res.json({ success: true, data: result.rows });
+    const rows = result.rows.map((r: any) => ({
+      ...r,
+      participating_business_ids: Array.isArray(r.participating_business_ids) ? r.participating_business_ids : (r.participating_business_ids ? JSON.parse(r.participating_business_ids) : []),
+    }));
+
+    res.json({ success: true, data: rows });
   } catch (error) {
     next(error);
   }

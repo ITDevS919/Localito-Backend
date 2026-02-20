@@ -852,6 +852,18 @@ export async function runMigrations() {
       CREATE INDEX IF NOT EXISTS idx_order_discount_codes_order_id ON order_discount_codes(order_id)
     `);
 
+    // Participating businesses per discount code (empty = code applies to selected businesses only; no rows = site-wide for backward compat)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS discount_code_businesses (
+        discount_code_id UUID NOT NULL REFERENCES discount_codes(id) ON DELETE CASCADE,
+        business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+        PRIMARY KEY (discount_code_id, business_id)
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_discount_code_businesses_discount_code_id ON discount_code_businesses(discount_code_id)
+    `);
+
     // Create platform_settings table for commission and other settings
     await client.query(`
       CREATE TABLE IF NOT EXISTS platform_settings (
