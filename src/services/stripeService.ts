@@ -2,6 +2,7 @@ import Stripe from "stripe";
 import { pool } from "../db/connection";
 import { rewardsService } from "./rewardsService";
 import { emailService } from "./emailService";
+import { formatBookingDateTime } from "../utils/dateFormatting";
 
 /**
  * Stripe Connect Architecture:
@@ -163,7 +164,7 @@ export class StripeService {
         `SELECT COALESCE(SUM(total), 0) as turnover
          FROM orders
          WHERE business_id = $1
-           AND status IN ('processing', 'ready_for_pickup', 'completed', 'collected')
+           AND status IN ('processing', 'ready', 'complete')
            AND created_at >= $2`,
         [businessId, thirtyDaysAgo]
       );
@@ -1981,7 +1982,7 @@ export class StripeService {
           businessAddress: businessAddress,
           googleMapsLink: googleMapsLink,
           pickupTime: orderDetails.booking_date && orderDetails.booking_time
-            ? `${orderDetails.booking_date} at ${orderDetails.booking_time}`
+            ? formatBookingDateTime(orderDetails.booking_date, orderDetails.booking_time)
             : "Ready for pickup - check order status for updates",
           qrCodeUrl: qrCodeUrl,
         }
@@ -2014,7 +2015,7 @@ export class StripeService {
           items: allItems,
           totalAmount: parseFloat(orderDetails.total),
           collectionTimeSlot: orderDetails.booking_date && orderDetails.booking_time
-            ? `${orderDetails.booking_date} at ${orderDetails.booking_time}`
+            ? formatBookingDateTime(orderDetails.booking_date, orderDetails.booking_time)
             : orderDetails.pickup_time_slot || "To be confirmed",
           businessAddress: businessAddress,
           manageOrderLink: `${process.env.FRONTEND_URL || "http://localhost:5173"}/business/orders/${orderId}`,

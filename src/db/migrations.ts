@@ -190,7 +190,7 @@ export async function runMigrations() {
         user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
         status VARCHAR(20) NOT NULL DEFAULT 'pending' 
-        CHECK (status IN ('awaiting_payment', 'pending', 'processing', 'shipped', 'delivered', 'cancelled', 'ready_for_pickup', 'picked_up')),
+        CHECK (status IN ('awaiting_payment', 'pending', 'processing', 'cancelled', 'ready', 'complete')),
         total DECIMAL(10, 2) NOT NULL CHECK (total >= 0),
         stripe_session_id VARCHAR(255),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -261,6 +261,14 @@ export async function runMigrations() {
       END $$;
     `);
     
+    // Migrate status values to new enum: delivered->complete, shipped->complete, ready_for_pickup->ready, picked_up->complete
+    await client.query(`
+      UPDATE orders SET status = 'complete', updated_at = CURRENT_TIMESTAMP WHERE status IN ('delivered', 'shipped', 'picked_up');
+    `);
+    await client.query(`
+      UPDATE orders SET status = 'ready', updated_at = CURRENT_TIMESTAMP WHERE status = 'ready_for_pickup';
+    `);
+
     // Now add the updated constraint (drop first to ensure clean state)
     await client.query(`
       ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_status_check;
@@ -269,7 +277,7 @@ export async function runMigrations() {
     await client.query(`
       ALTER TABLE orders 
       ADD CONSTRAINT orders_status_check 
-      CHECK (status IN ('awaiting_payment', 'pending', 'processing', 'shipped', 'delivered', 'cancelled', 'ready_for_pickup', 'picked_up'));
+      CHECK (status IN ('awaiting_payment', 'pending', 'processing', 'cancelled', 'ready', 'complete'));
     `);
 
     // Create order_items table

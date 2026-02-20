@@ -3661,7 +3661,7 @@ router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
     }
 
     const { status } = req.body;
-    const validStatuses = ["awaiting_payment", "pending", "processing", "shipped", "delivered", "cancelled", "ready_for_pickup", "picked_up"];
+    const validStatuses = ["awaiting_payment", "pending", "processing", "cancelled", "ready", "complete"];
     
     if (!status || !validStatuses.includes(status)) {
       return res.status(400).json({
@@ -3721,10 +3721,10 @@ router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
       updateParams.push(platformCommission, businessAmount);
     }
 
-    // Set timestamps for BOPIS statuses
-    if (status === "ready_for_pickup") {
+    // Set timestamps for ready/complete statuses
+    if (status === "ready") {
       updateQuery += `, ready_for_pickup_at = CURRENT_TIMESTAMP`;
-    } else if (status === "picked_up") {
+    } else if (status === "complete") {
       updateQuery += `, picked_up_at = CURRENT_TIMESTAMP`;
     }
 
@@ -3754,7 +3754,7 @@ router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
     );
 
     // Send emails based on status change
-    if (status === "ready_for_pickup") {
+    if (status === "ready") {
       try {
         // Get customer and business details
         const customerResult = await pool.query(
@@ -3843,7 +3843,7 @@ router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
       }
     }
 
-    if (status === "picked_up") {
+    if (status === "complete") {
       try {
         // Get customer details and points balance
         const customerResult = await pool.query(
@@ -4075,11 +4075,11 @@ router.post("/orders/verify-qr", isAuthenticated, async (req, res, next) => {
       });
     }
 
-    // Check if order is already picked up
-    if (order.status === 'picked_up') {
+    // Check if order is already complete
+    if (order.status === 'complete') {
       return res.status(400).json({ 
         success: false, 
-        message: "Order has already been picked up",
+        message: "Order has already been completed",
         data: {
           orderId: order.id,
           status: order.status,
@@ -4118,10 +4118,10 @@ router.post("/orders/verify-qr", isAuthenticated, async (req, res, next) => {
       });
     }
 
-    // Update order status to picked_up and record scan
+    // Update order status to complete and record scan
     const updateResult = await pool.query(
       `UPDATE orders 
-       SET status = 'picked_up', 
+       SET status = 'complete', 
            picked_up_at = CURRENT_TIMESTAMP,
            qr_code_scanned_at = CURRENT_TIMESTAMP,
            qr_code_scanned_by = $1,
@@ -4337,7 +4337,7 @@ router.post("/products/:id/reviews", isAuthenticated, async (req, res, next) => 
       `SELECT oi.id
        FROM order_items oi
        JOIN orders o ON oi.order_id = o.id
-       WHERE oi.product_id = $1 AND o.user_id = $2 AND o.status = 'delivered'
+       WHERE oi.product_id = $1 AND o.user_id = $2 AND o.status = 'complete'
        LIMIT 1`,
       [req.params.id, user.id]
     );
@@ -5417,8 +5417,12 @@ router.get("/admin/orders", isAuthenticated, async (req, res, next) => {
 
     const params: string[] = [];
     if (status && status !== "all") {
-      query += ` AND o.status = $1`;
-      params.push(status as string);
+      if (status === "complete") {
+        query += ` AND (o.status = 'complete' OR o.booking_status = 'completed')`;
+      } else {
+        query += ` AND o.status = $1`;
+        params.push(status as string);
+      }
     }
 
     query += ` ORDER BY o.created_at DESC`;
