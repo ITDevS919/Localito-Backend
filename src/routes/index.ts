@@ -3773,69 +3773,76 @@ router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
           [order.id]
         );
 
-        if (customerResult.rows.length > 0 && businessResult.rows.length > 0) {
+        if (customerResult.rows.length === 0) {
+          console.warn(`[Order Status] Cannot send ready-for-pickup email for order ${order.id}: customer not found`);
+        } else if (businessResult.rows.length === 0) {
+          console.warn(`[Order Status] Cannot send ready-for-pickup email for order ${order.id}: business not found`);
+        } else {
           const customer = customerResult.rows[0];
           const business = businessResult.rows[0];
+          const toEmail = customer.customer_email?.trim?.() || customer.customer_email;
+          if (!toEmail) {
+            console.warn(`[Order Status] Cannot send ready-for-pickup email for order ${order.id}: customer has no email`);
+          } else {
+            // Combine all items (products + services)
+            const allItems = [
+              ...itemsResult.rows.map((item: any) => ({
+                name: item.product_name,
+                quantity: item.quantity,
+                price: parseFloat(item.price),
+              })),
+              ...serviceItemsResult.rows.map((item: any) => ({
+                name: item.service_name,
+                quantity: item.quantity,
+                price: parseFloat(item.price),
+              })),
+            ];
 
-          // Combine all items
-          const allItems = [
-            ...itemsResult.rows.map((item: any) => ({
-              name: item.product_name,
-              quantity: item.quantity,
-              price: parseFloat(item.price),
-            })),
-            ...serviceItemsResult.rows.map((item: any) => ({
-              name: item.service_name,
-              quantity: item.quantity,
-              price: parseFloat(item.price),
-            })),
-          ];
+            const totalAmount = parseFloat(order.total);
+            const cashbackAmount = parseFloat(order.points_earned || "0");
 
-          // Calculate totals
-          const totalAmount = parseFloat(order.total);
-          const cashbackAmount = parseFloat(order.points_earned || "0");
+            const businessAddressResult = await pool.query(
+              `SELECT business_address, postcode, city
+               FROM businesses
+               WHERE id = (SELECT business_id FROM orders WHERE id = $1)`,
+              [order.id]
+            );
+            const businessAddress = businessAddressResult.rows[0]
+              ? [
+                  businessAddressResult.rows[0].business_address,
+                  businessAddressResult.rows[0].postcode,
+                  businessAddressResult.rows[0].city,
+                ]
+                  .filter(Boolean)
+                  .join(", ")
+              : "";
 
-          // Get business address
-          const businessAddressResult = await pool.query(
-            `SELECT business_address, postcode, city
-             FROM businesses
-             WHERE id = (SELECT business_id FROM orders WHERE id = $1)`,
-            [order.id]
-          );
-          const businessAddress = businessAddressResult.rows[0]
-            ? [
-                businessAddressResult.rows[0].business_address,
-                businessAddressResult.rows[0].postcode,
-                businessAddressResult.rows[0].city,
-              ]
-                .filter(Boolean)
-                .join(", ")
-            : "";
+            const googleMapsLink = businessAddress
+              ? `https://maps.google.com/?q=${encodeURIComponent(businessAddress)}`
+              : undefined;
+            const qrCodeUrl = order.qr_code || undefined;
 
-          // Build Google Maps link
-          const googleMapsLink = businessAddress
-            ? `https://maps.google.com/?q=${encodeURIComponent(businessAddress)}`
-            : undefined;
-
-          // Get QR code if available
-          const qrCodeUrl = order.qr_code || undefined;
-
-          await emailService.sendOrderReadyForPickupEmail(
-            customer.customer_email,
-            {
-              customerName: customer.customer_name,
-              orderId: order.id,
-              items: allItems,
-              totalAmount: totalAmount,
-              cashbackAmount: cashbackAmount,
-              businessName: business.business_name,
-              businessAddress: businessAddress,
-              openingHours: business.opening_hours || "Check business profile for hours",
-              googleMapsLink: googleMapsLink,
-              qrCodeUrl: qrCodeUrl,
+            const sent = await emailService.sendOrderReadyForPickupEmail(
+              toEmail,
+              {
+                customerName: customer.customer_name || "Customer",
+                orderId: String(order.id),
+                items: allItems,
+                totalAmount: totalAmount,
+                cashbackAmount: cashbackAmount,
+                businessName: business.business_name,
+                businessAddress: businessAddress,
+                openingHours: business.opening_hours || "Check business profile for hours",
+                googleMapsLink: googleMapsLink,
+                qrCodeUrl: qrCodeUrl,
+              }
+            );
+            if (sent) {
+              console.log(`[Order Status] Order ready for pickup email sent for order ${order.id} to ${toEmail}`);
+            } else {
+              console.error(`[Order Status] Failed to send ready-for-pickup email for order ${order.id} (sendEmail returned false). Check RESEND_API_KEY / SMTP config.`);
             }
-          );
-          console.log(`[Order Status] Order ready for pickup email sent for order ${order.id}`);
+          }
         }
       } catch (emailError: any) {
         console.error(`[Order Status] Failed to send ready for pickup email for order ${order.id}:`, emailError);
