@@ -37,8 +37,9 @@ export async function renderOrderReadyForPickupEmail(
 export function renderOrderReadyForPickupEmailText(
   data: OrderReadyForPickupData
 ): string {
-  const itemsList = data.items
-    .map((item) => `  - ${item.name}: ${item.quantity} × £${item.price.toFixed(2)}`)
+  const items = Array.isArray(data.items) ? data.items : [];
+  const itemsList = items
+    .map((item) => `  - ${item?.name ?? 'Item'}: ${item?.quantity ?? 1} × £${Number(item?.price ?? 0).toFixed(2)}`)
     .join('\n');
 
   return `Dear ${data.customerName},

@@ -3755,6 +3755,7 @@ router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
 
     // Send emails based on status change
     if (status === "ready") {
+      console.log(`[Order Status] Status set to ready for order ${order.id}, preparing ready-for-pickup email.`);
       try {
         // Get customer and business details
         const customerResult = await pool.query(
@@ -3766,7 +3767,7 @@ router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
         );
 
         const businessResult = await pool.query(
-          `SELECT b.business_name, b.opening_hours
+          `SELECT b.business_name
            FROM businesses b
            JOIN orders o ON b.id = o.business_id
            WHERE o.id = $1`,
@@ -3784,22 +3785,22 @@ router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
           if (!toEmail) {
             console.warn(`[Order Status] Cannot send ready-for-pickup email for order ${order.id}: customer has no email`);
           } else {
-            // Combine all items (products + services)
+            // Combine all items (products + services) with safe values so email render never throws
             const allItems = [
               ...itemsResult.rows.map((item: any) => ({
-                name: item.product_name,
-                quantity: item.quantity,
-                price: parseFloat(item.price),
+                name: String(item?.product_name ?? "Item"),
+                quantity: Number(item?.quantity) || 1,
+                price: Number(item?.price) || 0,
               })),
               ...serviceItemsResult.rows.map((item: any) => ({
-                name: item.service_name,
-                quantity: item.quantity,
-                price: parseFloat(item.price),
+                name: String(item?.service_name ?? "Item"),
+                quantity: Number(item?.quantity) || 1,
+                price: Number(item?.price) || 0,
               })),
             ];
 
-            const totalAmount = parseFloat(order.total);
-            const cashbackAmount = parseFloat(order.points_earned || "0");
+            const totalAmount = Number(order?.total) || 0;
+            const cashbackAmount = Number(order?.points_earned) || 0;
 
             const businessAddressResult = await pool.query(
               `SELECT business_address, postcode, city

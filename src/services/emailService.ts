@@ -130,7 +130,7 @@ export class EmailService {
       return this.sendEmailViaSMTP(options);
     }
 
-    console.warn('[EmailService] No email service configured. Skipping email send.');
+    console.error('[EmailService] No email service configured. Set RESEND_API_KEY or SMTP env vars. Skipping email send.');
     return false;
   }
 
@@ -250,12 +250,13 @@ export class EmailService {
     try {
       const html = await renderOrderReadyForPickupEmail(data);
       const text = renderOrderReadyForPickupEmailText(data);
-      return this.sendEmail({
+      const ok = await this.sendEmail({
         to,
         subject: `Your Localito Order is Ready for Pickup – ${data.orderId}`,
         html,
         text,
       });
+      return ok;
     } catch (error: any) {
       console.error('[EmailService] Failed to send order ready email:', error);
       return false;
