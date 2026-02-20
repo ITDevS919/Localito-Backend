@@ -2631,15 +2631,32 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
       }
     }
 
+    // Require pickup slot for every business that has product items
+    const productBusinessIds = new Set(cartResult.rows.map((r: any) => r.business_id));
+    const singleBusiness = productBusinessIds.size === 1 && cartServiceResult.rows.length === 0;
+    if (cartResult.rows.length > 0) {
+      for (const businessId of productBusinessIds) {
+        const hasSlot = businessBookings && typeof businessBookings === 'object' && businessBookings[businessId]?.date && businessBookings[businessId]?.time;
+        const hasLegacySlot = singleBusiness && bookingDate && bookingTime;
+        if (!hasSlot && !hasLegacySlot) {
+          const businessName = cartResult.rows.find((r: any) => r.business_id === businessId)?.business_name || 'this business';
+          return res.status(400).json({
+            success: false,
+            message: `Pickup date and time are required for products from ${businessName}`,
+          });
+        }
+      }
+    }
+
     // Validate cutoff rules for product orders (same-day pickup)
     if (cartResult.rows.length > 0) {
       const businessCutoffChecks = new Map<string, { allowed: boolean; reason?: string }>();
-      
+
       for (const item of cartResult.rows) {
         if (!businessCutoffChecks.has(item.business_id)) {
           const cutoffCheck = await availabilityService.isSameDayPickupAllowed(item.business_id);
           businessCutoffChecks.set(item.business_id, cutoffCheck);
-          
+
           if (!cutoffCheck.allowed) {
             return res.status(400).json({
               success: false,
@@ -2782,20 +2799,17 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
         ? (serviceItems[0]?.duration_minutes || null)
         : null;
 
-      // Get booking date/time for this business
+      // Get booking date/time for this business (services and/or product pickup)
       let businessBookingDate: string | null = null;
       let businessBookingTime: string | null = null;
-      
-      if (isServiceOrder) {
-        if (businessBookings && typeof businessBookings === 'object' && businessBookings[businessId]) {
-          // Use per-business booking
-          businessBookingDate = businessBookings[businessId].date;
-          businessBookingTime = businessBookings[businessId].time;
-        } else if (bookingDate && bookingTime) {
-          // Backward compatibility: use single booking
-          businessBookingDate = bookingDate;
-          businessBookingTime = bookingTime;
-        }
+
+      if (businessBookings && typeof businessBookings === 'object' && businessBookings[businessId]) {
+        businessBookingDate = businessBookings[businessId].date;
+        businessBookingTime = businessBookings[businessId].time;
+      } else if (bookingDate && bookingTime && totalBusinesses === 1) {
+        // Backward compatibility: single booking when one business only
+        businessBookingDate = bookingDate;
+        businessBookingTime = bookingTime;
       }
 
       // Create order with status 'awaiting_payment' - payment must be confirmed before finalizing
