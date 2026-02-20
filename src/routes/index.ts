@@ -2734,24 +2734,45 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
     );
     const totalBeforeDiscount = productsTotal + servicesTotal;
 
-    // Combine all businesses (products + services) for discount validation
+    // Combine all businesses (products + services)
     const allBusinessIdsForDiscount = new Set([
       ...Array.from(businessGroups.keys()),
       ...Array.from(serviceBusinessGroups.keys()),
     ]);
+    const allBusinessIdsArray = Array.from(allBusinessIdsForDiscount);
 
-    // Validate and apply discount code (scoped to businesses in cart)
-    let discountParticipatingBusinessIds: string[] | null = null; // null = site-wide (all get share)
+    // Per-business subtotals (for discount: only participating businesses get a share)
+    const businessSubtotals = new Map<string, number>();
+    for (const businessId of allBusinessIdsArray) {
+      const items = businessGroups.get(businessId) || [];
+      const serviceItems = serviceBusinessGroups.get(businessId) || [];
+      const pt = items.reduce((sum, item) => sum + parseFloat(item.price) * item.quantity, 0);
+      const st = serviceItems.reduce((sum, item) => sum + parseFloat(item.price) * item.quantity, 0);
+      businessSubtotals.set(businessId, pt + st);
+    }
+
+    // Validate discount code: use qualifying subtotal only (participating businesses' portion)
+    let discountParticipatingBusinessIds: string[] | null = null;
     if (discountCode) {
       try {
-        const validation = await rewardsService.validateDiscountCode(
-          discountCode,
-          totalBeforeDiscount,
-          Array.from(allBusinessIdsForDiscount)
-        );
-        if (validation.valid) {
-          discountAmount = validation.discount!.amount;
-          discountParticipatingBusinessIds = validation.participatingBusinessIds ?? null;
+        const participating = await rewardsService.getParticipatingBusinessIds(discountCode);
+        const qualifyingSubtotal =
+          participating === null
+            ? totalBeforeDiscount
+            : allBusinessIdsArray
+                .filter((id) => participating.includes(id))
+                .reduce((sum, id) => sum + (businessSubtotals.get(id) || 0), 0);
+
+        if (qualifyingSubtotal > 0) {
+          const validation = await rewardsService.validateDiscountCode(
+            discountCode,
+            qualifyingSubtotal,
+            allBusinessIdsArray
+          );
+          if (validation.valid) {
+            discountAmount = validation.discount!.amount;
+            discountParticipatingBusinessIds = validation.participatingBusinessIds ?? null;
+          }
         }
       } catch (err) {
         console.error('Discount code validation error:', err);
@@ -2783,7 +2804,10 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
       discountParticipatingBusinessIds === null
         ? Array.from(allBusinessIds)
         : Array.from(allBusinessIds).filter((id) => discountParticipatingBusinessIds!.includes(id));
-    const discountEligibleCount = discountEligibleBusinessIds.length;
+    const qualifyingSubtotalForSplit =
+      discountEligibleBusinessIds.length > 0
+        ? discountEligibleBusinessIds.reduce((sum, id) => sum + (businessSubtotals.get(id) || 0), 0)
+        : 0;
 
     // Create orders for each business
     const createdOrders = [];
@@ -2797,11 +2821,16 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
       const servicesTotal = serviceItems.reduce((sum, item) => sum + parseFloat(item.price) * item.quantity, 0);
       let total = productsTotal + servicesTotal;
 
-      // Discount only for businesses that participate in the code; split among eligible only
-      const getsDiscount = discountEligibleCount > 0 && discountEligibleBusinessIds.includes(businessId);
-      const businessDiscount = getsDiscount && discountAmount > 0
-        ? discountAmount / discountEligibleCount
-        : 0;
+      // Discount only for participating businesses; split proportionally by their share of qualifying subtotal
+      const getsDiscount = discountEligibleBusinessIds.includes(businessId);
+      const businessSubtotal = businessSubtotals.get(businessId) || 0;
+      const businessDiscount =
+        getsDiscount &&
+        discountAmount > 0 &&
+        qualifyingSubtotalForSplit > 0 &&
+        businessSubtotal > 0
+          ? (discountAmount * businessSubtotal) / qualifyingSubtotalForSplit
+          : 0;
       const businessPoints = totalBusinesses > 1
         ? (pointsRedeemed / totalBusinesses)
         : pointsRedeemed;
@@ -8307,20 +8336,41 @@ router.get("/user/points/transactions", isAuthenticated, async (req, res, next) 
   }
 });
 
-// Validate discount code (optionally scoped to businesses in cart)
+// Validate discount code (optionally scoped to businesses in cart).
+// If businessTotals is provided (map of businessId -> subtotal), discount is calculated only on the
+// sum of subtotals for businesses that participate in the code (so multi-vendor carts get correct amount).
 router.post("/discount-codes/validate", async (req, res, next) => {
   try {
-    const { code, orderTotal, businessIds } = req.body;
+    const { code, orderTotal, businessIds, businessTotals } = req.body;
 
     if (!code) {
       return res.status(400).json({ success: false, message: "Discount code is required" });
     }
 
-    const validation = await rewardsService.validateDiscountCode(
-      code,
-      orderTotal || 0,
-      Array.isArray(businessIds) ? businessIds : undefined
-    );
+    let totalToUse = orderTotal || 0;
+    const ids = Array.isArray(businessIds) ? businessIds : undefined;
+    const totals = businessTotals && typeof businessTotals === "object" && ids && ids.length > 0
+      ? businessTotals
+      : null;
+
+    if (totals) {
+      const participating = await rewardsService.getParticipatingBusinessIds(code);
+      const qualifyingSubtotal = participating === null
+        ? (Object.values(totals) as number[]).reduce((a, b) => a + Number(b), 0)
+        : ids!.filter((id: string) => participating.includes(id)).reduce(
+            (sum: number, id: string) => sum + (Number(totals[id]) || 0),
+            0
+          );
+      if (qualifyingSubtotal <= 0) {
+        return res.json({
+          success: false,
+          data: { valid: false, message: "This discount code is not valid for any business in your cart" },
+        });
+      }
+      totalToUse = qualifyingSubtotal;
+    }
+
+    const validation = await rewardsService.validateDiscountCode(code, totalToUse, ids);
     res.json({ success: validation.valid, data: validation });
   } catch (error) {
     next(error);
@@ -8437,6 +8487,127 @@ router.get("/admin/discount-codes", isAuthenticated, async (req, res, next) => {
     }));
 
     res.json({ success: true, data: rows });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Admin: Update discount code
+router.put("/admin/discount-codes/:id", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ success: false, message: "Only admins can update discount codes" });
+    }
+    const id = req.params.id;
+    const {
+      code,
+      description,
+      discountType,
+      discountValue,
+      minPurchaseAmount,
+      maxDiscountAmount,
+      usageLimit,
+      validUntil,
+      isActive,
+      participatingBusinessIds,
+    } = req.body;
+
+    const businessIds = Array.isArray(participatingBusinessIds)
+      ? participatingBusinessIds.filter((id: string) => typeof id === "string" && id)
+      : [];
+    if (businessIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Select at least one participating business for this discount code",
+      });
+    }
+
+    const client = await pool.connect();
+    try {
+      const existing = await client.query("SELECT id FROM discount_codes WHERE id = $1", [id]);
+      if (existing.rows.length === 0) {
+        return res.status(404).json({ success: false, message: "Discount code not found" });
+      }
+
+      await client.query(
+        `UPDATE discount_codes SET
+          code = $1, description = $2, discount_type = $3, discount_value = $4,
+          min_purchase_amount = $5, max_discount_amount = $6, usage_limit = $7,
+          valid_until = $8, is_active = $9, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $10`,
+        [
+          code.toUpperCase(),
+          description || null,
+          discountType,
+          discountValue,
+          minPurchaseAmount ?? 0,
+          maxDiscountAmount ?? null,
+          usageLimit ?? null,
+          validUntil ?? null,
+          isActive !== false,
+          id,
+        ]
+      );
+
+      await client.query("DELETE FROM discount_code_businesses WHERE discount_code_id = $1", [id]);
+      for (const businessId of businessIds) {
+        await client.query(
+          `INSERT INTO discount_code_businesses (discount_code_id, business_id) VALUES ($1, $2)
+           ON CONFLICT (discount_code_id, business_id) DO NOTHING`,
+          [id, businessId]
+        );
+      }
+
+      const result = await client.query(
+        `SELECT dc.*,
+          COALESCE(
+            (SELECT json_agg(dcb.business_id) FROM discount_code_businesses dcb WHERE dcb.discount_code_id = dc.id),
+            '[]'::json
+          ) as participating_business_ids
+         FROM discount_codes dc WHERE dc.id = $1`,
+        [id]
+      );
+      const row = result.rows[0];
+      if (row && row.participating_business_ids && !Array.isArray(row.participating_business_ids)) {
+        row.participating_business_ids = JSON.parse(row.participating_business_ids);
+      }
+      res.json({ success: true, data: row });
+    } finally {
+      client.release();
+    }
+  } catch (error: any) {
+    if (error.code === "23505") {
+      res.status(400).json({ success: false, message: "A discount code with this code already exists" });
+    } else {
+      next(error);
+    }
+  }
+});
+
+// Admin: Delete discount code (fails if code has been used on any order)
+router.delete("/admin/discount-codes/:id", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ success: false, message: "Only admins can delete discount codes" });
+    }
+    const id = req.params.id;
+
+    const used = await pool.query(
+      "SELECT 1 FROM order_discount_codes WHERE discount_code_id = $1 LIMIT 1",
+      [id]
+    );
+    if (used.rows.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Cannot delete: this discount code has already been used on orders",
+      });
+    }
+
+    await pool.query("DELETE FROM discount_code_businesses WHERE discount_code_id = $1", [id]);
+    await pool.query("DELETE FROM discount_codes WHERE id = $1", [id]);
+    res.json({ success: true, message: "Discount code deleted" });
   } catch (error) {
     next(error);
   }
