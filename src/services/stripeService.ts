@@ -2,6 +2,7 @@ import Stripe from "stripe";
 import { pool } from "../db/connection";
 import { rewardsService } from "./rewardsService";
 import { emailService } from "./emailService";
+import { createNotification } from "./notificationService";
 import { formatBookingDateTime } from "../utils/dateFormatting";
 
 /**
@@ -2023,6 +2024,38 @@ export class StripeService {
         console.log(`[Stripe] New order alert email sent to business for order ${orderId}`);
       } else {
         console.warn(`[Stripe] Business user not found for order ${orderId}, skipping business email`);
+      }
+
+      // App notifications: buyer + seller
+      try {
+        await createNotification(
+          orderDetails.user_id,
+          "customer",
+          "order_placed",
+          "Order placed successfully",
+          "Your order has been confirmed.",
+          { orderId, screen: "order" }
+        );
+        await createNotification(
+          orderDetails.business_user_id,
+          "business",
+          "new_order",
+          "New order received",
+          `New order #${String(orderId).slice(0, 8)}`,
+          { orderId, screen: "order" }
+        );
+        if (stockIssues.length > 0) {
+          await createNotification(
+            orderDetails.business_user_id,
+            "business",
+            "low_stock",
+            "Low stock alert",
+            `Order #${String(orderId).slice(0, 8)} had stock issues. Check your inventory.`,
+            { orderId, screen: "order" }
+          );
+        }
+      } catch (notifErr: any) {
+        console.warn(`[Stripe] App notification failed for order ${orderId}:`, notifErr?.message);
       }
     } catch (emailError: any) {
       // Log but don't fail - email is non-critical

@@ -1221,6 +1221,42 @@ export async function runMigrations() {
       END $$;
     `);
 
+    // App notifications: push tokens and notification records
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS user_push_tokens (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        token VARCHAR(512) NOT NULL,
+        platform VARCHAR(20) DEFAULT 'expo',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(token)
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_user_push_tokens_user_id ON user_push_tokens(user_id)
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role VARCHAR(20) NOT NULL DEFAULT 'customer',
+        type VARCHAR(80) NOT NULL,
+        title VARCHAR(255) NOT NULL,
+        body TEXT,
+        data JSONB DEFAULT '{}',
+        read_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_notifications_created_at ON notifications(created_at DESC)
+    `);
+
     console.log("Database migrations completed successfully");
   } catch (error) {
     console.error("Error running migrations:", error);

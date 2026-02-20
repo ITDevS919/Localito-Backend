@@ -19,6 +19,7 @@ import { rewardsService } from '../services/rewardsService';
 import { AvailabilityService } from '../services/availabilityService';
 import { emailService } from '../services/emailService';
 import { getAdminFirestore, listBuyerSellerRooms, getRoomMessages } from '../services/firebaseAdmin';
+import { createNotification, registerPushToken } from '../services/notificationService';
 
 // Create require function for ES modules
 const require = createRequire(import.meta.url);
@@ -1073,6 +1074,19 @@ router.post("/business/onboarding-complete", isAuthenticated, async (req, res, n
        WHERE user_id = $1`,
       [user.id]
     );
+
+    try {
+      await createNotification(
+        user.id,
+        "business",
+        "account_verified",
+        "Account verified",
+        "Your business account is set up and ready. You can start receiving orders.",
+        { screen: "dashboard" }
+      );
+    } catch (e: any) {
+      console.warn(`[Onboarding] App notification failed:`, e?.message);
+    }
 
     res.json({ success: true, message: "Onboarding marked as complete" });
   } catch (error) {
@@ -3444,6 +3458,16 @@ router.post("/orders/:id/cancel", isAuthenticated, async (req, res, next) => {
       [orderId]
     );
 
+    try {
+      await createNotification(user.id, "customer", "order_cancelled", "Order cancelled", "Your order has been cancelled.", { orderId, screen: "order" });
+      const biz = await pool.query(`SELECT user_id FROM businesses WHERE id = $1`, [order.business_id]);
+      if (biz.rows.length > 0) {
+        await createNotification(biz.rows[0].user_id, "business", "order_cancelled_business", "Order cancelled", `Order #${orderId.slice(0, 8)} was cancelled by the customer.`, { orderId, screen: "order" });
+      }
+    } catch (e: any) {
+      console.warn(`[Cancel Order] App notification failed:`, e?.message);
+    }
+
     // Expire Stripe session if exists (defensive – for abandoned checkouts)
     if (order.stripe_session_id) {
       try {
@@ -3652,6 +3676,183 @@ router.post("/orders/:id/retry-payment", isAuthenticated, async (req, res, next)
   }
 });
 
+// ---------- App notifications (push token + in-app list) ----------
+router.post("/notifications/push-token", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user) return res.status(401).json({ success: false, message: "Unauthorized" });
+    const { token, platform } = req.body;
+    if (!token || typeof token !== "string") {
+      return res.status(400).json({ success: false, message: "Token is required" });
+    }
+    await registerPushToken(user.id, token.trim(), platform || "expo");
+    res.json({ success: true, message: "Push token registered" });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/notifications", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user) return res.status(401).json({ success: false, message: "Unauthorized" });
+    const role = (req.query.role as string) || "customer";
+    const limit = Math.min(parseInt(String(req.query.limit || "20"), 10) || 20, 50);
+    const offset = parseInt(String(req.query.offset || "0"), 10) || 0;
+    const result = await pool.query(
+      `SELECT id, type, title, body, data, read_at, created_at
+       FROM notifications WHERE user_id = $1 AND role = $2
+       ORDER BY created_at DESC LIMIT $3 OFFSET $4`,
+      [user.id, role, limit, offset]
+    );
+    const countResult = await pool.query(
+      `SELECT COUNT(*) as total FROM notifications WHERE user_id = $1 AND role = $2`,
+      [user.id, role]
+    );
+    const unreadResult = await pool.query(
+      `SELECT COUNT(*) as unread FROM notifications WHERE user_id = $1 AND role = $2 AND read_at IS NULL`,
+      [user.id, role]
+    );
+    res.json({
+      success: true,
+      data: {
+        items: result.rows,
+        total: parseInt(countResult.rows[0]?.total || "0", 10),
+        unreadCount: parseInt(unreadResult.rows[0]?.unread || "0", 10),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/notifications/unread-count", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user) return res.status(401).json({ success: false, message: "Unauthorized" });
+    const role = (req.query.role as string) || "customer";
+    const result = await pool.query(
+      `SELECT COUNT(*) as count FROM notifications WHERE user_id = $1 AND role = $2 AND read_at IS NULL`,
+      [user.id, role]
+    );
+    res.json({ success: true, data: { count: parseInt(result.rows[0]?.count || "0", 10) } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.patch("/notifications/:id/read", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user) return res.status(401).json({ success: false, message: "Unauthorized" });
+    const result = await pool.query(
+      `UPDATE notifications SET read_at = CURRENT_TIMESTAMP WHERE id = $1 AND user_id = $2 RETURNING id`,
+      [req.params.id, user.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Notification not found" });
+    }
+    res.json({ success: true, data: { id: req.params.id } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post("/notifications/read-all", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user) return res.status(401).json({ success: false, message: "Unauthorized" });
+    const role = (req.query.role as string) || "customer";
+    await pool.query(
+      `UPDATE notifications SET read_at = CURRENT_TIMESTAMP WHERE user_id = $1 AND role = $2 AND read_at IS NULL`,
+      [user.id, role]
+    );
+    res.json({ success: true, message: "All marked as read" });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * Call this when a chat message is sent (e.g. from the app after writing to Firebase).
+ * Creates an in-app + push notification for the recipient.
+ * Body: { recipientUserId, recipientRole: "customer"|"business", roomId, senderName }
+ */
+router.post("/notifications/on-new-message", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user) return res.status(401).json({ success: false, message: "Unauthorized" });
+    const { recipientUserId, recipientRole, roomId, senderName } = req.body;
+    if (!recipientUserId || !recipientRole || !roomId) {
+      return res.status(400).json({
+        success: false,
+        message: "recipientUserId, recipientRole, and roomId are required",
+      });
+    }
+    if (!["customer", "business"].includes(recipientRole)) {
+      return res.status(400).json({ success: false, message: "recipientRole must be customer or business" });
+    }
+    const type = recipientRole === "customer" ? "new_message" : "new_message_business";
+    const title = "New message";
+    const body = senderName ? `${senderName}: New message` : "You have a new message";
+    await createNotification(
+      recipientUserId,
+      recipientRole as "customer" | "business",
+      type,
+      title,
+      body,
+      { roomId, screen: "messages" }
+    );
+    res.json({ success: true, message: "Notification sent" });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * Send abandoned-cart reminder notifications (and optionally emails).
+ * Intended to be called by a cron (e.g. daily). Users with cart items who haven't
+ * received this reminder in the last 24h get a notification.
+ */
+router.post("/notifications/send-abandoned-cart-reminders", async (req, res, next) => {
+  try {
+    const sent: string[] = [];
+    const now = new Date();
+    const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const usersWithCart = await pool.query(
+      `SELECT DISTINCT user_id FROM (
+        SELECT user_id FROM cart_items
+        UNION
+        SELECT user_id FROM cart_service_items
+      ) u
+      WHERE user_id NOT IN (
+        SELECT user_id FROM notifications
+        WHERE type = 'abandoned_cart_reminder' AND created_at > $1
+      )`,
+      [oneDayAgo]
+    );
+    for (const row of usersWithCart.rows) {
+      const userId = row.user_id;
+      try {
+        await createNotification(
+          userId,
+          "customer",
+          "abandoned_cart_reminder",
+          "Still thinking about it?",
+          "Your cart is waiting. Complete your order when you're ready.",
+          { screen: "cart" }
+        );
+        sent.push(userId);
+      } catch (e: any) {
+        console.warn(`[AbandonedCart] Failed for user ${userId}:`, e?.message);
+      }
+    }
+    res.json({ success: true, data: { sent: sent.length, userIds: sent } });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Update order status (business only)
 router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
   try {
@@ -3843,6 +4044,18 @@ router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
             } else {
               console.error(`[Order Status] Failed to send ready-for-pickup email for order ${order.id} (sendEmail returned false). Check RESEND_API_KEY / SMTP config.`);
             }
+            try {
+              await createNotification(
+                order.user_id,
+                "customer",
+                "order_ready_for_pickup",
+                "Order ready for pickup",
+                "Your order is ready for collection.",
+                { orderId: order.id, screen: "order" }
+              );
+            } catch (e: any) {
+              console.warn(`[Order Status] App notification failed:`, e?.message);
+            }
           }
         }
       } catch (emailError: any) {
@@ -3913,9 +4126,62 @@ router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
           );
           console.log(`[Order Status] Collection confirmation email sent for order ${order.id}`);
         }
+        // App notifications: buyer + seller
+        try {
+          await createNotification(
+            order.user_id,
+            "customer",
+            "order_completed",
+            "Order collected",
+            "Your order has been collected / completed.",
+            { orderId: order.id, screen: "order" }
+          );
+          const bizUser = await pool.query(
+            `SELECT user_id FROM businesses WHERE id = $1`,
+            [order.business_id]
+          );
+          if (bizUser.rows.length > 0) {
+            await createNotification(
+              bizUser.rows[0].user_id,
+              "business",
+              "order_completed_by_buyer",
+              "Order collected by buyer",
+              `Order #${String(order.id).slice(0, 8)} has been collected.`,
+              { orderId: order.id, screen: "order" }
+            );
+          }
+        } catch (e: any) {
+          console.warn(`[Order Status] App notification failed:`, e?.message);
+        }
       } catch (emailError: any) {
         console.error(`[Order Status] Failed to send collection confirmation email for order ${order.id}:`, emailError);
         // Don't fail the status update if email fails
+      }
+    }
+
+    if (status === "cancelled") {
+      try {
+        await createNotification(
+          order.user_id,
+          "customer",
+          "order_cancelled",
+          "Order cancelled",
+          "Your order has been cancelled.",
+          { orderId: order.id, screen: "order" }
+        );
+        const bizUser = await pool.query(`SELECT user_id FROM businesses WHERE id = $1`, [order.business_id]);
+        if (bizUser.rows.length > 0) {
+          await createNotification(
+            bizUser.rows[0].user_id,
+            "business",
+            "order_cancelled_business",
+            "Order cancelled",
+            `Order #${String(order.id).slice(0, 8)} was cancelled.`,
+            { orderId: order.id, screen: "order" }
+          );
+        }
+      } catch (e: any) {
+        console.warn(`[Order Status] App notification failed:`, e?.message);
       }
     }
 
