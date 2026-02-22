@@ -3843,16 +3843,26 @@ router.post("/notifications/on-new-message", isAuthenticated, async (req, res, n
     const type = recipientRole === "customer" ? "new_message" : "new_message_business";
     const title = "New message";
     const body = senderName ? `${senderName}: New message` : "You have a new message";
+    const data = { roomId, screen: "messages" };
+    // Log so we can confirm request reached server and diagnose push
+    const tokenCount = await pool.query(
+      "SELECT COUNT(*) as n FROM user_push_tokens WHERE user_id = $1 AND token IS NOT NULL AND token != ''",
+      [recipientUserId]
+    );
+    const n = parseInt(tokenCount.rows[0]?.n || "0", 10);
+    console.log("[Notifications] on-new-message:", { recipientUserId, recipientRole, type, roomId, pushTokens: n });
     await createNotification(
       recipientUserId,
       recipientRole as "customer" | "business",
       type,
       title,
       body,
-      { roomId, screen: "messages" }
+      data
     );
-    res.json({ success: true, message: "Notification sent" });
+    // Include pushTokens so logs/response show whether push was attempted (0 = in-app only, no device tokens)
+    res.json({ success: true, message: "Notification sent", pushTokens: n });
   } catch (error) {
+    console.error("[Notifications] on-new-message failed:", error);
     next(error);
   }
 });
