@@ -1,14 +1,19 @@
 import { pool } from "../db/connection";
 
+/**
+ * All notification types used by the app.
+ * Buyer: order_placed, order_ready_for_pickup, order_completed, order_cancelled, abandoned_cart_reminder, new_message.
+ * Business: new_order, order_completed_by_buyer, order_cancelled_business, new_message_business, low_stock, account_verified.
+ */
 export type NotificationType =
-  // Buyer
+  // Buyer (shopper)
   | "order_placed"
   | "order_ready_for_pickup"
   | "order_completed"
   | "order_cancelled"
   | "abandoned_cart_reminder"
   | "new_message"
-  // Business
+  // Business (seller)
   | "new_order"
   | "order_completed_by_buyer"
   | "order_cancelled_business"
@@ -62,7 +67,10 @@ export async function sendPushToUser(
     [userId]
   );
   const tokens = result.rows.map((r: { token: string }) => r.token).filter(Boolean);
-  if (tokens.length === 0) return;
+  if (tokens.length === 0) {
+    console.warn("[NotificationService] No push tokens for user:", userId);
+    return;
+  }
 
   const messages = tokens.map((token: string) => ({
     to: token,
@@ -79,14 +87,29 @@ export async function sendPushToUser(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(messages),
     });
+    const text = await res.text();
     if (!res.ok) {
-      const text = await res.text();
       console.error("[NotificationService] Expo push failed:", res.status, text);
       return;
     }
-    const json = await res.json();
-    if (json.data?.some((d: { status: string }) => d.status === "error")) {
-      console.warn("[NotificationService] Some push deliveries failed:", JSON.stringify(json.data));
+    let json: { data?: Array<{ status: string; message?: string; details?: unknown }> };
+    try {
+      json = JSON.parse(text);
+    } catch {
+      console.error("[NotificationService] Expo push response not JSON:", text.slice(0, 200));
+      return;
+    }
+    const data = json.data ?? [];
+    const hasError = data.some((d: { status: string }) => d.status === "error");
+    if (data.length > 0) {
+      data.forEach((d: { status: string; message?: string; details?: unknown }, i: number) => {
+        if (d.status === "error") {
+          console.warn("[NotificationService] Push ticket error:", d.message ?? "unknown", d.details ?? "");
+        }
+      });
+    }
+    if (!hasError && data.length > 0) {
+      console.log("[NotificationService] Push sent to Expo OK, tickets:", data.length);
     }
   } catch (err: unknown) {
     console.error("[NotificationService] Failed to send push:", err);
