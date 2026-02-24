@@ -12,6 +12,7 @@ import { isAuthenticated, getCurrentUser } from "../middleware/auth";
 import { z } from "zod";
 import bcrypt from "bcrypt";
 import { insertUserSchema, loginSchema, User } from "../../shared/schema";
+import verifyAppleToken from "verify-apple-id-token";
 // Using require to avoid TS module resolution issues in this runtime config
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 import { stripeService, COMMISSION_TIERS } from "../services/stripeService";
@@ -36,6 +37,21 @@ const toBaseCurrency = (amount: number, currency: string) => {
 
 const router = Router();
 
+
+// --------- Simple UGC content moderation helpers ----------
+const OBJECTIONABLE_WORDS = (process.env.OBJECTIONABLE_WORD_LIST || '')
+  .split(',')
+  .map((w) => w.trim().toLowerCase())
+  .filter(Boolean);
+
+function containsObjectionableContent(text: unknown): boolean {
+  if (!text || typeof text !== "string") return false;
+  const lower = text.toLowerCase();
+  for (const word of OBJECTIONABLE_WORDS) {
+    if (word && lower.includes(word)) return true;
+  }
+  return false;
+}
 
 // Health check endpoint
 router.get("/health", async (_req, res) => {
@@ -657,6 +673,140 @@ router.post("/auth/google/mobile", async (req, res, next) => {
   }
 });
 
+// Sign in with Apple for mobile (iOS)
+router.post("/auth/apple/mobile", async (req, res, next) => {
+  try {
+    console.log("[Apple Auth] Mobile login request received");
+    const { identityToken, email: emailFromClient, fullName, role, isLogin } = req.body;
+
+    if (!identityToken) {
+      return res.status(400).json({
+        success: false,
+        message: "identityToken is required",
+      });
+    }
+
+    const userRole: "customer" | "business" | "admin" =
+      role && ["customer", "business", "admin"].includes(role) ? role : "customer";
+
+    // Verify Apple ID token
+    const clientId =
+      process.env.APPLE_CLIENT_ID ||
+      process.env.APPLE_SERVICE_ID ||
+      process.env.APPLE_BUNDLE_ID ||
+      "com.localito.marketplace";
+
+    let claims: any;
+    try {
+      claims = await verifyAppleToken({
+        idToken: identityToken,
+        clientId,
+      });
+    } catch (err: any) {
+      console.error("[Apple Auth] Token verification error:", err);
+      return res.status(401).json({
+        success: false,
+        message: "Invalid Apple identity token. Token verification failed.",
+      });
+    }
+
+    const appleId = claims.sub as string;
+    const emailFromToken = (claims.email as string | undefined) || null;
+    const email = emailFromToken || emailFromClient || null;
+
+    if (!appleId) {
+      return res.status(401).json({ success: false, message: "Invalid Apple token payload" });
+    }
+
+    // Derive display name from client-provided fullName or email
+    const displayName: string | null =
+      (typeof fullName === "string" && fullName.trim().length > 0
+        ? fullName
+        : email
+        ? email.split("@")[0]
+        : "Apple User") || null;
+
+    // 1) Check if user exists by Apple ID
+    let user = await storage.getUserByAppleId(appleId);
+    if (user) {
+      req.login(user, (err) => {
+        if (err) return next(err);
+        const { password: _, ...publicUser } = user as any;
+        return res.json({
+          success: true,
+          message: "Login successful",
+          data: publicUser,
+        });
+      });
+      return;
+    }
+
+    // 2) Link to existing account by email if possible
+    if (email) {
+      user = await storage.getUserByEmail(email);
+      if (user) {
+        await storage.updateUserAppleId(user.id, appleId);
+        req.login(user, (err) => {
+          if (err) return next(err);
+          const { password: _, ...publicUser } = user as any;
+          return res.json({
+            success: true,
+            message: "Login successful",
+            data: publicUser,
+          });
+        });
+        return;
+      }
+    }
+
+    // 3) For login flows, do not auto-create business/admin accounts
+    if (isLogin === true && (userRole === "business" || userRole === "admin")) {
+      return res.status(404).json({
+        success: false,
+        message: "Account not found. Please sign up first.",
+      });
+    }
+
+    // 4) Create new user from Apple profile (email may be null if user hid email)
+    user = await storage.createUserFromApple(appleId, email, displayName, userRole);
+
+    const frontendUrlMobile = process.env.FRONTEND_URL || "http://localhost:5173";
+    if (user.role === "customer") {
+      emailService
+        .sendWelcomeVerificationEmail(user.email, {
+          userName: user.username,
+          verificationLink: `${frontendUrlMobile}/`,
+        })
+        .catch((e) => console.error("[Apple Auth Mobile] Welcome email failed:", e));
+    } else if (user.role === "business") {
+      pool
+        .query("SELECT business_name FROM businesses WHERE user_id = $1", [user.id])
+        .then((result) => {
+          const businessName = result.rows[0]?.business_name || user.username;
+          return emailService.sendBusinessWelcomeEmail(user.email, {
+            businessOwnerName: user.username,
+            businessName,
+            verificationLink: `${frontendUrlMobile}/`,
+            dashboardLink: `${frontendUrlMobile}/business/dashboard`,
+          });
+        })
+        .catch((e) => console.error("[Apple Auth Mobile] Business welcome email failed:", e));
+    }
+
+    req.login(user, (err) => {
+      if (err) return next(err);
+      const { password: _, ...publicUser } = user as any;
+      return res.json({
+        success: true,
+        message: "Account created and logged in successfully",
+        data: publicUser,
+      });
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Get current user
 router.get("/auth/me", isAuthenticated, (req, res) => {
   const user = getCurrentUser(req);
@@ -672,6 +822,69 @@ router.get("/auth/me", isAuthenticated, (req, res) => {
     success: true,
     data: publicUser,
   });
+});
+
+// Delete current user's account (customer or business)
+router.delete("/account", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Not authenticated",
+      });
+    }
+
+    if (user.role === "admin") {
+      return res.status(403).json({
+        success: false,
+        message: "Admin accounts cannot be deleted via the mobile app.",
+      });
+    }
+
+    const userId = user.id;
+
+    // Clean up dependent records similar to the admin delete flow
+    const cartCountResult = await pool.query(
+      `SELECT COUNT(*) as count FROM cart WHERE user_id = $1`,
+      [userId]
+    );
+    const cartCount = parseInt(cartCountResult.rows[0].count);
+
+    const wishlistCountResult = await pool.query(
+      `SELECT COUNT(*) as count FROM wishlist WHERE user_id = $1`,
+      [userId]
+    );
+    const wishlistCount = parseInt(wishlistCountResult.rows[0].count);
+
+    const ordersCountResult = await pool.query(
+      `SELECT COUNT(*) as count FROM orders WHERE user_id = $1`,
+      [userId]
+    );
+    const ordersCount = parseInt(ordersCountResult.rows[0].count);
+
+    await pool.query(`DELETE FROM cart WHERE user_id = $1`, [userId]);
+    await pool.query(`DELETE FROM wishlist WHERE user_id = $1`, [userId]);
+
+    await pool.query(`DELETE FROM users WHERE id = $1`, [userId]);
+
+    req.logout?.(() => undefined);
+
+    res.json({
+      success: true,
+      message: "Account deleted successfully",
+      data: {
+        deletedUserId: userId,
+        deletedRecords: {
+          cartItems: cartCount,
+          wishlistItems: wishlistCount,
+          orders: ordersCount,
+        },
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 // Products routes
@@ -4658,6 +4871,13 @@ router.post("/products/:id/reviews", isAuthenticated, async (req, res, next) => 
       });
     }
 
+    if (comment && containsObjectionableContent(comment)) {
+      return res.status(400).json({
+        success: false,
+        message: "Review comment contains language that violates our content guidelines.",
+      });
+    }
+
     // Check if product exists
     const productResult = await pool.query("SELECT id FROM products WHERE id = $1", [req.params.id]);
     if (productResult.rows.length === 0) {
@@ -4764,6 +4984,13 @@ router.post("/services/:id/reviews", isAuthenticated, async (req, res, next) => 
       });
     }
 
+    if (comment && containsObjectionableContent(comment)) {
+      return res.status(400).json({
+        success: false,
+        message: "Review comment contains language that violates our content guidelines.",
+      });
+    }
+
     // Check if service exists
     const serviceResult = await pool.query("SELECT id FROM services WHERE id = $1", [req.params.id]);
     if (serviceResult.rows.length === 0) {
@@ -4813,6 +5040,99 @@ router.post("/services/:id/reviews", isAuthenticated, async (req, res, next) => 
     );
 
     res.json({ success: true, message: "Review submitted successfully" });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --------- User-generated content moderation: reports and blocks ---------
+
+router.post("/content/report", isAuthenticated, async (req, res, next) => {
+  try {
+    const reporter = getCurrentUser(req);
+    if (!reporter) {
+      return res.status(401).json({ success: false, message: "Not authenticated" });
+    }
+
+    const { reportedUserId, contentType, contentId, contentSnapshot, reason } = req.body;
+
+    if (!reportedUserId || !contentType || !contentId) {
+      return res.status(400).json({
+        success: false,
+        message: "reportedUserId, contentType, and contentId are required",
+      });
+    }
+
+    await pool.query(
+      `INSERT INTO user_content_reports 
+       (reporter_user_id, reported_user_id, content_type, content_id, content_snapshot, reason, status)
+       VALUES ($1, $2, $3, $4, $5, $6, 'open')`,
+      [
+        reporter.id,
+        reportedUserId,
+        contentType,
+        contentId,
+        contentSnapshot || null,
+        reason || null,
+      ]
+    );
+
+    console.log("[UGC] Content reported:", {
+      reporterId: reporter.id,
+      reportedUserId,
+      contentType,
+      contentId,
+    });
+
+    res.json({
+      success: true,
+      message: "Report submitted. Our team will review the content within 24 hours.",
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Block a user (hide their future content and notify backend)
+router.post("/users/:id/block", isAuthenticated, async (req, res, next) => {
+  try {
+    const currentUser = getCurrentUser(req);
+    if (!currentUser) {
+      return res.status(401).json({ success: false, message: "Not authenticated" });
+    }
+
+    const blockedUserId = req.params.id;
+    const { reason } = req.body || {};
+
+    if (!blockedUserId || blockedUserId === currentUser.id) {
+      return res.status(400).json({
+        success: false,
+        message: "Cannot block this user.",
+      });
+    }
+
+    await pool.query(
+      `INSERT INTO user_blocks (user_id, blocked_user_id)
+       VALUES ($1, $2)
+       ON CONFLICT (user_id, blocked_user_id) DO NOTHING`,
+      [currentUser.id, blockedUserId]
+    );
+
+    if (reason) {
+      await pool.query(
+        `INSERT INTO user_content_reports 
+         (reporter_user_id, reported_user_id, content_type, content_id, content_snapshot, reason, status)
+         VALUES ($1, $2, 'user', $2, NULL, $3, 'open')`,
+        [currentUser.id, blockedUserId, reason]
+      );
+    }
+
+    console.log("[UGC] User blocked:", { userId: currentUser.id, blockedUserId });
+
+    res.json({
+      success: true,
+      message: "User blocked successfully. Their content will no longer appear in your feed.",
+    });
   } catch (error) {
     next(error);
   }

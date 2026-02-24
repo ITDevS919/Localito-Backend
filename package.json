@@ -43,6 +43,7 @@
     "resend": "^6.8.0",
     "square": "^43.2.1",
     "stripe": "^20.1.0",
+    "verify-apple-id-token": "^3.1.2",
     "ws": "^8.18.0",
     "zod": "^3.25.76",
     "zod-validation-error": "^3.4.0"

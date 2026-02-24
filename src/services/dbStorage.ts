@@ -309,5 +309,83 @@ export class DbStorage {
       createdAt: row.created_at,
     };
   }
+
+  async getUserByAppleId(appleId: string): Promise<User | undefined> {
+    const result = await pool.query(
+      "SELECT id, username, email, password, role, created_at FROM users WHERE apple_id = $1",
+      [appleId]
+    );
+    if (result.rows.length === 0) return undefined;
+    const row = result.rows[0];
+    return {
+      id: row.id,
+      username: row.username,
+      email: row.email,
+      password: row.password,
+      role: row.role,
+      createdAt: row.created_at,
+    };
+  }
+
+  async updateUserAppleId(userId: string, appleId: string): Promise<void> {
+    await pool.query("UPDATE users SET apple_id = $1 WHERE id = $2", [appleId, userId]);
+  }
+
+  async createUserFromApple(
+    appleId: string,
+    email: string | null,
+    displayName: string | null,
+    role: string = "customer"
+  ): Promise<User> {
+    const safeEmail = email || `${appleId}@private.appleid.local`;
+
+    const normalizedDisplayName = displayName?.trim().replace(/\s+/g, " ");
+    let baseUsername =
+      normalizedDisplayName && normalizedDisplayName.length >= 3
+        ? normalizedDisplayName
+        : safeEmail.split("@")[0] || `user_${Date.now()}`;
+
+    let uniqueUsername = baseUsername;
+    let counter = 1;
+    while (await this.getUserByUsername(uniqueUsername)) {
+      uniqueUsername = `${baseUsername} ${counter}`;
+      counter++;
+    }
+
+    // If an account already exists with this email, link Apple ID to it
+    const existingByEmail = await this.getUserByEmail(safeEmail);
+    if (existingByEmail) {
+      await this.updateUserAppleId(existingByEmail.id, appleId);
+      return existingByEmail;
+    }
+
+    const hashedPassword = await bcrypt.hash(`oauth_${Date.now()}`, 10);
+    const result = await pool.query(
+      `INSERT INTO users (username, email, password, role, apple_id)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, username, email, password, role, created_at`,
+      [uniqueUsername, safeEmail, hashedPassword, role, appleId]
+    );
+
+    const row = result.rows[0];
+
+    // If user is a business, create minimal business record
+    if (row.role === "business") {
+      await pool.query(
+        `INSERT INTO businesses (user_id, business_name, is_approved)
+         VALUES ($1, $2, $3)`,
+        [row.id, displayName || "Business Name Pending", false]
+      );
+    }
+
+    return {
+      id: row.id,
+      username: row.username,
+      email: row.email,
+      password: row.password,
+      role: row.role,
+      createdAt: row.created_at,
+    };
+  }
 }
 

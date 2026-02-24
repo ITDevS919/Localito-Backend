@@ -39,6 +39,17 @@ export async function runMigrations() {
       END $$;
     `);
 
+    // Add apple_id column if it doesn't exist (for Sign in with Apple)
+    await client.query(`
+      DO $$ 
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='users' AND column_name='apple_id') THEN
+          ALTER TABLE users ADD COLUMN apple_id VARCHAR(255) UNIQUE;
+        END IF;
+      END $$;
+    `);
+
     // Create businesses table
     await client.query(`
       CREATE TABLE IF NOT EXISTS businesses (
@@ -1267,6 +1278,41 @@ export async function runMigrations() {
     `);
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_notifications_created_at ON notifications(created_at DESC)
+    `);
+
+    // User-generated content moderation: reports and blocks
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS user_content_reports (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        reporter_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        reported_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        content_type VARCHAR(50) NOT NULL,
+        content_id VARCHAR(255) NOT NULL,
+        content_snapshot TEXT,
+        reason TEXT,
+        status VARCHAR(20) NOT NULL DEFAULT 'open',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        handled_at TIMESTAMP
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_content_reports_reporter ON user_content_reports(reporter_user_id)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_content_reports_reported ON user_content_reports(reported_user_id)
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS user_blocks (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        blocked_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, blocked_user_id)
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_user_blocks_user_id ON user_blocks(user_id)
     `);
 
     console.log("Database migrations completed successfully");
