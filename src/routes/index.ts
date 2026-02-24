@@ -697,12 +697,76 @@ router.post("/auth/apple/mobile", async (req, res, next) => {
 
     let claims: any;
     try {
+      // ---- Diagnostics for "Invalid Apple identity token" ----
+      // We intentionally do NOT log the full token (sensitive). We only log safe claims + header info.
+      console.log("[Apple Auth] Env:", {
+        APPLE_BUNDLE_ID: process.env.APPLE_BUNDLE_ID,
+        // These are intentionally ignored for the mobile route, but log them to detect misconfiguration.
+        APPLE_CLIENT_ID: process.env.APPLE_CLIENT_ID,
+        APPLE_SERVICE_ID: process.env.APPLE_SERVICE_ID,
+      });
+      console.log("[Apple Auth] Using clientId (expected aud):", clientId);
+
+      try {
+        const parts = String(identityToken).split(".");
+        const base64UrlDecodeJson = (b64url: string) => {
+          const padded = b64url.padEnd(b64url.length + ((4 - (b64url.length % 4)) % 4), "=");
+          const b64 = padded.replace(/-/g, "+").replace(/_/g, "/");
+          return JSON.parse(Buffer.from(b64, "base64").toString("utf8"));
+        };
+
+        if (parts.length >= 2) {
+          const header = base64UrlDecodeJson(parts[0]);
+          const payload = base64UrlDecodeJson(parts[1]);
+          const now = Math.floor(Date.now() / 1000);
+
+          console.log("[Apple Auth] Token header:", {
+            kid: header?.kid,
+            alg: header?.alg,
+            typ: header?.typ,
+          });
+          console.log("[Apple Auth] Token payload (safe):", {
+            iss: payload?.iss,
+            aud: payload?.aud,
+            sub: payload?.sub,
+            exp: payload?.exp,
+            iat: payload?.iat,
+            now,
+            secondsUntilExpiry:
+              typeof payload?.exp === "number" ? payload.exp - now : null,
+            email: payload?.email,
+            email_verified: payload?.email_verified,
+            is_private_email: payload?.is_private_email,
+            nonce_supported: payload?.nonce_supported,
+          });
+        } else {
+          console.warn("[Apple Auth] identityToken is not a JWT (unexpected format)");
+        }
+      } catch (decodeErr: any) {
+        console.warn("[Apple Auth] Failed to decode identityToken for diagnostics:", {
+          message: decodeErr?.message,
+          name: decodeErr?.name,
+        });
+      }
+
       claims = await verifyAppleToken({
         idToken: identityToken,
         clientId,
       });
+      console.log("[Apple Auth] verifyAppleToken ok:", {
+        iss: claims?.iss,
+        aud: claims?.aud,
+        sub: claims?.sub,
+        exp: claims?.exp,
+        email: claims?.email,
+      });
     } catch (err: any) {
-      console.error("[Apple Auth] Token verification error:", err);
+      console.error("[Apple Auth] Token verification error:", {
+        message: err?.message,
+        name: err?.name,
+        code: err?.code,
+        stack: err?.stack,
+      });
       return res.status(401).json({
         success: false,
         message: "Invalid Apple identity token. Token verification failed.",
@@ -711,7 +775,7 @@ router.post("/auth/apple/mobile", async (req, res, next) => {
 
     const appleId = claims.sub as string;
     const emailFromToken = (claims.email as string | undefined) || null;
-    const email = emailFromToken || emailFromClient || null;
+    const email = emailFromToken || null;
 
     if (!appleId) {
       return res.status(401).json({ success: false, message: "Invalid Apple token payload" });
