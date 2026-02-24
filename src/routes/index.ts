@@ -689,12 +689,11 @@ router.post("/auth/apple/mobile", async (req, res, next) => {
     const userRole: "customer" | "business" | "admin" =
       role && ["customer", "business", "admin"].includes(role) ? role : "customer";
 
-    // Verify Apple ID token
-    const clientId =
-      process.env.APPLE_CLIENT_ID ||
-      process.env.APPLE_SERVICE_ID ||
-      process.env.APPLE_BUNDLE_ID ||
-      "com.localito.marketplace";
+    // Verify Apple ID token.
+    // For the native iOS app we always use the iOS bundle identifier as the clientId/audience.
+    // Web/service IDs (APPLE_CLIENT_ID / APPLE_SERVICE_ID) are not used here so that
+    // mobile Sign in with Apple is independent from any web Apple configuration.
+    const clientId = process.env.APPLE_BUNDLE_ID || "com.localito.marketplace";
 
     let claims: any;
     try {
