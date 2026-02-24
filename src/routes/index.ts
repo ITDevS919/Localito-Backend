@@ -749,6 +749,7 @@ router.post("/auth/apple/mobile", async (req, res, next) => {
         });
       }
 
+      // `verify-apple-id-token` is CommonJS and exposes the verifier as `default`
       claims = await verifyAppleIdToken({
         idToken: identityToken,
         clientId,
