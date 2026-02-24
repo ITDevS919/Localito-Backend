@@ -12,7 +12,7 @@ import { isAuthenticated, getCurrentUser } from "../middleware/auth";
 import { z } from "zod";
 import bcrypt from "bcrypt";
 import { insertUserSchema, loginSchema, User } from "../../shared/schema";
-import * as verifyAppleToken from "verify-apple-id-token";
+import * as verifyAppleIdToken from "verify-apple-id-token";
 // Using require to avoid TS module resolution issues in this runtime config
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 import { stripeService, COMMISSION_TIERS } from "../services/stripeService";
@@ -749,7 +749,7 @@ router.post("/auth/apple/mobile", async (req, res, next) => {
         });
       }
 
-      claims = await verifyAppleToken({
+      claims = await verifyAppleIdToken({
         idToken: identityToken,
         clientId,
       });
