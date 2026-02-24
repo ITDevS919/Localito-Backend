@@ -12,7 +12,8 @@ import { isAuthenticated, getCurrentUser } from "../middleware/auth";
 import { z } from "zod";
 import bcrypt from "bcrypt";
 import { insertUserSchema, loginSchema, User } from "../../shared/schema";
-import verifyAppleIdToken from "verify-apple-id-token";
+import verifyAppleIdTokenPkg from "verify-apple-id-token";
+
 // Using require to avoid TS module resolution issues in this runtime config
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 import { stripeService, COMMISSION_TIERS } from "../services/stripeService";
@@ -21,6 +22,10 @@ import { AvailabilityService } from '../services/availabilityService';
 import { emailService } from '../services/emailService';
 import { getAdminFirestore, listBuyerSellerRooms, getRoomMessages } from '../services/firebaseAdmin';
 import { createNotification, registerPushToken } from '../services/notificationService';
+
+
+const verifyAppleIdToken =
+  (verifyAppleIdTokenPkg as any).default || verifyAppleIdTokenPkg;
 
 // Create require function for ES modules
 const require = createRequire(import.meta.url);
