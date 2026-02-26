@@ -5191,8 +5191,8 @@ router.post("/users/:id/block", isAuthenticated, async (req, res, next) => {
       await pool.query(
         `INSERT INTO user_content_reports 
          (reporter_user_id, reported_user_id, content_type, content_id, content_snapshot, reason, status)
-         VALUES ($1, $2, 'user', $2, NULL, $3, 'open')`,
-        [currentUser.id, blockedUserId, reason]
+         VALUES ($1, $2, 'user', $3, NULL, $4, 'open')`,
+        [currentUser.id, blockedUserId, String(blockedUserId), reason]
       );
     }
 
