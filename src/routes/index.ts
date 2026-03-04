@@ -550,8 +550,8 @@ router.post("/auth/google/mobile", async (req, res, next) => {
      */
     const possibleAudiences = [
       process.env.GOOGLE_CLIENT_ID_MOBILE,
-      // process.env.GOOGLE_CLIENT_ID_ANDROID,
-      // process.env.GOOGLE_CLIENT_ID_IOS,
+      process.env.GOOGLE_CLIENT_ID_ANDROID,
+      process.env.GOOGLE_CLIENT_ID_IOS,
     ].filter(Boolean);
 
     if (!possibleAudiences.length) {
