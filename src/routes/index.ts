@@ -518,74 +518,82 @@ router.get("/auth/google/callback",
   }
 );
 
-// Google OAuth for mobile (accepts ID token)
+// Google OAuth for mobile (accepts access token or ID token)
 // Uses Expo AuthSession with platform-specific Client IDs
-// Frontend sends ID token directly from response.authentication.idToken
+// Frontend sends accessToken from response.authentication.accessToken
 router.post("/auth/google/mobile", async (req, res, next) => {
   try {
     console.log("[Google Auth] Mobile login request received");
-    const { idToken, role, isLogin } = req.body;
-    
-    if (!idToken) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "ID token is required" 
-      });
-    }
+    const { accessToken, idToken, role, isLogin } = req.body;
 
     const userRole = role || "customer";
 
-    // Verify Google ID token
-    const { OAuth2Client } = require('google-auth-library');
-    
-    /**
-     * IMPORTANT:
-     * On mobile we can get ID tokens issued for any of these client IDs:
-     * - GOOGLE_CLIENT_ID_MOBILE (Web client used by Expo AuthSession)
-     * - GOOGLE_CLIENT_ID_ANDROID (Android native client)
-     * - GOOGLE_CLIENT_ID_IOS (iOS native client)
-     *
-     * The "aud" claim in the ID token will match the client that issued it,
-     * so we must allow verification against ALL of them.
-     */
-    const possibleAudiences = [
-      process.env.GOOGLE_CLIENT_ID_MOBILE,
-      process.env.GOOGLE_CLIENT_ID_ANDROID,
-      process.env.GOOGLE_CLIENT_ID_IOS,
-    ].filter(Boolean);
+    let googleId: string;
+    let email: string;
+    let displayName: string;
 
-    if (!possibleAudiences.length) {
-      return res.status(500).json({ 
-        success: false, 
-        message: "Google Client ID not configured. Please set GOOGLE_CLIENT_ID_MOBILE / GOOGLE_CLIENT_ID_ANDROID / GOOGLE_CLIENT_ID_IOS." 
+    if (accessToken) {
+      // Verify via Google userinfo API
+      const userinfoRes = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      if (!userinfoRes.ok) {
+        console.error("[Google Auth] Userinfo error:", userinfoRes.status, await userinfoRes.text());
+        return res.status(401).json({
+          success: false,
+          message: "Invalid Google access token.",
+        });
+      }
+      const profile = (await userinfoRes.json()) as {
+        id: string;
+        email?: string;
+        name?: string;
+        given_name?: string;
+      };
+      googleId = profile.id;
+      email = profile.email ?? "";
+      displayName = profile.name || profile.given_name || "User";
+    } else if (idToken) {
+      // Verify Google ID token (legacy)
+      const { OAuth2Client } = require('google-auth-library');
+      const possibleAudiences = [
+        process.env.GOOGLE_CLIENT_ID_MOBILE,
+        process.env.GOOGLE_CLIENT_ID_ANDROID,
+        process.env.GOOGLE_CLIENT_ID_IOS,
+      ].filter(Boolean);
+      if (!possibleAudiences.length) {
+        return res.status(500).json({
+          success: false,
+          message: "Google Client ID not configured.",
+        });
+      }
+      let ticket;
+      try {
+        const client = new OAuth2Client(possibleAudiences[0]);
+        ticket = await client.verifyIdToken({
+          idToken,
+          audience: possibleAudiences,
+        });
+      } catch (error: any) {
+        console.error("[Google Auth] Token verification error:", error);
+        return res.status(401).json({
+          success: false,
+          message: "Invalid Google ID token.",
+        });
+      }
+      const payload = ticket.getPayload();
+      if (!payload) {
+        return res.status(401).json({ success: false, message: "Invalid token payload" });
+      }
+      googleId = payload.sub;
+      email = payload.email;
+      displayName = payload.name || payload.given_name || "User";
+    } else {
+      return res.status(400).json({
+        success: false,
+        message: "accessToken or idToken is required",
       });
     }
-
-    // Verify ID token using google-auth-library
-    let ticket;
-    try {
-      const client = new OAuth2Client(possibleAudiences[0]);
-      ticket = await client.verifyIdToken({
-        idToken,
-        // Accept any of the configured client IDs as a valid audience
-        audience: possibleAudiences,
-      });
-    } catch (error: any) {
-      console.error('[Google Auth] Token verification error:', error);
-      return res.status(401).json({ 
-        success: false, 
-        message: "Invalid Google ID token. Token verification failed." 
-      });
-    }
-
-    const payload = ticket.getPayload();
-    if (!payload) {
-      return res.status(401).json({ success: false, message: "Invalid token payload" });
-    }
-
-    const googleId = payload.sub;
-    const email = payload.email;
-    const displayName = payload.name || payload.given_name || "User";
 
     if (!email) {
       return res.status(400).json({ success: false, message: "Email is required for Google authentication" });
