@@ -554,12 +554,11 @@ router.post("/auth/google/mobile", async (req, res, next) => {
       email = profile.email ?? "";
       displayName = profile.name || profile.given_name || "User";
     } else if (idToken) {
-      // Verify Google ID token (legacy)
       const { OAuth2Client } = require('google-auth-library');
       const possibleAudiences = [
-        process.env.GOOGLE_CLIENT_ID_MOBILE,
         process.env.GOOGLE_CLIENT_ID_ANDROID,
         process.env.GOOGLE_CLIENT_ID_IOS,
+        process.env.GOOGLE_CLIENT_ID_MOBILE,
       ].filter(Boolean);
       if (!possibleAudiences.length) {
         return res.status(500).json({
@@ -569,7 +568,7 @@ router.post("/auth/google/mobile", async (req, res, next) => {
       }
       let ticket;
       try {
-        const client = new OAuth2Client(possibleAudiences[0]);
+        const client = new OAuth2Client();
         ticket = await client.verifyIdToken({
           idToken,
           audience: possibleAudiences,
