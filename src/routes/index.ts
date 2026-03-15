@@ -8,12 +8,11 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import { createRequire } from "module";
 import { storage } from "../services/storage";
+import { issueToken } from "../authToken";
 import { isAuthenticated, getCurrentUser } from "../middleware/auth";
 import { z } from "zod";
 import bcrypt from "bcrypt";
 import { insertUserSchema, loginSchema, User } from "../../shared/schema";
-import verifyAppleIdTokenPkg from "verify-apple-id-token";
-
 // Using require to avoid TS module resolution issues in this runtime config
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 import { stripeService, COMMISSION_TIERS } from "../services/stripeService";
@@ -21,11 +20,16 @@ import { rewardsService } from '../services/rewardsService';
 import { AvailabilityService } from '../services/availabilityService';
 import { emailService } from '../services/emailService';
 import { getAdminFirestore, listBuyerSellerRooms, getRoomMessages } from '../services/firebaseAdmin';
-import { createNotification, registerPushToken } from '../services/notificationService';
-
-
-const verifyAppleIdToken =
-  (verifyAppleIdTokenPkg as any).default || verifyAppleIdTokenPkg;
+import { getCachedList, setCachedList } from "../middleware/listCache";
+import { resizeBase64 } from "../services/thumbnailService";
+import {
+  getManagedVariantPath,
+  isManagedLocalImagePath,
+  migrateExistingUploadToManaged,
+  saveManagedImageBuffer,
+  saveManagedImageDataUrl,
+  toAbsoluteImageUrl,
+} from "../services/imageVariantService";
 
 // Create require function for ES modules
 const require = createRequire(import.meta.url);
@@ -42,21 +46,6 @@ const toBaseCurrency = (amount: number, currency: string) => {
 
 const router = Router();
 
-
-// --------- Simple UGC content moderation helpers ----------
-const OBJECTIONABLE_WORDS = (process.env.OBJECTIONABLE_WORD_LIST || '')
-  .split(',')
-  .map((w) => w.trim().toLowerCase())
-  .filter(Boolean);
-
-function containsObjectionableContent(text: unknown): boolean {
-  if (!text || typeof text !== "string") return false;
-  const lower = text.toLowerCase();
-  for (const word of OBJECTIONABLE_WORDS) {
-    if (word && lower.includes(word)) return true;
-  }
-  return false;
-}
 
 // Health check endpoint
 router.get("/health", async (_req, res) => {
@@ -191,12 +180,11 @@ router.post("/auth/signup", async (req, res, next) => {
       if (err) {
         return next(err);
       }
-      
-      // Return user without password
       const { password: _, ...publicUser } = user;
+      const isMobile = req.get("X-Platform") === "mobile";
       res.status(201).json({
         success: true,
-        data: publicUser,
+        data: isMobile ? { ...publicUser, token: issueToken(user.id) } : publicUser,
       });
     });
   } catch (error: any) {
@@ -210,7 +198,7 @@ router.post("/auth/signup", async (req, res, next) => {
   }
 });
 
-// Login (customer / business)
+// Login
 router.post("/auth/login", (req, res, next) => {
   // Validate input
   const validationResult = loginSchema.safeParse(req.body);
@@ -222,24 +210,9 @@ router.post("/auth/login", (req, res, next) => {
     });
   }
 
-  const { role: requestedRole } = validationResult.data;
-
   passport.authenticate("local", (err: any, user: User, info: any) => {
     if (err) {
       return next(err);
-    }
-
-    // If a specific role was requested (e.g. customer vs business), enforce it
-    if (requestedRole && user.role !== requestedRole) {
-      return res.status(403).json({
-        success: false,
-        message:
-          requestedRole === "customer"
-            ? "Access denied. This login form is for customers only."
-            : requestedRole === "business"
-            ? "Access denied. This login form is for businesses only."
-            : "Access denied for this login form.",
-      });
     }
     if (!user) {
       return res.status(401).json({
@@ -251,11 +224,12 @@ router.post("/auth/login", (req, res, next) => {
       if (err) {
         return next(err);
       }
-      // Return user without password
+      // Return user without password; include token for mobile (no cookie persistence)
       const { password: _, ...publicUser } = user;
+      const isMobile = req.get("X-Platform") === "mobile";
       res.json({
         success: true,
-        data: publicUser,
+        data: isMobile ? { ...publicUser, token: issueToken(user.id) } : publicUser,
       });
     });
   })(req, res, next);
@@ -429,16 +403,21 @@ router.get("/auth/google", (req, res, next) => {
 });
 
 router.get("/auth/google/callback",
-  passport.authenticate("google", { 
-    failureRedirect: `${process.env.FRONTEND_URL || "http://localhost:5173"}/login/customer?error=google_auth_failed` 
-  }),
+  (req, res, next) => {
+    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+    const failureUrl = `${frontendUrl}/login/customer?error=google_auth_failed`;
+    passport.authenticate("google", (err: any, user: any, _info: any) => {
+      if (err || !user) return res.redirect(failureUrl);
+      (req as any).user = user;
+      next();
+    })(req, res, next);
+  },
   async (req, res) => {
     try {
       // Get user from request (set by passport.authenticate)
       const user = req.user as any;
       
       if (!user) {
-        console.error("[Google Auth] No user found after authentication");
         const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
         return res.redirect(`${frontendUrl}/login/customer?error=google_auth_failed`);
       }
@@ -454,7 +433,7 @@ router.get("/auth/google/callback",
           emailService.sendWelcomeVerificationEmail(user.email, {
             userName: user.username,
             verificationLink: `${frontendUrl}/`,
-          }).catch((e) => console.error("[Google Auth] Welcome email failed:", e));
+          }).catch(() => {});
         } else if (user.role === "business") {
           pool.query("SELECT business_name FROM businesses WHERE user_id = $1", [user.id])
             .then((result) => {
@@ -466,26 +445,18 @@ router.get("/auth/google/callback",
                 dashboardLink: `${frontendUrl}/business/dashboard`,
               });
             })
-            .catch((e) => console.error("[Google Auth] Business welcome email failed:", e));
+            .catch(() => {});
         }
       }
 
       // Explicitly save session to ensure cookie is set
       req.session.save((err) => {
         if (err) {
-          console.error("[Google Auth] Session save error:", err);
           const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
           return res.redirect(`${frontendUrl}/login/customer?error=session_error`);
         }
 
-        // Redirect based on user role
         const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
-        
-        console.log(`[Google Auth] Successful authentication for user ${user.id} with role ${user.role}`);
-        console.log(`[Google Auth] Session ID: ${req.sessionID}`);
-        console.log(`[Google Auth] Request origin: ${req.headers.origin}`);
-        console.log(`[Google Auth] Request host: ${req.headers.host}`);
-        
         if (user.role === "business") {
           // Check if business has completed onboarding
           pool.query(
@@ -499,100 +470,74 @@ router.get("/auth/google/callback",
               // New business or hasn't completed onboarding yet
               res.redirect(`${frontendUrl}/business/onboarding`);
             }
-          }).catch((err) => {
-            console.error("[Google Auth] Error checking onboarding status:", err);
-            // Fallback to onboarding if error
-            res.redirect(`${frontendUrl}/business/onboarding`);
-          });
+          }).catch(() => res.redirect(`${frontendUrl}/business/onboarding`));
         } else if (user.role === "admin") {
           res.redirect(`${frontendUrl}/admin/dashboard`);
         } else {
           res.redirect(`${frontendUrl}/`);
         }
       });
-    } catch (error: any) {
-      console.error("[Google Auth] Callback error:", error);
+    } catch {
       const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
       res.redirect(`${frontendUrl}/login/customer?error=google_auth_failed`);
     }
   }
 );
 
-// Google OAuth for mobile (accepts access token or ID token)
+// Google OAuth for mobile (accepts ID token)
 // Uses Expo AuthSession with platform-specific Client IDs
-// Frontend sends accessToken from response.authentication.accessToken
+// Frontend sends ID token directly from response.authentication.idToken
 router.post("/auth/google/mobile", async (req, res, next) => {
   try {
-    console.log("[Google Auth] Mobile login request received");
-    const { accessToken, idToken, role, isLogin } = req.body;
+    const { idToken, role } = req.body;
+    
+    if (!idToken) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "ID token is required" 
+      });
+    }
 
     const userRole = role || "customer";
 
-    let googleId: string;
-    let email: string;
-    let displayName: string;
-
-    if (accessToken) {
-      // Verify via Google userinfo API
-      const userinfoRes = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
-        headers: { Authorization: `Bearer ${accessToken}` },
-      });
-      if (!userinfoRes.ok) {
-        console.error("[Google Auth] Userinfo error:", userinfoRes.status, await userinfoRes.text());
-        return res.status(401).json({
-          success: false,
-          message: "Invalid Google access token.",
-        });
-      }
-      const profile = (await userinfoRes.json()) as {
-        id: string;
-        email?: string;
-        name?: string;
-        given_name?: string;
-      };
-      googleId = profile.id;
-      email = profile.email ?? "";
-      displayName = profile.name || profile.given_name || "User";
-    } else if (idToken) {
-      const { OAuth2Client } = require('google-auth-library');
-      const possibleAudiences = [
-        process.env.GOOGLE_CLIENT_ID_ANDROID,
-        process.env.GOOGLE_CLIENT_ID_IOS,
-        process.env.GOOGLE_CLIENT_ID_MOBILE,
-      ].filter(Boolean);
-      if (!possibleAudiences.length) {
-        return res.status(500).json({
-          success: false,
-          message: "Google Client ID not configured.",
-        });
-      }
-      let ticket;
-      try {
-        const client = new OAuth2Client();
-        ticket = await client.verifyIdToken({
-          idToken,
-          audience: possibleAudiences,
-        });
-      } catch (error: any) {
-        console.error("[Google Auth] Token verification error:", error);
-        return res.status(401).json({
-          success: false,
-          message: "Invalid Google ID token.",
-        });
-      }
-      const payload = ticket.getPayload();
-      if (!payload) {
-        return res.status(401).json({ success: false, message: "Invalid token payload" });
-      }
-      googleId = payload.sub;
-      email = payload.email;
-      displayName = payload.name || payload.given_name || "User";
-    } else {
-      return res.status(400).json({
-        success: false,
-        message: "accessToken or idToken is required",
+    // Verify Google ID token
+    const { OAuth2Client } = require('google-auth-library');
+    
+    // Use WEB Client ID for verification (works for all platforms with Expo AuthSession)
+    // The frontend uses webClientId, androidClientId, and iosClientId, but all generate
+    // ID tokens that can be verified with the Web Client ID
+    const clientId = process.env.GOOGLE_CLIENT_ID_MOBILE;
+    
+    if (!clientId) {
+      return res.status(500).json({ 
+        success: false, 
+        message: "Google Client ID not configured. Please set GOOGLE_CLIENT_ID_MOBILE or GOOGLE_CLIENT_ID." 
       });
     }
+
+    // Verify ID token using google-auth-library
+    let ticket;
+    try {
+      const client = new OAuth2Client(clientId);
+      ticket = await client.verifyIdToken({
+        idToken,
+        audience: clientId,
+      });
+    } catch {
+      return res.status(401).json({ 
+        success: false, 
+        message: "Invalid Google ID token. Token verification failed." 
+      });
+    }
+
+    const payload = ticket.getPayload();
+    if (!payload) {
+      return res.status(401).json({ success: false, message: "Invalid token payload" });
+    }
+
+    const googleId = payload.sub;
+    const email = payload.email;
+    const displayName = payload.name || payload.given_name || "User";
 
     if (!email) {
       return res.status(400).json({ success: false, message: "Email is required for Google authentication" });
@@ -611,7 +556,7 @@ router.post("/auth/google/mobile", async (req, res, next) => {
         return res.json({
           success: true,
           message: "Login successful",
-          data: publicUser,
+          data: { ...publicUser, token: issueToken(user.id) },
         });
       });
       return;
@@ -631,7 +576,7 @@ router.post("/auth/google/mobile", async (req, res, next) => {
         return res.json({
           success: true,
           message: "Login successful",
-          data: publicUser,
+          data: { ...publicUser, token: issueToken(user.id) },
         });
       });
       return;
@@ -677,205 +622,7 @@ router.post("/auth/google/mobile", async (req, res, next) => {
       return res.json({
         success: true,
         message: "Account created and logged in successfully",
-        data: publicUser,
-      });
-    });
-  } catch (error) {
-    next(error);
-  }
-});
-
-// Sign in with Apple for mobile (iOS)
-router.post("/auth/apple/mobile", async (req, res, next) => {
-  try {
-    console.log("[Apple Auth] Mobile login request received");
-    const { identityToken, email: emailFromClient, fullName, role, isLogin } = req.body;
-
-    if (!identityToken) {
-      return res.status(400).json({
-        success: false,
-        message: "identityToken is required",
-      });
-    }
-
-    const userRole: "customer" | "business" | "admin" =
-      role && ["customer", "business", "admin"].includes(role) ? role : "customer";
-
-    // Verify Apple ID token.
-    // For the native iOS app we always use the iOS bundle identifier as the clientId/audience.
-    // Web/service IDs (APPLE_CLIENT_ID / APPLE_SERVICE_ID) are not used here so that
-    // mobile Sign in with Apple is independent from any web Apple configuration.
-    const clientId = process.env.APPLE_BUNDLE_ID || "com.localito.marketplace";
-
-    let claims: any;
-    try {
-      // ---- Diagnostics for "Invalid Apple identity token" ----
-      // We intentionally do NOT log the full token (sensitive). We only log safe claims + header info.
-      console.log("[Apple Auth] Env:", {
-        APPLE_BUNDLE_ID: process.env.APPLE_BUNDLE_ID,
-        // These are intentionally ignored for the mobile route, but log them to detect misconfiguration.
-        APPLE_CLIENT_ID: process.env.APPLE_CLIENT_ID,
-        APPLE_SERVICE_ID: process.env.APPLE_SERVICE_ID,
-      });
-      console.log("[Apple Auth] Using clientId (expected aud):", clientId);
-
-      try {
-        const parts = String(identityToken).split(".");
-        const base64UrlDecodeJson = (b64url: string) => {
-          const padded = b64url.padEnd(b64url.length + ((4 - (b64url.length % 4)) % 4), "=");
-          const b64 = padded.replace(/-/g, "+").replace(/_/g, "/");
-          return JSON.parse(Buffer.from(b64, "base64").toString("utf8"));
-        };
-
-        if (parts.length >= 2) {
-          const header = base64UrlDecodeJson(parts[0]);
-          const payload = base64UrlDecodeJson(parts[1]);
-          const now = Math.floor(Date.now() / 1000);
-
-          console.log("[Apple Auth] Token header:", {
-            kid: header?.kid,
-            alg: header?.alg,
-            typ: header?.typ,
-          });
-          console.log("[Apple Auth] Token payload (safe):", {
-            iss: payload?.iss,
-            aud: payload?.aud,
-            sub: payload?.sub,
-            exp: payload?.exp,
-            iat: payload?.iat,
-            now,
-            secondsUntilExpiry:
-              typeof payload?.exp === "number" ? payload.exp - now : null,
-            email: payload?.email,
-            email_verified: payload?.email_verified,
-            is_private_email: payload?.is_private_email,
-            nonce_supported: payload?.nonce_supported,
-          });
-        } else {
-          console.warn("[Apple Auth] identityToken is not a JWT (unexpected format)");
-        }
-      } catch (decodeErr: any) {
-        console.warn("[Apple Auth] Failed to decode identityToken for diagnostics:", {
-          message: decodeErr?.message,
-          name: decodeErr?.name,
-        });
-      }
-
-      // `verify-apple-id-token` is CommonJS and exposes the verifier as `default`
-      claims = await verifyAppleIdToken({
-        idToken: identityToken,
-        clientId,
-      });
-      console.log("[Apple Auth] verifyAppleToken ok:", {
-        iss: claims?.iss,
-        aud: claims?.aud,
-        sub: claims?.sub,
-        exp: claims?.exp,
-        email: claims?.email,
-      });
-    } catch (err: any) {
-      console.error("[Apple Auth] Token verification error:", {
-        message: err?.message,
-        name: err?.name,
-        code: err?.code,
-        stack: err?.stack,
-      });
-      return res.status(401).json({
-        success: false,
-        message: "Invalid Apple identity token. Token verification failed.",
-      });
-    }
-
-    const appleId = claims.sub as string;
-    const emailFromToken = (claims.email as string | undefined) || null;
-    const email = emailFromToken || null;
-
-    if (!appleId) {
-      return res.status(401).json({ success: false, message: "Invalid Apple token payload" });
-    }
-
-    // Derive display name from client-provided fullName or email
-    const displayName: string | null =
-      (typeof fullName === "string" && fullName.trim().length > 0
-        ? fullName
-        : email
-        ? email.split("@")[0]
-        : "Apple User") || null;
-
-    // 1) Check if user exists by Apple ID
-    let user = await storage.getUserByAppleId(appleId);
-    if (user) {
-      req.login(user, (err) => {
-        if (err) return next(err);
-        const { password: _, ...publicUser } = user as any;
-        return res.json({
-          success: true,
-          message: "Login successful",
-          data: publicUser,
-        });
-      });
-      return;
-    }
-
-    // 2) Link to existing account by email if possible
-    if (email) {
-      user = await storage.getUserByEmail(email);
-      if (user) {
-        await storage.updateUserAppleId(user.id, appleId);
-        req.login(user, (err) => {
-          if (err) return next(err);
-          const { password: _, ...publicUser } = user as any;
-          return res.json({
-            success: true,
-            message: "Login successful",
-            data: publicUser,
-          });
-        });
-        return;
-      }
-    }
-
-    // 3) For login flows, do not auto-create business/admin accounts
-    if (isLogin === true && (userRole === "business" || userRole === "admin")) {
-      return res.status(404).json({
-        success: false,
-        message: "Account not found. Please sign up first.",
-      });
-    }
-
-    // 4) Create new user from Apple profile (email may be null if user hid email)
-    user = await storage.createUserFromApple(appleId, email, displayName, userRole);
-
-    const frontendUrlMobile = process.env.FRONTEND_URL || "http://localhost:5173";
-    if (user.role === "customer") {
-      emailService
-        .sendWelcomeVerificationEmail(user.email, {
-          userName: user.username,
-          verificationLink: `${frontendUrlMobile}/`,
-        })
-        .catch((e) => console.error("[Apple Auth Mobile] Welcome email failed:", e));
-    } else if (user.role === "business") {
-      pool
-        .query("SELECT business_name FROM businesses WHERE user_id = $1", [user.id])
-        .then((result) => {
-          const businessName = result.rows[0]?.business_name || user.username;
-          return emailService.sendBusinessWelcomeEmail(user.email, {
-            businessOwnerName: user.username,
-            businessName,
-            verificationLink: `${frontendUrlMobile}/`,
-            dashboardLink: `${frontendUrlMobile}/business/dashboard`,
-          });
-        })
-        .catch((e) => console.error("[Apple Auth Mobile] Business welcome email failed:", e));
-    }
-
-    req.login(user, (err) => {
-      if (err) return next(err);
-      const { password: _, ...publicUser } = user as any;
-      return res.json({
-        success: true,
-        message: "Account created and logged in successfully",
-        data: publicUser,
+        data: { ...publicUser, token: issueToken(user.id) },
       });
     });
   } catch (error) {
@@ -898,69 +645,6 @@ router.get("/auth/me", isAuthenticated, (req, res) => {
     success: true,
     data: publicUser,
   });
-});
-
-// Delete current user's account (customer or business)
-router.delete("/account", isAuthenticated, async (req, res, next) => {
-  try {
-    const user = getCurrentUser(req);
-    if (!user) {
-      return res.status(401).json({
-        success: false,
-        message: "Not authenticated",
-      });
-    }
-
-    if (user.role === "admin") {
-      return res.status(403).json({
-        success: false,
-        message: "Admin accounts cannot be deleted via the mobile app.",
-      });
-    }
-
-    const userId = user.id;
-
-    // Clean up dependent records similar to the admin delete flow
-    const cartCountResult = await pool.query(
-      `SELECT COUNT(*) as count FROM cart WHERE user_id = $1`,
-      [userId]
-    );
-    const cartCount = parseInt(cartCountResult.rows[0].count);
-
-    const wishlistCountResult = await pool.query(
-      `SELECT COUNT(*) as count FROM wishlist WHERE user_id = $1`,
-      [userId]
-    );
-    const wishlistCount = parseInt(wishlistCountResult.rows[0].count);
-
-    const ordersCountResult = await pool.query(
-      `SELECT COUNT(*) as count FROM orders WHERE user_id = $1`,
-      [userId]
-    );
-    const ordersCount = parseInt(ordersCountResult.rows[0].count);
-
-    await pool.query(`DELETE FROM cart WHERE user_id = $1`, [userId]);
-    await pool.query(`DELETE FROM wishlist WHERE user_id = $1`, [userId]);
-
-    await pool.query(`DELETE FROM users WHERE id = $1`, [userId]);
-
-    req.logout?.(() => undefined);
-
-    res.json({
-      success: true,
-      message: "Account deleted successfully",
-      data: {
-        deletedUserId: userId,
-        deletedRecords: {
-          cartItems: cartCount,
-          wishlistItems: wishlistCount,
-          orders: ordersCount,
-        },
-      },
-    });
-  } catch (error) {
-    next(error);
-  }
 });
 
 // Products routes
@@ -1005,9 +689,13 @@ async function ensureBusinessGeocoded(businessId: string): Promise<{ latitude: n
 // Get products (public)
 router.get("/products", async (req, res, next) => {
   try {
-    console.log(`[Products API] Request received with query params:`, req.query);
     const { category, search, businessId, businessType, location, latitude, longitude, radiusKm, page, limit } = req.query;
-    
+    const queryForCache = { category, search, businessId, businessType, location, latitude, longitude, radiusKm, page, limit };
+    const cached = getCachedList<{ success: true; data: unknown[]; pagination: unknown }>("products", queryForCache as Record<string, unknown>);
+    if (cached) {
+      return res.json(cached);
+    }
+
     let lat: number | undefined;
     let lon: number | undefined;
     let radius: number | undefined;
@@ -1025,67 +713,49 @@ router.get("/products", async (req, res, next) => {
         });
       }
     } else if (location) {
-      // Always use text-based search for location (postcode/city filter)
-      // No geocoding, directly search businesses.postcode and businesses.city
-      console.log(`[Products API] Using text-based search for location: "${location}" (no geocoding)`);
-      radius = undefined; // Ensure no radius search
+      radius = undefined; // Text-based search (postcode/city)
     }
 
-    // If no pagination params provided, return all results (set very high limit)
+    // If no pagination params provided, use a sane default to avoid huge payloads (was 10000; full images made response ~41MB and caused timeouts)
     const pageNum = page ? parseInt(page as string) : 1;
-    const limitNum = limit ? parseInt(limit as string) : (page ? 12 : 10000); // If no page/limit, return all results
+    const requestedLimit = limit ? parseInt(limit as string) : (page ? 12 : 50);
+    const limitNum = Math.min(requestedLimit, 100); // Cap at 100 to keep response size and DB load under control
 
     // Determine which search method to use
     const useTextSearch = !(lat && lon && radius);
     const locationForSearch = useTextSearch ? (location as string) : undefined;
-    
-    console.log(`[Products API] Search parameters:`, {
-      location: location as string,
-      locationForSearch,
-      lat,
-      lon,
-      radius,
-      useTextSearch,
-      search: search as string,
-      category: category as string,
-      businessId: businessId as string,
-    });
-    
-    // Log what will be passed to productService
-    console.log(`[Products API] Calling productService.getProducts with:`, {
-      search: search as string,
-      location: locationForSearch,
-      latitude: lat,
-      longitude: lon,
-      radiusKm: radius,
-      category: category as string,
-      isApproved: true,
-    });
 
+    const origin = (process.env.BACKEND_URL || process.env.API_URL || `${req.protocol}://${req.get("host")}`).replace(/\/api\/?$/, "").replace(/\/$/, "");
     const result = await productService.getProducts({
       category: category as string,
       search: search as string,
       businessId: businessId as string,
       businessTypeCategoryId: businessType as string,
-      location: locationForSearch, // Use text search only if no coordinates or radius is 0
+      location: locationForSearch,
       latitude: lat,
       longitude: lon,
       radiusKm: radius,
-      isApproved: true, // Only show approved products to public
+      isApproved: true,
       page: pageNum,
       limit: limitNum,
+      skipEposSync: true,
+      imageBaseUrl: origin, // URLs instead of base64 = small JSON; images load on demand
     });
-    
-    res.json({ 
-      success: true, 
+
+    // ProductService returns image URLs (~30KB list vs ~300KB base64); no Sharp on list
+    const response = {
+      success: true,
       data: result.products,
       pagination: {
         total: result.total,
         page: result.page,
         limit: result.limit,
         totalPages: result.totalPages,
-      }
-    });
+      },
+    };
+    setCachedList("products", queryForCache as Record<string, unknown>, response);
+    res.setHeader("Cache-Control", "public, max-age=120"); // 2 min browser cache
+    res.json(response);
   } catch (error) {
     next(error);
   }
@@ -1169,13 +839,81 @@ router.get("/products/pending", isAuthenticated, async (req, res, next) => {
   }
 });
 
-// Get product by ID (public)
+// Serve a single product image by index. This is now mainly a fallback for legacy base64 rows.
+router.get("/products/:id/image/:index", async (req, res, next) => {
+  try {
+    const product = await productService.getProductById(req.params.id);
+    if (!product) {
+      return res.status(404).json({ success: false, message: "Product not found" });
+    }
+    const images = (product as { images?: string[] }).images || [];
+    const idx = parseInt(req.params.index, 10);
+    if (isNaN(idx) || idx < 0 || idx >= images.length) {
+      return res.status(404).json({ success: false, message: "Image not found" });
+    }
+    const img = images[idx];
+    const wantThumb = req.query.thumb === "1";
+    const wantWidth = parseInt(String(req.query.w || req.query.width), 10);
+    const maxWidth = wantThumb ? 300 : (wantWidth > 0 && wantWidth <= 2000 ? wantWidth : 0);
+    if (isManagedLocalImagePath(img)) {
+      const variantPath = maxWidth >= 1200
+        ? getManagedVariantPath(img, "detail")
+        : wantThumb
+          ? getManagedVariantPath(img, "thumb")
+          : getManagedVariantPath(img, "original");
+      const origin = (process.env.BACKEND_URL || process.env.API_URL || `${req.protocol}://${req.get("host")}`)
+        .replace(/\/api\/?$/, "")
+        .replace(/\/$/, "");
+      return res.redirect(302, `${origin}${variantPath}`);
+    }
+    if (img.startsWith("data:") && img.includes("base64,")) {
+      if (maxWidth > 0) {
+        const buf = await resizeBase64(img, maxWidth);
+        if (buf) {
+          res.setHeader("Content-Type", "image/jpeg");
+          res.setHeader("Cache-Control", "public, max-age=86400");
+          return res.send(buf);
+        }
+      }
+      const base64Data = img.replace(/^data:image\/\w+;base64,/, "");
+      const buf = Buffer.from(base64Data, "base64");
+      const mimeMatch = img.match(/^data:(image\/\w+);/);
+      res.setHeader("Content-Type", mimeMatch ? mimeMatch[1] : "image/jpeg");
+      res.setHeader("Cache-Control", "public, max-age=86400");
+      res.send(buf);
+      return;
+    }
+    if (img.startsWith("http://") || img.startsWith("https://")) {
+      return res.redirect(302, img);
+    }
+    if (img.startsWith("/")) {
+      const baseUrl = (process.env.BACKEND_URL || process.env.API_URL || `${req.protocol}://${req.get("host")}`).replace(/\/$/, "");
+      return res.redirect(302, baseUrl + img);
+    }
+    res.status(404).json({ success: false, message: "Image not found" });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Get product by ID (public). Return image URLs instead of base64 so detail page loads reliably.
 router.get("/products/:id", async (req, res, next) => {
   try {
     const product = await productService.getProductById(req.params.id);
     if (!product) {
       return res.status(404).json({ success: false, message: "Product not found" });
     }
+    const origin = (process.env.BACKEND_URL || process.env.API_URL || `${req.protocol}://${req.get("host")}`).replace(/\/api\/?$/, "").replace(/\/$/, "");
+    const rawImages = (product as { images?: string[] }).images || [];
+    (product as { images: string[] }).images = rawImages.map((img: string, i: number) => {
+      if (!img) return "";
+      if (isManagedLocalImagePath(img)) return `${origin}${getManagedVariantPath(img, "detail")}`;
+      if (img.startsWith("http://") || img.startsWith("https://")) return img;
+      if (img.startsWith("/")) return origin + img;
+      if (img.startsWith("data:") && img.includes("base64,"))
+        return `${origin}/api/products/${product.id}/image/${i}?w=1200`;
+      return `${origin}/api/products/${product.id}/image/${i}?w=1200`;
+    });
     // Lazy geocode business so MapView has coordinates when only postcode/city are stored
     const hasAddress = product.business_address || product.city || product.postcode;
     const missingCoords = (product as any).business_latitude == null || (product as any).business_longitude == null;
@@ -1364,19 +1102,6 @@ router.post("/business/onboarding-complete", isAuthenticated, async (req, res, n
       [user.id]
     );
 
-    try {
-      await createNotification(
-        user.id,
-        "business",
-        "account_verified",
-        "Account verified",
-        "Your business account is set up and ready. You can start receiving orders.",
-        { screen: "dashboard" }
-      );
-    } catch (e: any) {
-      console.warn(`[Onboarding] App notification failed:`, e?.message);
-    }
-
     res.json({ success: true, message: "Onboarding marked as complete" });
   } catch (error) {
     next(error);
@@ -1503,7 +1228,217 @@ router.put("/business/settings", isAuthenticated, async (req, res, next) => {
 
 // Square integration endpoints
 
-// Connect Square account
+function getSquareAppId(): string {
+  const id = process.env.SQUARE_APPLICATION_ID || process.env.SQUARE_APP_ID || "";
+  if (!id) {
+    console.warn("[Square OAuth] SQUARE_APPLICATION_ID not configured – Square OAuth will not work until set.");
+  }
+  return id;
+}
+
+function getSquareAppSecret(): string {
+  const secret = process.env.SQUARE_APPLICATION_SECRET || "";
+  if (!secret) {
+    console.warn("[Square OAuth] SQUARE_APPLICATION_SECRET not configured – Square OAuth will not work until set.");
+  }
+  return secret;
+}
+
+function getSquareRedirectUri(req: express.Request): string {
+  const base =
+    (process.env.BACKEND_URL || process.env.API_URL || `${req.protocol}://${req.get("host")}/api`).replace(
+      /\/api\/?$/,
+      ""
+    );
+  return `${base}/api/business/square/oauth/callback`;
+}
+
+// Get Square OAuth authorization URL (for mobile / SPAs)
+router.get("/business/square/oauth/url", isAuthenticated, async (req, res) => {
+  const user = getCurrentUser(req);
+  if (!user || user.role !== "business") {
+    return res.status(403).json({ success: false, message: "Only businesses can connect Square" });
+  }
+
+  const clientId = getSquareAppId();
+  const clientSecret = getSquareAppSecret();
+  if (!clientId || !clientSecret) {
+    return res.status(500).json({ success: false, message: "Square OAuth is not configured on the server" });
+  }
+
+  const state = crypto.randomBytes(16).toString("hex");
+  (req.session as any).squareOAuthState = state;
+
+  const redirectUri = getSquareRedirectUri(req);
+  const scope =
+    process.env.SQUARE_OAUTH_SCOPES ||
+    "MERCHANT_PROFILE_READ INVENTORY_READ ITEMS_READ"; // minimal set for locations + inventory/items
+
+  const params = new URLSearchParams({
+    client_id: clientId,
+    scope: scope.replace(/\s+/g, " "),
+    session: "false",
+    state,
+    redirect_uri: redirectUri,
+  });
+
+  const authUrl = `https://connect.squareup.com/oauth2/authorize?${params.toString()}`;
+  res.json({ success: true, data: { url: authUrl } });
+});
+
+// Start Square OAuth – redirect seller to Square (web dashboard)
+router.get("/business/square/oauth/start", isAuthenticated, async (req, res) => {
+  const user = getCurrentUser(req);
+  if (!user || user.role !== "business") {
+    return res.status(403).json({ success: false, message: "Only businesses can connect Square" });
+  }
+
+  const clientId = getSquareAppId();
+  const clientSecret = getSquareAppSecret();
+  if (!clientId || !clientSecret) {
+    return res.status(500).json({ success: false, message: "Square OAuth is not configured on the server" });
+  }
+
+  const state = crypto.randomBytes(16).toString("hex");
+  (req.session as any).squareOAuthState = state;
+
+  const redirectUri = getSquareRedirectUri(req);
+  const scope =
+    process.env.SQUARE_OAUTH_SCOPES ||
+    "MERCHANT_PROFILE_READ INVENTORY_READ ITEMS_READ";
+
+  const params = new URLSearchParams({
+    client_id: clientId,
+    scope: scope.replace(/\s+/g, " "),
+    session: "false",
+    state,
+    redirect_uri: redirectUri,
+  });
+
+  const authUrl = `https://connect.squareup.com/oauth2/authorize?${params.toString()}`;
+  res.redirect(authUrl);
+});
+
+// OAuth callback – exchange code for token, pick a location, and store per-business credentials
+router.get("/business/square/oauth/callback", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "business") {
+      return res.status(403).json({ success: false, message: "Only businesses can connect Square" });
+    }
+
+    const { code, state } = req.query;
+    const expectedState = (req.session as any).squareOAuthState;
+    (req.session as any).squareOAuthState = undefined;
+
+    if (!code || typeof code !== "string") {
+      return res.status(400).json({ success: false, message: "Missing authorization code from Square" });
+    }
+    if (!state || typeof state !== "string" || !expectedState || state !== expectedState) {
+      return res.status(400).json({ success: false, message: "Invalid OAuth state" });
+    }
+
+    const clientId = getSquareAppId();
+    const clientSecret = getSquareAppSecret();
+    if (!clientId || !clientSecret) {
+      return res.status(500).json({ success: false, message: "Square OAuth is not configured on the server" });
+    }
+
+    const redirectUri = getSquareRedirectUri(req);
+
+    // Exchange authorization code for access + refresh token
+    const tokenRes = await fetch("https://connect.squareup.com/oauth2/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_id: clientId,
+        client_secret: clientSecret,
+        code,
+        grant_type: "authorization_code",
+        redirect_uri: redirectUri,
+      }),
+    });
+
+    const tokenBody: any = await tokenRes.json().catch(() => ({}));
+    if (!tokenRes.ok || !tokenBody.access_token) {
+      console.error("[Square OAuth] Token exchange failed:", tokenRes.status, tokenBody);
+      return res.status(400).json({
+        success: false,
+        message: "Failed to connect Square account. Please try again or contact support.",
+      });
+    }
+
+    const squareAccessToken: string = tokenBody.access_token;
+
+    // Fetch seller locations and choose one (first active)
+    const locRes = await fetch("https://connect.squareup.com/v2/locations", {
+      headers: {
+        Authorization: `Bearer ${squareAccessToken}`,
+        "Content-Type": "application/json",
+      },
+    });
+    const locBody: any = await locRes.json().catch(() => ({}));
+    if (!locRes.ok || !Array.isArray(locBody.locations) || locBody.locations.length === 0) {
+      console.error("[Square OAuth] Failed to list locations:", locRes.status, locBody);
+      return res.status(400).json({
+        success: false,
+        message:
+          "Square account connected, but no locations were found. Please ensure your Square account has at least one active location.",
+      });
+    }
+
+    const activeLocation =
+      locBody.locations.find((l: any) => l.status === "ACTIVE") || locBody.locations[0];
+    const locationId: string | undefined = activeLocation?.id;
+    if (!locationId) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Square account connected, but we could not determine a valid location. Please contact support.",
+      });
+    }
+
+    // Get business ID
+    const businessResult = await pool.query(
+      "SELECT id FROM businesses WHERE user_id = $1",
+      [user.id]
+    );
+
+    if (businessResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business profile not found" });
+    }
+
+    const businessId = businessResult.rows[0].id;
+
+    await pool.query(
+      `UPDATE businesses 
+       SET square_access_token = $1,
+           square_location_id = $2,
+           square_connected_at = CURRENT_TIMESTAMP,
+           square_sync_enabled = true
+       WHERE id = $3`,
+      [squareAccessToken, locationId, businessId]
+    );
+
+    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+    const redirectTarget = `${frontendUrl.replace(/\/$/, "")}/business/square-settings`;
+
+    // For web flows, redirect back to dashboard; for API callers, JSON is still valid
+    if (req.get("Accept")?.includes("text/html")) {
+      return res.redirect(302, redirectTarget);
+    }
+
+    res.json({
+      success: true,
+      message: "Square account connected successfully",
+      data: { locationId },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Legacy manual connection endpoint (personal access token + location ID)
 router.post("/business/square/connect", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
@@ -1881,6 +1816,24 @@ router.delete("/admin/products/:id", isAuthenticated, async (req, res, next) => 
   }
 });
 
+// Delete service (admin only)
+router.delete("/admin/services/:id", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ success: false, message: "Only admins can delete services" });
+    }
+
+    const result = await pool.query("DELETE FROM services WHERE id = $1 RETURNING id", [req.params.id]);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ success: false, message: "Service not found" });
+    }
+    res.json({ success: true, message: "Service permanently deleted" });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Cart routes
 router.get("/cart", isAuthenticated, async (req, res, next) => {
   try {
@@ -2055,9 +2008,18 @@ router.delete("/cart/:productId", isAuthenticated, async (req, res, next) => {
 // Get all services (public)
 router.get("/services", async (req, res, next) => {
   try {
-    const { category, businessId, businessType, search } = req.query;
+    const { category, businessId, businessType, search, limit: limitQuery } = req.query;
+    const queryForCache = { category, businessId, businessType, search, limit: limitQuery };
+    const cached = getCachedList<{ success: true; data: unknown[] }>("services", queryForCache as Record<string, unknown>);
+    if (cached) {
+      return res.json(cached);
+    }
+
     let query = `
-      SELECT s.*, b.business_name as business_name, b.business_address, b.city
+      SELECT s.id, s.name, s.description, s.price, s.category, s.duration_minutes, s.max_participants,
+             s.location_type, s.requires_staff, s.created_at, s.updated_at, s.business_id, s.is_approved,
+             s.review_count, s.average_rating, (s.images)[1] as first_image, b.business_name as business_name,
+             b.business_address, b.city
       FROM services s
       JOIN businesses b ON s.business_id = b.id
       WHERE s.is_approved = true AND b.is_approved = true
@@ -2085,14 +2047,40 @@ router.get("/services", async (req, res, next) => {
 
     if (search) {
       paramCount++;
-      query += ` AND (s.name ILIKE $${paramCount} OR s.description ILIKE $${paramCount})`;
+      query += ` AND (s.name ILIKE $${paramCount} OR s.description ILIKE $${paramCount} OR b.business_name ILIKE $${paramCount})`;
       params.push(`%${search}%`);
     }
 
     query += ` ORDER BY s.created_at DESC`;
 
+    const limitNum = Math.min(Math.max(parseInt(String(req.query.limit), 10) || 50, 1), 100);
+    query += ` LIMIT $${paramCount + 1}`;
+    params.push(limitNum);
+
     const result = await pool.query(query, params);
-    res.json({ success: true, data: result.rows });
+    const origin = (process.env.BACKEND_URL || process.env.API_URL || `${req.protocol}://${req.get("host")}`).replace(/\/api\/?$/, "").replace(/\/$/, "");
+    // Use image URLs for list (small JSON); base64/external passed through as URL to fetch
+    const listServices = result.rows.map((row: { id: string; first_image?: string | null; [key: string]: unknown }) => {
+      const first = row.first_image;
+      let images: string[] = [];
+      if (first) {
+        if (first.startsWith("http://") || first.startsWith("https://")) {
+          images = [first];
+        } else if (isManagedLocalImagePath(first)) {
+          images = [`${origin}${getManagedVariantPath(first, "thumb")}`];
+        } else if (first.startsWith("/")) {
+          images = [origin + first];
+        } else {
+          images = [`${origin}/api/services/${row.id}/image/0?thumb=1`];
+        }
+      }
+      const { first_image: _drop, ...rest } = row;
+      return { ...rest, images };
+    });
+    const response = { success: true, data: listServices };
+    setCachedList("services", queryForCache as Record<string, unknown>, response);
+    res.setHeader("Cache-Control", "public, max-age=120"); // 2 min browser cache
+    res.json(response);
   } catch (error) {
     next(error);
   }
@@ -2137,6 +2125,66 @@ router.get("/services/pending", isAuthenticated, async (req, res, next) => {
   }
 });
 
+// Serve a single service image by index. Mainly fallback for legacy base64 rows.
+router.get("/services/:id/image/:index", async (req, res, next) => {
+  try {
+    const result = await pool.query(
+      `SELECT images FROM services WHERE id = $1 AND is_approved = true`,
+      [req.params.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Service not found" });
+    }
+    const images = result.rows[0].images || [];
+    const idx = parseInt(req.params.index, 10);
+    if (isNaN(idx) || idx < 0 || idx >= images.length) {
+      return res.status(404).json({ success: false, message: "Image not found" });
+    }
+    const img = images[idx];
+    const wantThumb = req.query.thumb === "1";
+    const wantWidth = parseInt(String(req.query.w || req.query.width), 10);
+    const maxWidth = wantThumb ? 300 : (wantWidth > 0 && wantWidth <= 2000 ? wantWidth : 0);
+    if (isManagedLocalImagePath(img)) {
+      const variantPath = maxWidth >= 1200
+        ? getManagedVariantPath(img, "detail")
+        : wantThumb
+          ? getManagedVariantPath(img, "thumb")
+          : getManagedVariantPath(img, "original");
+      const origin = (process.env.BACKEND_URL || process.env.API_URL || `${req.protocol}://${req.get("host")}`)
+        .replace(/\/api\/?$/, "")
+        .replace(/\/$/, "");
+      return res.redirect(302, `${origin}${variantPath}`);
+    }
+    if (img.startsWith("data:") && img.includes("base64,")) {
+      if (maxWidth > 0) {
+        const buf = await resizeBase64(img, maxWidth);
+        if (buf) {
+          res.setHeader("Content-Type", "image/jpeg");
+          res.setHeader("Cache-Control", "public, max-age=86400");
+          return res.send(buf);
+        }
+      }
+      const base64Data = img.replace(/^data:image\/\w+;base64,/, "");
+      const buf = Buffer.from(base64Data, "base64");
+      const mimeMatch = img.match(/^data:(image\/\w+);/);
+      res.setHeader("Content-Type", mimeMatch ? mimeMatch[1] : "image/jpeg");
+      res.setHeader("Cache-Control", "public, max-age=86400");
+      res.send(buf);
+      return;
+    }
+    if (img.startsWith("http://") || img.startsWith("https://")) {
+      return res.redirect(302, img);
+    }
+    if (img.startsWith("/")) {
+      const baseUrl = (process.env.BACKEND_URL || process.env.API_URL || `${req.protocol}://${req.get("host")}`).replace(/\/$/, "");
+      return res.redirect(302, baseUrl + img);
+    }
+    res.status(404).json({ success: false, message: "Image not found" });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Get service by ID (public)
 router.get("/services/:id", async (req, res, next) => {
   try {
@@ -2154,6 +2202,17 @@ router.get("/services/:id", async (req, res, next) => {
     }
 
     const row = result.rows[0];
+    const origin = (process.env.BACKEND_URL || process.env.API_URL || `${req.protocol}://${req.get("host")}`)
+      .replace(/\/api\/?$/, "")
+      .replace(/\/$/, "");
+    row.images = ((row.images || []) as string[]).map((img: string, i: number) => {
+      if (!img) return "";
+      if (isManagedLocalImagePath(img)) return `${origin}${getManagedVariantPath(img, "detail")}`;
+      if (img.startsWith("http://") || img.startsWith("https://")) return img;
+      if (img.startsWith("/")) return `${origin}${img}`;
+      if (img.startsWith("data:") && img.includes("base64,")) return `${origin}/api/services/${row.id}/image/${i}?w=1200`;
+      return `${origin}/api/services/${row.id}/image/${i}?w=1200`;
+    });
     const hasAddress = row.business_address || row.city || row.postcode;
     const missingCoords = row.business_latitude == null || row.business_longitude == null;
     const serviceBusinessId = row.business_id;
@@ -2571,82 +2630,6 @@ router.delete("/business/availability/blocks/:id", isAuthenticated, async (req, 
   }
 });
 
-// Get slot grid for seller dashboard (available | booked | blocked | locked)
-router.get("/business/availability/slot-grid", isAuthenticated, async (req, res, next) => {
-  try {
-    const user = getCurrentUser(req);
-    if (!user || user.role !== "business") {
-      return res.status(403).json({ success: false, message: "Only businesses can access this" });
-    }
-    const businessId = await productService.getBusinessIdByUserId(user.id);
-    if (!businessId) {
-      return res.status(404).json({ success: false, message: "Business profile not found" });
-    }
-    const { startDate, endDate, slotIntervalMinutes, durationMinutes } = req.query;
-    if (!startDate || !endDate) {
-      return res.status(400).json({ success: false, message: "startDate and endDate are required (YYYY-MM-DD)" });
-    }
-    const grid = await availabilityService.getSlotGrid(
-      businessId,
-      new Date(startDate as string),
-      new Date(endDate as string),
-      slotIntervalMinutes ? parseInt(slotIntervalMinutes as string) : 60,
-      durationMinutes ? parseInt(durationMinutes as string) : 60
-    );
-    res.json({ success: true, data: grid });
-  } catch (error) {
-    next(error);
-  }
-});
-
-// Get explicit time slots by day (for seller UI)
-router.get("/business/availability/slots", isAuthenticated, async (req, res, next) => {
-  try {
-    const user = getCurrentUser(req);
-    if (!user || user.role !== "business") {
-      return res.status(403).json({ success: false, message: "Only businesses can access this" });
-    }
-    const businessId = await productService.getBusinessIdByUserId(user.id);
-    if (!businessId) {
-      return res.status(404).json({ success: false, message: "Business profile not found" });
-    }
-    const slotsByDay = await availabilityService.getExplicitSlots(businessId);
-    res.json({ success: true, data: slotsByDay });
-  } catch (error) {
-    next(error);
-  }
-});
-
-// Set explicit time slots (slotsByDay: { [dayOfWeek]: { time: string, enabled: boolean }[] })
-router.put("/business/availability/slots", isAuthenticated, async (req, res, next) => {
-  try {
-    const user = getCurrentUser(req);
-    if (!user || user.role !== "business") {
-      return res.status(403).json({ success: false, message: "Only businesses can update slots" });
-    }
-    const businessId = await productService.getBusinessIdByUserId(user.id);
-    if (!businessId) {
-      return res.status(404).json({ success: false, message: "Business profile not found" });
-    }
-    const { slotsByDay } = req.body;
-    if (!slotsByDay || typeof slotsByDay !== "object") {
-      return res.status(400).json({ success: false, message: "slotsByDay object is required" });
-    }
-    for (const dayOfWeekStr of Object.keys(slotsByDay)) {
-      const dayOfWeek = parseInt(dayOfWeekStr, 10);
-      if (isNaN(dayOfWeek) || dayOfWeek < 0 || dayOfWeek > 6) continue;
-      const slots = slotsByDay[dayOfWeekStr];
-      if (Array.isArray(slots)) {
-        await availabilityService.setExplicitSlotsForDay(businessId, dayOfWeek, slots);
-      }
-    }
-    const updated = await availabilityService.getExplicitSlots(businessId);
-    res.json({ success: true, data: updated });
-  } catch (error) {
-    next(error);
-  }
-});
-
 // Lock a booking slot (during checkout)
 router.post("/bookings/lock", isAuthenticated, async (req, res, next) => {
   try {
@@ -2934,32 +2917,15 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
       }
     }
 
-    // Require pickup slot for every business that has product items
-    const productBusinessIds = new Set(cartResult.rows.map((r: any) => r.business_id));
-    const singleBusiness = productBusinessIds.size === 1 && cartServiceResult.rows.length === 0;
-    if (cartResult.rows.length > 0) {
-      for (const businessId of productBusinessIds) {
-        const hasSlot = businessBookings && typeof businessBookings === 'object' && businessBookings[businessId]?.date && businessBookings[businessId]?.time;
-        const hasLegacySlot = singleBusiness && bookingDate && bookingTime;
-        if (!hasSlot && !hasLegacySlot) {
-          const businessName = cartResult.rows.find((r: any) => r.business_id === businessId)?.business_name || 'this business';
-          return res.status(400).json({
-            success: false,
-            message: `Pickup date and time are required for products from ${businessName}`,
-          });
-        }
-      }
-    }
-
     // Validate cutoff rules for product orders (same-day pickup)
     if (cartResult.rows.length > 0) {
       const businessCutoffChecks = new Map<string, { allowed: boolean; reason?: string }>();
-
+      
       for (const item of cartResult.rows) {
         if (!businessCutoffChecks.has(item.business_id)) {
           const cutoffCheck = await availabilityService.isSameDayPickupAllowed(item.business_id);
           businessCutoffChecks.set(item.business_id, cutoffCheck);
-
+          
           if (!cutoffCheck.allowed) {
             return res.status(400).json({
               success: false,
@@ -3023,47 +2989,15 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
     );
     const totalBeforeDiscount = productsTotal + servicesTotal;
 
-    // Combine all businesses (products + services)
-    const allBusinessIdsForDiscount = new Set([
-      ...Array.from(businessGroups.keys()),
-      ...Array.from(serviceBusinessGroups.keys()),
-    ]);
-    const allBusinessIdsArray = Array.from(allBusinessIdsForDiscount);
-
-    // Per-business subtotals (for discount: only participating businesses get a share)
-    const businessSubtotals = new Map<string, number>();
-    for (const businessId of allBusinessIdsArray) {
-      const items = businessGroups.get(businessId) || [];
-      const serviceItems = serviceBusinessGroups.get(businessId) || [];
-      const pt = items.reduce((sum, item) => sum + parseFloat(item.price) * item.quantity, 0);
-      const st = serviceItems.reduce((sum, item) => sum + parseFloat(item.price) * item.quantity, 0);
-      businessSubtotals.set(businessId, pt + st);
-    }
-
-    // Validate discount code: use qualifying subtotal only (participating businesses' portion)
-    let discountParticipatingBusinessIds: string[] | null = null;
+    // Validate and apply discount code
     if (discountCode) {
       try {
-        const participating = await rewardsService.getParticipatingBusinessIds(discountCode);
-        const qualifyingSubtotal =
-          participating === null
-            ? totalBeforeDiscount
-            : allBusinessIdsArray
-                .filter((id) => participating.includes(id))
-                .reduce((sum, id) => sum + (businessSubtotals.get(id) || 0), 0);
-
-        if (qualifyingSubtotal > 0) {
-          const validation = await rewardsService.validateDiscountCode(
-            discountCode,
-            qualifyingSubtotal,
-            allBusinessIdsArray
-          );
-          if (validation.valid) {
-            discountAmount = validation.discount!.amount;
-            discountParticipatingBusinessIds = validation.participatingBusinessIds ?? null;
-          }
+        const validation = await rewardsService.validateDiscountCode(discountCode, totalBeforeDiscount);
+        if (validation.valid) {
+          discountAmount = validation.discount!.amount;
         }
       } catch (err) {
+        // Discount code invalid, continue without it
         console.error('Discount code validation error:', err);
       }
     }
@@ -3088,16 +3022,6 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
     ]);
     const totalBusinesses = allBusinessIds.size;
 
-    // Which businesses get a share of the discount (only participating businesses in cart)
-    const discountEligibleBusinessIds =
-      discountParticipatingBusinessIds === null
-        ? Array.from(allBusinessIds)
-        : Array.from(allBusinessIds).filter((id) => discountParticipatingBusinessIds!.includes(id));
-    const qualifyingSubtotalForSplit =
-      discountEligibleBusinessIds.length > 0
-        ? discountEligibleBusinessIds.reduce((sum, id) => sum + (businessSubtotals.get(id) || 0), 0)
-        : 0;
-
     // Create orders for each business
     const createdOrders = [];
 
@@ -3109,17 +3033,11 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
       const productsTotal = items.reduce((sum, item) => sum + parseFloat(item.price) * item.quantity, 0);
       const servicesTotal = serviceItems.reduce((sum, item) => sum + parseFloat(item.price) * item.quantity, 0);
       let total = productsTotal + servicesTotal;
-
-      // Discount only for participating businesses; split proportionally by their share of qualifying subtotal
-      const getsDiscount = discountEligibleBusinessIds.includes(businessId);
-      const businessSubtotal = businessSubtotals.get(businessId) || 0;
-      const businessDiscount =
-        getsDiscount &&
-        discountAmount > 0 &&
-        qualifyingSubtotalForSplit > 0 &&
-        businessSubtotal > 0
-          ? (discountAmount * businessSubtotal) / qualifyingSubtotalForSplit
-          : 0;
+      
+      // Apply discount proportionally (if multiple businesses, split discount)
+      const businessDiscount = totalBusinesses > 1 
+        ? (discountAmount / totalBusinesses) 
+        : discountAmount;
       const businessPoints = totalBusinesses > 1
         ? (pointsRedeemed / totalBusinesses)
         : pointsRedeemed;
@@ -3150,17 +3068,20 @@ router.post("/orders", isAuthenticated, async (req, res, next) => {
         ? (serviceItems[0]?.duration_minutes || null)
         : null;
 
-      // Get booking date/time for this business (services and/or product pickup)
+      // Get booking date/time for this business
       let businessBookingDate: string | null = null;
       let businessBookingTime: string | null = null;
-
-      if (businessBookings && typeof businessBookings === 'object' && businessBookings[businessId]) {
-        businessBookingDate = businessBookings[businessId].date;
-        businessBookingTime = businessBookings[businessId].time;
-      } else if (bookingDate && bookingTime && totalBusinesses === 1) {
-        // Backward compatibility: single booking when one business only
-        businessBookingDate = bookingDate;
-        businessBookingTime = bookingTime;
+      
+      if (isServiceOrder) {
+        if (businessBookings && typeof businessBookings === 'object' && businessBookings[businessId]) {
+          // Use per-business booking
+          businessBookingDate = businessBookings[businessId].date;
+          businessBookingTime = businessBookings[businessId].time;
+        } else if (bookingDate && bookingTime) {
+          // Backward compatibility: use single booking
+          businessBookingDate = bookingDate;
+          businessBookingTime = bookingTime;
+        }
       }
 
       // Create order with status 'awaiting_payment' - payment must be confirmed before finalizing
@@ -3795,16 +3716,6 @@ router.post("/orders/:id/cancel", isAuthenticated, async (req, res, next) => {
       [orderId]
     );
 
-    try {
-      await createNotification(user.id, "customer", "order_cancelled", "Order cancelled", "Your order has been cancelled.", { orderId, screen: "order" });
-      const biz = await pool.query(`SELECT user_id FROM businesses WHERE id = $1`, [order.business_id]);
-      if (biz.rows.length > 0) {
-        await createNotification(biz.rows[0].user_id, "business", "order_cancelled_business", "Order cancelled", `Order #${orderId.slice(0, 8)} was cancelled by the customer.`, { orderId, screen: "order" });
-      }
-    } catch (e: any) {
-      console.warn(`[Cancel Order] App notification failed:`, e?.message);
-    }
-
     // Expire Stripe session if exists (defensive – for abandoned checkouts)
     if (order.stripe_session_id) {
       try {
@@ -4013,193 +3924,6 @@ router.post("/orders/:id/retry-payment", isAuthenticated, async (req, res, next)
   }
 });
 
-// ---------- App notifications (push token + in-app list) ----------
-router.post("/notifications/push-token", isAuthenticated, async (req, res, next) => {
-  try {
-    const user = getCurrentUser(req);
-    if (!user) return res.status(401).json({ success: false, message: "Unauthorized" });
-    const { token, platform } = req.body;
-    if (!token || typeof token !== "string") {
-      return res.status(400).json({ success: false, message: "Token is required" });
-    }
-    await registerPushToken(user.id, token.trim(), platform || "expo");
-    res.json({ success: true, message: "Push token registered" });
-  } catch (error) {
-    next(error);
-  }
-});
-
-router.get("/notifications", isAuthenticated, async (req, res, next) => {
-  try {
-    const user = getCurrentUser(req);
-    if (!user) return res.status(401).json({ success: false, message: "Unauthorized" });
-    const role = (req.query.role as string) || "customer";
-    const limit = Math.min(parseInt(String(req.query.limit || "20"), 10) || 20, 50);
-    const offset = parseInt(String(req.query.offset || "0"), 10) || 0;
-    const result = await pool.query(
-      `SELECT id, type, title, body, data, read_at, created_at
-       FROM notifications WHERE user_id = $1 AND role = $2
-       ORDER BY created_at DESC LIMIT $3 OFFSET $4`,
-      [user.id, role, limit, offset]
-    );
-    const countResult = await pool.query(
-      `SELECT COUNT(*) as total FROM notifications WHERE user_id = $1 AND role = $2`,
-      [user.id, role]
-    );
-    const unreadResult = await pool.query(
-      `SELECT COUNT(*) as unread FROM notifications WHERE user_id = $1 AND role = $2 AND read_at IS NULL`,
-      [user.id, role]
-    );
-    res.json({
-      success: true,
-      data: {
-        items: result.rows,
-        total: parseInt(countResult.rows[0]?.total || "0", 10),
-        unreadCount: parseInt(unreadResult.rows[0]?.unread || "0", 10),
-      },
-    });
-  } catch (error) {
-    next(error);
-  }
-});
-
-router.get("/notifications/unread-count", isAuthenticated, async (req, res, next) => {
-  try {
-    const user = getCurrentUser(req);
-    if (!user) return res.status(401).json({ success: false, message: "Unauthorized" });
-    const role = (req.query.role as string) || "customer";
-    const result = await pool.query(
-      `SELECT COUNT(*) as count FROM notifications WHERE user_id = $1 AND role = $2 AND read_at IS NULL`,
-      [user.id, role]
-    );
-    res.json({ success: true, data: { count: parseInt(result.rows[0]?.count || "0", 10) } });
-  } catch (error) {
-    next(error);
-  }
-});
-
-router.patch("/notifications/:id/read", isAuthenticated, async (req, res, next) => {
-  try {
-    const user = getCurrentUser(req);
-    if (!user) return res.status(401).json({ success: false, message: "Unauthorized" });
-    const result = await pool.query(
-      `UPDATE notifications SET read_at = CURRENT_TIMESTAMP WHERE id = $1 AND user_id = $2 RETURNING id`,
-      [req.params.id, user.id]
-    );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Notification not found" });
-    }
-    res.json({ success: true, data: { id: req.params.id } });
-  } catch (error) {
-    next(error);
-  }
-});
-
-router.post("/notifications/read-all", isAuthenticated, async (req, res, next) => {
-  try {
-    const user = getCurrentUser(req);
-    if (!user) return res.status(401).json({ success: false, message: "Unauthorized" });
-    const role = (req.query.role as string) || "customer";
-    await pool.query(
-      `UPDATE notifications SET read_at = CURRENT_TIMESTAMP WHERE user_id = $1 AND role = $2 AND read_at IS NULL`,
-      [user.id, role]
-    );
-    res.json({ success: true, message: "All marked as read" });
-  } catch (error) {
-    next(error);
-  }
-});
-
-/**
- * Call this when a chat message is sent (e.g. from the app after writing to Firebase).
- * Creates an in-app + push notification for the recipient.
- * Body: { recipientUserId, recipientRole: "customer"|"business", roomId, senderName }
- */
-router.post("/notifications/on-new-message", isAuthenticated, async (req, res, next) => {
-  try {
-    const user = getCurrentUser(req);
-    if (!user) return res.status(401).json({ success: false, message: "Unauthorized" });
-    const { recipientUserId, recipientRole, roomId, senderName } = req.body;
-    if (!recipientUserId || !recipientRole || !roomId) {
-      return res.status(400).json({
-        success: false,
-        message: "recipientUserId, recipientRole, and roomId are required",
-      });
-    }
-    if (!["customer", "business"].includes(recipientRole)) {
-      return res.status(400).json({ success: false, message: "recipientRole must be customer or business" });
-    }
-    const type = recipientRole === "customer" ? "new_message" : "new_message_business";
-    const title = "New message";
-    const body = senderName ? `${senderName}: New message` : "You have a new message";
-    const data = { roomId, screen: "messages" };
-    // Log so we can confirm request reached server and diagnose push
-    const tokenCount = await pool.query(
-      "SELECT COUNT(*) as n FROM user_push_tokens WHERE user_id = $1 AND token IS NOT NULL AND token != ''",
-      [recipientUserId]
-    );
-    const n = parseInt(tokenCount.rows[0]?.n || "0", 10);
-    console.log("[Notifications] on-new-message:", { recipientUserId, recipientRole, type, roomId, pushTokens: n });
-    await createNotification(
-      recipientUserId,
-      recipientRole as "customer" | "business",
-      type,
-      title,
-      body,
-      data
-    );
-    // Include pushTokens so logs/response show whether push was attempted (0 = in-app only, no device tokens)
-    res.json({ success: true, message: "Notification sent", pushTokens: n });
-  } catch (error) {
-    console.error("[Notifications] on-new-message failed:", error);
-    next(error);
-  }
-});
-
-/**
- * Send abandoned-cart reminder notifications (and optionally emails).
- * Intended to be called by a cron (e.g. daily). Users with cart items who haven't
- * received this reminder in the last 24h get a notification.
- */
-router.post("/notifications/send-abandoned-cart-reminders", async (req, res, next) => {
-  try {
-    const sent: string[] = [];
-    const now = new Date();
-    const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-    const usersWithCart = await pool.query(
-      `SELECT DISTINCT user_id FROM (
-        SELECT user_id FROM cart_items
-        UNION
-        SELECT user_id FROM cart_service_items
-      ) u
-      WHERE user_id NOT IN (
-        SELECT user_id FROM notifications
-        WHERE type = 'abandoned_cart_reminder' AND created_at > $1
-      )`,
-      [oneDayAgo]
-    );
-    for (const row of usersWithCart.rows) {
-      const userId = row.user_id;
-      try {
-        await createNotification(
-          userId,
-          "customer",
-          "abandoned_cart_reminder",
-          "Still thinking about it?",
-          "Your cart is waiting. Complete your order when you're ready.",
-          { screen: "cart" }
-        );
-        sent.push(userId);
-      } catch (e: any) {
-        console.warn(`[AbandonedCart] Failed for user ${userId}:`, e?.message);
-      }
-    }
-    res.json({ success: true, data: { sent: sent.length, userIds: sent } });
-  } catch (error) {
-    next(error);
-  }
-});
-
 // Update order status (business only)
 router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
   try {
@@ -4209,7 +3933,7 @@ router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
     }
 
     const { status } = req.body;
-    const validStatuses = ["awaiting_payment", "pending", "processing", "cancelled", "ready", "complete"];
+    const validStatuses = ["awaiting_payment", "pending", "processing", "shipped", "delivered", "cancelled", "ready_for_pickup", "picked_up"];
     
     if (!status || !validStatuses.includes(status)) {
       return res.status(400).json({
@@ -4269,10 +3993,10 @@ router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
       updateParams.push(platformCommission, businessAmount);
     }
 
-    // Set timestamps for ready/complete statuses
-    if (status === "ready") {
+    // Set timestamps for BOPIS statuses
+    if (status === "ready_for_pickup") {
       updateQuery += `, ready_for_pickup_at = CURRENT_TIMESTAMP`;
-    } else if (status === "complete") {
+    } else if (status === "picked_up") {
       updateQuery += `, picked_up_at = CURRENT_TIMESTAMP`;
     }
 
@@ -4302,8 +4026,7 @@ router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
     );
 
     // Send emails based on status change
-    if (status === "ready") {
-      console.log(`[Order Status] Status set to ready for order ${order.id}, preparing ready-for-pickup email.`);
+    if (status === "ready_for_pickup") {
       try {
         // Get customer and business details
         const customerResult = await pool.query(
@@ -4315,95 +4038,76 @@ router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
         );
 
         const businessResult = await pool.query(
-          `SELECT b.business_name
+          `SELECT b.business_name, b.opening_hours
            FROM businesses b
            JOIN orders o ON b.id = o.business_id
            WHERE o.id = $1`,
           [order.id]
         );
 
-        if (customerResult.rows.length === 0) {
-          console.warn(`[Order Status] Cannot send ready-for-pickup email for order ${order.id}: customer not found`);
-        } else if (businessResult.rows.length === 0) {
-          console.warn(`[Order Status] Cannot send ready-for-pickup email for order ${order.id}: business not found`);
-        } else {
+        if (customerResult.rows.length > 0 && businessResult.rows.length > 0) {
           const customer = customerResult.rows[0];
           const business = businessResult.rows[0];
-          const toEmail = customer.customer_email?.trim?.() || customer.customer_email;
-          if (!toEmail) {
-            console.warn(`[Order Status] Cannot send ready-for-pickup email for order ${order.id}: customer has no email`);
-          } else {
-            // Combine all items (products + services) with safe values so email render never throws
-            const allItems = [
-              ...itemsResult.rows.map((item: any) => ({
-                name: String(item?.product_name ?? "Item"),
-                quantity: Number(item?.quantity) || 1,
-                price: Number(item?.price) || 0,
-              })),
-              ...serviceItemsResult.rows.map((item: any) => ({
-                name: String(item?.service_name ?? "Item"),
-                quantity: Number(item?.quantity) || 1,
-                price: Number(item?.price) || 0,
-              })),
-            ];
 
-            const totalAmount = Number(order?.total) || 0;
-            const cashbackAmount = Number(order?.points_earned) || 0;
+          // Combine all items
+          const allItems = [
+            ...itemsResult.rows.map((item: any) => ({
+              name: item.product_name,
+              quantity: item.quantity,
+              price: parseFloat(item.price),
+            })),
+            ...serviceItemsResult.rows.map((item: any) => ({
+              name: item.service_name,
+              quantity: item.quantity,
+              price: parseFloat(item.price),
+            })),
+          ];
 
-            const businessAddressResult = await pool.query(
-              `SELECT business_address, postcode, city
-               FROM businesses
-               WHERE id = (SELECT business_id FROM orders WHERE id = $1)`,
-              [order.id]
-            );
-            const businessAddress = businessAddressResult.rows[0]
-              ? [
-                  businessAddressResult.rows[0].business_address,
-                  businessAddressResult.rows[0].postcode,
-                  businessAddressResult.rows[0].city,
-                ]
-                  .filter(Boolean)
-                  .join(", ")
-              : "";
+          // Calculate totals
+          const totalAmount = parseFloat(order.total);
+          const cashbackAmount = parseFloat(order.points_earned || "0");
 
-            const googleMapsLink = businessAddress
-              ? `https://maps.google.com/?q=${encodeURIComponent(businessAddress)}`
-              : undefined;
-            const qrCodeUrl = order.qr_code || undefined;
+          // Get business address
+          const businessAddressResult = await pool.query(
+            `SELECT business_address, postcode, city
+             FROM businesses
+             WHERE id = (SELECT business_id FROM orders WHERE id = $1)`,
+            [order.id]
+          );
+          const businessAddress = businessAddressResult.rows[0]
+            ? [
+                businessAddressResult.rows[0].business_address,
+                businessAddressResult.rows[0].postcode,
+                businessAddressResult.rows[0].city,
+              ]
+                .filter(Boolean)
+                .join(", ")
+            : "";
 
-            const sent = await emailService.sendOrderReadyForPickupEmail(
-              toEmail,
-              {
-                customerName: customer.customer_name || "Customer",
-                orderId: String(order.id),
-                items: allItems,
-                totalAmount: totalAmount,
-                cashbackAmount: cashbackAmount,
-                businessName: business.business_name,
-                businessAddress: businessAddress,
-                openingHours: business.opening_hours || "Check business profile for hours",
-                googleMapsLink: googleMapsLink,
-                qrCodeUrl: qrCodeUrl,
-              }
-            );
-            if (sent) {
-              console.log(`[Order Status] Order ready for pickup email sent for order ${order.id} to ${toEmail}`);
-            } else {
-              console.error(`[Order Status] Failed to send ready-for-pickup email for order ${order.id} (sendEmail returned false). Check RESEND_API_KEY / SMTP config.`);
+          // Build Google Maps link
+          const googleMapsLink = businessAddress
+            ? `https://maps.google.com/?q=${encodeURIComponent(businessAddress)}`
+            : undefined;
+
+          // Get QR code if available
+          const qrCodeUrl = order.qr_code || undefined;
+
+          await emailService.sendOrderReadyForPickupEmail(
+            customer.customer_email,
+            {
+              customerName: customer.customer_name,
+              orderId: order.id,
+              items: allItems,
+              totalAmount: totalAmount,
+              cashbackAmount: cashbackAmount,
+              businessName: business.business_name,
+              businessAddress: businessAddress,
+              openingHours: business.opening_hours || "Check business profile for hours",
+              googleMapsLink: googleMapsLink,
+              qrCodeUrl: qrCodeUrl,
             }
-            try {
-              await createNotification(
-                order.user_id,
-                "customer",
-                "order_ready_for_pickup",
-                "Order ready for pickup",
-                "Your order is ready for collection.",
-                { orderId: order.id, screen: "order" }
-              );
-            } catch (e: any) {
-              console.warn(`[Order Status] App notification failed:`, e?.message);
-            }
-          }
+          );
+          console.log(`[Order Status] Order ready for pickup email sent for order ${order.id}`);
         }
       } catch (emailError: any) {
         console.error(`[Order Status] Failed to send ready for pickup email for order ${order.id}:`, emailError);
@@ -4411,7 +4115,7 @@ router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
       }
     }
 
-    if (status === "complete") {
+    if (status === "picked_up") {
       try {
         // Get customer details and points balance
         const customerResult = await pool.query(
@@ -4473,62 +4177,9 @@ router.put("/orders/:id/status", isAuthenticated, async (req, res, next) => {
           );
           console.log(`[Order Status] Collection confirmation email sent for order ${order.id}`);
         }
-        // App notifications: buyer + seller
-        try {
-          await createNotification(
-            order.user_id,
-            "customer",
-            "order_completed",
-            "Order collected",
-            "Your order has been collected / completed.",
-            { orderId: order.id, screen: "order" }
-          );
-          const bizUser = await pool.query(
-            `SELECT user_id FROM businesses WHERE id = $1`,
-            [order.business_id]
-          );
-          if (bizUser.rows.length > 0) {
-            await createNotification(
-              bizUser.rows[0].user_id,
-              "business",
-              "order_completed_by_buyer",
-              "Order collected by buyer",
-              `Order #${String(order.id).slice(0, 8)} has been collected.`,
-              { orderId: order.id, screen: "order" }
-            );
-          }
-        } catch (e: any) {
-          console.warn(`[Order Status] App notification failed:`, e?.message);
-        }
       } catch (emailError: any) {
         console.error(`[Order Status] Failed to send collection confirmation email for order ${order.id}:`, emailError);
         // Don't fail the status update if email fails
-      }
-    }
-
-    if (status === "cancelled") {
-      try {
-        await createNotification(
-          order.user_id,
-          "customer",
-          "order_cancelled",
-          "Order cancelled",
-          "Your order has been cancelled.",
-          { orderId: order.id, screen: "order" }
-        );
-        const bizUser = await pool.query(`SELECT user_id FROM businesses WHERE id = $1`, [order.business_id]);
-        if (bizUser.rows.length > 0) {
-          await createNotification(
-            bizUser.rows[0].user_id,
-            "business",
-            "order_cancelled_business",
-            "Order cancelled",
-            `Order #${String(order.id).slice(0, 8)} was cancelled.`,
-            { orderId: order.id, screen: "order" }
-          );
-        }
-      } catch (e: any) {
-        console.warn(`[Order Status] App notification failed:`, e?.message);
       }
     }
 
@@ -4696,11 +4347,11 @@ router.post("/orders/verify-qr", isAuthenticated, async (req, res, next) => {
       });
     }
 
-    // Check if order is already complete
-    if (order.status === 'complete') {
+    // Check if order is already picked up
+    if (order.status === 'picked_up') {
       return res.status(400).json({ 
         success: false, 
-        message: "Order has already been completed",
+        message: "Order has already been picked up",
         data: {
           orderId: order.id,
           status: order.status,
@@ -4739,10 +4390,10 @@ router.post("/orders/verify-qr", isAuthenticated, async (req, res, next) => {
       });
     }
 
-    // Update order status to complete and record scan
+    // Update order status to picked_up and record scan
     const updateResult = await pool.query(
       `UPDATE orders 
-       SET status = 'complete', 
+       SET status = 'picked_up', 
            picked_up_at = CURRENT_TIMESTAMP,
            qr_code_scanned_at = CURRENT_TIMESTAMP,
            qr_code_scanned_by = $1,
@@ -4947,13 +4598,6 @@ router.post("/products/:id/reviews", isAuthenticated, async (req, res, next) => 
       });
     }
 
-    if (comment && containsObjectionableContent(comment)) {
-      return res.status(400).json({
-        success: false,
-        message: "Review comment contains language that violates our content guidelines.",
-      });
-    }
-
     // Check if product exists
     const productResult = await pool.query("SELECT id FROM products WHERE id = $1", [req.params.id]);
     if (productResult.rows.length === 0) {
@@ -4965,7 +4609,7 @@ router.post("/products/:id/reviews", isAuthenticated, async (req, res, next) => 
       `SELECT oi.id
        FROM order_items oi
        JOIN orders o ON oi.order_id = o.id
-       WHERE oi.product_id = $1 AND o.user_id = $2 AND o.status = 'complete'
+       WHERE oi.product_id = $1 AND o.user_id = $2 AND o.status = 'delivered'
        LIMIT 1`,
       [req.params.id, user.id]
     );
@@ -5060,13 +4704,6 @@ router.post("/services/:id/reviews", isAuthenticated, async (req, res, next) => 
       });
     }
 
-    if (comment && containsObjectionableContent(comment)) {
-      return res.status(400).json({
-        success: false,
-        message: "Review comment contains language that violates our content guidelines.",
-      });
-    }
-
     // Check if service exists
     const serviceResult = await pool.query("SELECT id FROM services WHERE id = $1", [req.params.id]);
     if (serviceResult.rows.length === 0) {
@@ -5116,99 +4753,6 @@ router.post("/services/:id/reviews", isAuthenticated, async (req, res, next) => 
     );
 
     res.json({ success: true, message: "Review submitted successfully" });
-  } catch (error) {
-    next(error);
-  }
-});
-
-// --------- User-generated content moderation: reports and blocks ---------
-
-router.post("/content/report", isAuthenticated, async (req, res, next) => {
-  try {
-    const reporter = getCurrentUser(req);
-    if (!reporter) {
-      return res.status(401).json({ success: false, message: "Not authenticated" });
-    }
-
-    const { reportedUserId, contentType, contentId, contentSnapshot, reason } = req.body;
-
-    if (!reportedUserId || !contentType || !contentId) {
-      return res.status(400).json({
-        success: false,
-        message: "reportedUserId, contentType, and contentId are required",
-      });
-    }
-
-    await pool.query(
-      `INSERT INTO user_content_reports 
-       (reporter_user_id, reported_user_id, content_type, content_id, content_snapshot, reason, status)
-       VALUES ($1, $2, $3, $4, $5, $6, 'open')`,
-      [
-        reporter.id,
-        reportedUserId,
-        contentType,
-        contentId,
-        contentSnapshot || null,
-        reason || null,
-      ]
-    );
-
-    console.log("[UGC] Content reported:", {
-      reporterId: reporter.id,
-      reportedUserId,
-      contentType,
-      contentId,
-    });
-
-    res.json({
-      success: true,
-      message: "Report submitted. Our team will review the content within 24 hours.",
-    });
-  } catch (error) {
-    next(error);
-  }
-});
-
-// Block a user (hide their future content and notify backend)
-router.post("/users/:id/block", isAuthenticated, async (req, res, next) => {
-  try {
-    const currentUser = getCurrentUser(req);
-    if (!currentUser) {
-      return res.status(401).json({ success: false, message: "Not authenticated" });
-    }
-
-    const blockedUserId = req.params.id;
-    const { reason } = req.body || {};
-
-    if (!blockedUserId || blockedUserId === currentUser.id) {
-      return res.status(400).json({
-        success: false,
-        message: "Cannot block this user.",
-      });
-    }
-
-    await pool.query(
-      `INSERT INTO user_blocks (user_id, blocked_user_id)
-       VALUES ($1, $2)
-       ON CONFLICT (user_id, blocked_user_id) DO NOTHING`,
-      [currentUser.id, blockedUserId]
-    );
-
-    if (reason) {
-      await pool.query(
-        `INSERT INTO user_content_reports 
-         (reporter_user_id, reported_user_id, content_type, content_id, content_snapshot, reason, status)
-         VALUES ($1, $2, 'user', $3, NULL, $4, 'open')`,
-        [currentUser.id, blockedUserId, String(blockedUserId), reason]
-      );
-    }
-
-    console.log("[UGC] User blocked:", { userId: currentUser.id, blockedUserId });
-
-    res.json({
-      success: true,
-      message: "User blocked successfully. Their content will no longer appear in your feed.",
-    });
   } catch (error) {
     next(error);
   }
@@ -5345,34 +4889,14 @@ router.delete("/wishlist/:productId", isAuthenticated, async (req, res, next) =>
 
 // Image upload endpoint
 import multer from "multer";
-
-// Configure multer storage
-const multerStorage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadDir = path.resolve(__dirname, "..", "..", "public", "uploads");
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-    const ext = path.extname(file.originalname);
-    cb(null, `product-${uniqueSuffix}${ext}`);
-  },
-});
+import { uploadImage as uploadToCloudinary, isCloudinaryEnabled } from "../services/cloudinaryService";
 
 const upload = multer({
-  storage: multerStorage,
-  limits: {
-    fileSize: 5 * 1024 * 1024, // 5MB limit
-  },
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const allowedTypes = /jpeg|jpg|png|gif|webp/;
-    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
-    const mimetype = allowedTypes.test(file.mimetype);
-
-    if (extname && mimetype) {
+    const allowed = /jpeg|jpg|png|gif|webp/;
+    if (allowed.test(path.extname(file.originalname).toLowerCase()) && allowed.test(file.mimetype)) {
       cb(null, true);
     } else {
       cb(new Error("Only image files (jpeg, jpg, png, gif, webp) are allowed"));
@@ -5383,21 +4907,26 @@ const upload = multer({
 router.post("/upload/image", isAuthenticated, upload.single("image"), async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
-    if (!user) {
-      return res.status(401).json({ success: false, message: "Not authenticated" });
+    if (!user) return res.status(401).json({ success: false, message: "Not authenticated" });
+    if (!req.file) return res.status(400).json({ success: false, message: "No file uploaded" });
+
+    let fileUrl: string;
+    if (isCloudinaryEnabled() && req.file.buffer) {
+      const cloudinaryUrl = await uploadToCloudinary(req.file.buffer);
+      if (cloudinaryUrl) {
+        fileUrl = cloudinaryUrl;
+      } else {
+        fileUrl = await fallbackSaveToDisk(req.file);
+      }
+    } else {
+      fileUrl = await fallbackSaveToDisk(req.file);
     }
 
-    if (!req.file) {
-      return res.status(400).json({ success: false, message: "No file uploaded" });
-    }
-
-    // Return the URL to access the uploaded file
-    const fileUrl = `/uploads/${req.file.filename}`;
     res.json({
       success: true,
       data: {
         url: fileUrl,
-        filename: req.file.filename,
+        filename: req.file.originalname,
         originalName: req.file.originalname,
         size: req.file.size,
       },
@@ -5406,6 +4935,14 @@ router.post("/upload/image", isAuthenticated, upload.single("image"), async (req
     next(error);
   }
 });
+
+async function fallbackSaveToDisk(file: Express.Multer.File): Promise<string> {
+  const filename = `product-${Date.now()}-${Math.round(Math.random() * 1e9)}${path.extname(file.originalname)}`;
+  const buf = (file as Express.Multer.File & { buffer?: Buffer }).buffer;
+  if (!buf) throw new Error("File buffer missing (use multer.memoryStorage())");
+  const managedPath = await saveManagedImageBuffer(buf);
+  return managedPath || `/uploads/${filename}`;
+}
 
 // Business approval (admin only)
 router.get("/businesses/pending", isAuthenticated, async (req, res, next) => {
@@ -6145,12 +5682,8 @@ router.get("/admin/orders", isAuthenticated, async (req, res, next) => {
 
     const params: string[] = [];
     if (status && status !== "all") {
-      if (status === "complete") {
-        query += ` AND (o.status = 'complete' OR o.booking_status = 'completed')`;
-      } else {
-        query += ` AND o.status = $1`;
-        params.push(status as string);
-      }
+      query += ` AND o.status = $1`;
+      params.push(status as string);
     }
 
     query += ` ORDER BY o.created_at DESC`;
@@ -8742,41 +8275,16 @@ router.get("/user/points/transactions", isAuthenticated, async (req, res, next) 
   }
 });
 
-// Validate discount code (optionally scoped to businesses in cart).
-// If businessTotals is provided (map of businessId -> subtotal), discount is calculated only on the
-// sum of subtotals for businesses that participate in the code (so multi-vendor carts get correct amount).
+// Validate discount code
 router.post("/discount-codes/validate", async (req, res, next) => {
   try {
-    const { code, orderTotal, businessIds, businessTotals } = req.body;
+    const { code, orderTotal } = req.body;
 
     if (!code) {
       return res.status(400).json({ success: false, message: "Discount code is required" });
     }
 
-    let totalToUse = orderTotal || 0;
-    const ids = Array.isArray(businessIds) ? businessIds : undefined;
-    const totals = businessTotals && typeof businessTotals === "object" && ids && ids.length > 0
-      ? businessTotals
-      : null;
-
-    if (totals) {
-      const participating = await rewardsService.getParticipatingBusinessIds(code);
-      const qualifyingSubtotal = participating === null
-        ? (Object.values(totals) as number[]).reduce((a, b) => a + Number(b), 0)
-        : ids!.filter((id: string) => participating.includes(id)).reduce(
-            (sum: number, id: string) => sum + (Number(totals[id]) || 0),
-            0
-          );
-      if (qualifyingSubtotal <= 0) {
-        return res.json({
-          success: false,
-          data: { valid: false, message: "This discount code is not valid for any business in your cart" },
-        });
-      }
-      totalToUse = qualifyingSubtotal;
-    }
-
-    const validation = await rewardsService.validateDiscountCode(code, totalToUse, ids);
+    const validation = await rewardsService.validateDiscountCode(code, orderTotal || 0);
     res.json({ success: validation.valid, data: validation });
   } catch (error) {
     next(error);
@@ -8800,7 +8308,7 @@ router.post("/orders/:orderId/discount-code", isAuthenticated, async (req, res, 
   }
 });
 
-// Admin: Create discount code (with participating businesses)
+// Admin: Create discount code
 router.post("/admin/discount-codes", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
@@ -8817,51 +8325,28 @@ router.post("/admin/discount-codes", isAuthenticated, async (req, res, next) => 
       maxDiscountAmount,
       usageLimit,
       validUntil,
-      participatingBusinessIds,
     } = req.body;
 
-    const businessIds = Array.isArray(participatingBusinessIds)
-      ? participatingBusinessIds.filter((id: string) => typeof id === "string" && id)
-      : [];
-    if (businessIds.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Select at least one participating business for this discount code",
-      });
-    }
+    const result = await pool.query(
+      `INSERT INTO discount_codes 
+       (code, description, discount_type, discount_value, min_purchase_amount, max_discount_amount, usage_limit, valid_until)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING *`,
+      [
+        code.toUpperCase(),
+        description || null,
+        discountType,
+        discountValue,
+        minPurchaseAmount || 0,
+        maxDiscountAmount || null,
+        usageLimit || null,
+        validUntil || null,
+      ]
+    );
 
-    const client = await pool.connect();
-    try {
-      const result = await client.query(
-        `INSERT INTO discount_codes 
-         (code, description, discount_type, discount_value, min_purchase_amount, max_discount_amount, usage_limit, valid_until)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         RETURNING *`,
-        [
-          code.toUpperCase(),
-          description || null,
-          discountType,
-          discountValue,
-          minPurchaseAmount || 0,
-          maxDiscountAmount || null,
-          usageLimit || null,
-          validUntil || null,
-        ]
-      );
-      const discountCodeId = result.rows[0].id;
-      for (const businessId of businessIds) {
-        await client.query(
-          `INSERT INTO discount_code_businesses (discount_code_id, business_id) VALUES ($1, $2)
-           ON CONFLICT (discount_code_id, business_id) DO NOTHING`,
-          [discountCodeId, businessId]
-        );
-      }
-      res.status(201).json({ success: true, data: result.rows[0] });
-    } finally {
-      client.release();
-    }
+    res.status(201).json({ success: true, data: result.rows[0] });
   } catch (error: any) {
-    if (error.code === "23505") {
+    if (error.code === '23505') { // Unique violation
       res.status(400).json({ success: false, message: "Discount code already exists" });
     } else {
       next(error);
@@ -8869,7 +8354,7 @@ router.post("/admin/discount-codes", isAuthenticated, async (req, res, next) => 
   }
 });
 
-// Admin: Get all discount codes (with participating business IDs)
+// Admin: Get all discount codes
 router.get("/admin/discount-codes", isAuthenticated, async (req, res, next) => {
   try {
     const user = getCurrentUser(req);
@@ -8878,142 +8363,10 @@ router.get("/admin/discount-codes", isAuthenticated, async (req, res, next) => {
     }
 
     const result = await pool.query(
-      `SELECT dc.*,
-        COALESCE(
-          (SELECT json_agg(dcb.business_id) FROM discount_code_businesses dcb WHERE dcb.discount_code_id = dc.id),
-          '[]'::json
-        ) as participating_business_ids
-       FROM discount_codes dc
-       ORDER BY dc.created_at DESC`
+      `SELECT * FROM discount_codes ORDER BY created_at DESC`
     );
 
-    const rows = result.rows.map((r: any) => ({
-      ...r,
-      participating_business_ids: Array.isArray(r.participating_business_ids) ? r.participating_business_ids : (r.participating_business_ids ? JSON.parse(r.participating_business_ids) : []),
-    }));
-
-    res.json({ success: true, data: rows });
-  } catch (error) {
-    next(error);
-  }
-});
-
-// Admin: Update discount code
-router.put("/admin/discount-codes/:id", isAuthenticated, async (req, res, next) => {
-  try {
-    const user = getCurrentUser(req);
-    if (!user || user.role !== "admin") {
-      return res.status(403).json({ success: false, message: "Only admins can update discount codes" });
-    }
-    const id = req.params.id;
-    const {
-      code,
-      description,
-      discountType,
-      discountValue,
-      minPurchaseAmount,
-      maxDiscountAmount,
-      usageLimit,
-      validUntil,
-      isActive,
-      participatingBusinessIds,
-    } = req.body;
-
-    const businessIds = Array.isArray(participatingBusinessIds)
-      ? participatingBusinessIds.filter((id: string) => typeof id === "string" && id)
-      : [];
-    if (businessIds.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Select at least one participating business for this discount code",
-      });
-    }
-
-    const client = await pool.connect();
-    try {
-      const existing = await client.query("SELECT id FROM discount_codes WHERE id = $1", [id]);
-      if (existing.rows.length === 0) {
-        return res.status(404).json({ success: false, message: "Discount code not found" });
-      }
-
-      await client.query(
-        `UPDATE discount_codes SET
-          code = $1, description = $2, discount_type = $3, discount_value = $4,
-          min_purchase_amount = $5, max_discount_amount = $6, usage_limit = $7,
-          valid_until = $8, is_active = $9, updated_at = CURRENT_TIMESTAMP
-         WHERE id = $10`,
-        [
-          code.toUpperCase(),
-          description || null,
-          discountType,
-          discountValue,
-          minPurchaseAmount ?? 0,
-          maxDiscountAmount ?? null,
-          usageLimit ?? null,
-          validUntil ?? null,
-          isActive !== false,
-          id,
-        ]
-      );
-
-      await client.query("DELETE FROM discount_code_businesses WHERE discount_code_id = $1", [id]);
-      for (const businessId of businessIds) {
-        await client.query(
-          `INSERT INTO discount_code_businesses (discount_code_id, business_id) VALUES ($1, $2)
-           ON CONFLICT (discount_code_id, business_id) DO NOTHING`,
-          [id, businessId]
-        );
-      }
-
-      const result = await client.query(
-        `SELECT dc.*,
-          COALESCE(
-            (SELECT json_agg(dcb.business_id) FROM discount_code_businesses dcb WHERE dcb.discount_code_id = dc.id),
-            '[]'::json
-          ) as participating_business_ids
-         FROM discount_codes dc WHERE dc.id = $1`,
-        [id]
-      );
-      const row = result.rows[0];
-      if (row && row.participating_business_ids && !Array.isArray(row.participating_business_ids)) {
-        row.participating_business_ids = JSON.parse(row.participating_business_ids);
-      }
-      res.json({ success: true, data: row });
-    } finally {
-      client.release();
-    }
-  } catch (error: any) {
-    if (error.code === "23505") {
-      res.status(400).json({ success: false, message: "A discount code with this code already exists" });
-    } else {
-      next(error);
-    }
-  }
-});
-
-// Admin: Delete discount code (fails if code has been used on any order)
-router.delete("/admin/discount-codes/:id", isAuthenticated, async (req, res, next) => {
-  try {
-    const user = getCurrentUser(req);
-    if (!user || user.role !== "admin") {
-      return res.status(403).json({ success: false, message: "Only admins can delete discount codes" });
-    }
-    const id = req.params.id;
-
-    const used = await pool.query(
-      "SELECT 1 FROM order_discount_codes WHERE discount_code_id = $1 LIMIT 1",
-      [id]
-    );
-    if (used.rows.length > 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Cannot delete: this discount code has already been used on orders",
-      });
-    }
-
-    await pool.query("DELETE FROM discount_code_businesses WHERE discount_code_id = $1", [id]);
-    await pool.query("DELETE FROM discount_codes WHERE id = $1", [id]);
-    res.json({ success: true, message: "Discount code deleted" });
+    res.json({ success: true, data: result.rows });
   } catch (error) {
     next(error);
   }

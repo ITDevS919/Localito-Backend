@@ -11,7 +11,9 @@ export const pool = new Pool({
   password: process.env.DB_PASSWORD || "postgres",
   max: 20, // Maximum number of clients in the pool
   idleTimeoutMillis: 30000, // Close idle clients after 30 seconds
-  connectionTimeoutMillis: 2000, // Return an error after 2 seconds if connection could not be established
+  connectionTimeoutMillis: 30000, // Timeout when establishing new connection
+  keepAlive: true, // Prevent DB/network from dropping idle connections (avoids "Connection terminated" during webhooks)
+  keepAliveInitialDelayMillis: 10000, // Start keepalive after 10s idle
 });
 
 // Test database connection
@@ -21,7 +23,14 @@ pool.on("connect", () => {
 
 pool.on("error", (err) => {
   console.error("Unexpected error on idle client", err);
-  process.exit(-1);
+  // Don't exit immediately - let PM2 handle restart if needed
+  // Logging the error allows monitoring systems to detect the issue
+  // Immediate exit causes restart loops if database is temporarily unavailable
+  console.error("Database pool error details:", {
+    message: err.message,
+    code: err.code,
+    stack: err.stack
+  });
 });
 
 // Helper function to test connection

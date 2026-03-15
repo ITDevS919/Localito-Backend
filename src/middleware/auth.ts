@@ -3,6 +3,7 @@ import passport from "passport";
 import { Strategy as LocalStrategy } from "passport-local";
 import { Strategy as GoogleStrategy, VerifyCallback } from "passport-google-oauth20";
 import { storage } from "../services/storage";
+import { verifyToken } from "../authToken";
 import type { User } from "../../shared/schema";
 
 // Configure Passport Local Strategy
@@ -44,37 +45,37 @@ passport.serializeUser((user: any, done) => {
 
 // Configure Passport Google Strategy
 if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
+  const callbackURL =
+    process.env.GOOGLE_CALLBACK_URL ||
+    (process.env.BACKEND_URL
+      ? `${process.env.BACKEND_URL.replace(/\/$/, "")}/auth/google/callback`
+      : process.env.API_URL
+        ? `${process.env.API_URL.replace(/\/$/, "")}/auth/google/callback`
+        : "/api/auth/google/callback");
   passport.use(
     "google",
     new GoogleStrategy(
       {
         clientID: process.env.GOOGLE_CLIENT_ID,
         clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-        callbackURL: process.env.GOOGLE_CALLBACK_URL || "/api/auth/google/callback",
+        callbackURL,
         passReqToCallback: true, // Enable passing request to callback
       },
       async (req: any, accessToken: any, refreshToken: any, profile: any, done: VerifyCallback) => {
         try {
-          console.log("[Google Auth Strategy] Processing authentication for profile:", profile.id);
-          
           // Get role from session (stored in route before authentication)
           const role = (req.session as any)?.googleAuthRole || "customer";
-          console.log("[Google Auth Strategy] Role from session:", role);
 
           // Check if user exists by Google ID
           let user = await storage.getUserByGoogleId(profile.id);
           
-          if (user) {
-            console.log("[Google Auth Strategy] User found by Google ID:", user.id);
-            return done(null, user);
-          }
+          if (user) return done(null, user);
 
           // Check if user exists by email (for linking accounts)
           if (profile.emails && profile.emails[0]) {
             user = await storage.getUserByEmail(profile.emails[0].value);
             
             if (user) {
-              console.log("[Google Auth Strategy] User found by email, linking Google account:", user.id);
               // Link Google account to existing user
               await storage.updateUserGoogleId(user.id, profile.id);
               return done(null, user);
@@ -87,7 +88,6 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
           const isLoginFlow = req.originalUrl?.includes('/login') || req.path?.includes('/login');
           
           if (isLoginFlow && (role === "business" || role === "admin")) {
-            console.log("[Google Auth Strategy] Login flow detected for business/admin, but account not found");
             return done(new Error("Account not found. Please sign up first using the signup page."));
           }
 
@@ -95,12 +95,8 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
           const displayName = profile.displayName || profile.name?.givenName || "User";
           const email = profile.emails?.[0]?.value || "";
           
-          if (!email) {
-            console.error("[Google Auth Strategy] No email found in profile");
-            return done(new Error("Email is required for Google authentication"));
-          }
+          if (!email) return done(new Error("Email is required for Google authentication"));
 
-          console.log("[Google Auth Strategy] Creating new user with email:", email, "role:", role);
           user = await storage.createUserFromGoogle(
             profile.id,
             email,
@@ -108,11 +104,9 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
             role // Use role from session instead of hardcoded "customer"
           );
 
-          console.log("[Google Auth Strategy] User created successfully:", user.id);
           (user as any)._isNewUser = true;
           return done(null, user);
         } catch (error: any) {
-          console.error("[Google Auth Strategy] Error during authentication:", error);
           return done(error);
         }
       }
@@ -129,6 +123,35 @@ passport.deserializeUser(async (id: string, done) => {
     done(error);
   }
 });
+
+/**
+ * Optional Bearer token auth for mobile. If Authorization: Bearer <token> is present,
+ * verify the token and set req.user so isAuthenticated() passes without cookies.
+ */
+export async function bearerAuth(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
+  if (!token) {
+    return next();
+  }
+  const userId = verifyToken(token);
+  if (!userId) {
+    return next();
+  }
+  try {
+    const user = await storage.getUser(userId);
+    if (user) {
+      (req as any).user = user;
+    }
+  } catch {
+    // ignore
+  }
+  next();
+}
 
 // Middleware to check if user is authenticated
 export function isAuthenticated(

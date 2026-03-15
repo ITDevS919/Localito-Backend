@@ -3,6 +3,7 @@ import type { Product } from "../../shared/schema";
 import { squareService } from "./squareService";
 import * as shopifyService from "./shopifyService";
 import { geocodingService } from "./geocodingService";
+import { getManagedVariantPath, isManagedLocalImagePath } from "./imageVariantService";
 
 export class ProductService {
   async getProducts(filters?: {
@@ -17,6 +18,8 @@ export class ProductService {
     radiusKm?: number;
     page?: number;  // Add page parameter
     limit?: number; // Add limit parameter
+    skipEposSync?: boolean; // Skip Square/Shopify sync on public list for fast response (sync on detail/cron)
+    imageBaseUrl?: string; // When set, return image URLs instead of base64 (for fast list; images loaded on demand)
   }): Promise<{ products: Product[]; total: number; page: number; limit: number; totalPages: number }> {
       let query = `
       SELECT p.*, b.business_name as business_name, b.postcode, b.city, b.latitude, b.longitude,
@@ -65,7 +68,7 @@ export class ProductService {
     }
 
     if (filters?.search) {
-      query += ` AND (p.name ILIKE $${paramCount} OR p.description ILIKE $${paramCount})`;
+      query += ` AND (p.name ILIKE $${paramCount} OR p.description ILIKE $${paramCount} OR b.business_name ILIKE $${paramCount})`;
       params.push(`%${filters.search}%`);
       paramCount++;
     }
@@ -80,8 +83,7 @@ export class ProductService {
     } else if (filters?.location) {
       // Fallback to text-based search by postcode or city
       const locationParam = filters.location.trim();
-      console.log(`[ProductService] Using text-based search for location: "${locationParam}"`);
-      console.log(`[ProductService] Current query before location filter:`, query);
+      // Text-based search for location (postcode/city)
       
       // Compare against businesses table postcode and city fields
       // Handle NULL values and trim whitespace for better matching
@@ -98,14 +100,6 @@ export class ProductService {
       params.push(`${locationParam}%`); // For postcode prefix match (e.g., "M1" matches "M1 1AA")
       params.push(locationParam); // For exact postcode match (ILIKE without % works as equals)
       params.push(locationParam); // For exact city match (ILIKE without % works as equals)
-      console.log(`[ProductService] Location filter params:`, {
-        partialPostcode: `%${locationParam}%`,
-        partialCity: `%${locationParam}%`,
-        prefixPostcode: `${locationParam}%`,
-        exactPostcode: locationParam,
-        exactCity: locationParam
-      });
-      console.log(`[ProductService] Filtering businesses where b.postcode or b.city matches: "${locationParam}"`);
       paramCount += 5;
     }
 
@@ -124,67 +118,91 @@ export class ProductService {
       // Fetch all products without pagination for radius filtering
       result = await pool.query(query, params);
     } else {
-      // Get total count first (before pagination) for non-radius searches
-      const countQuery = query
-        .replace(/SELECT.*?FROM/, 'SELECT COUNT(*) as total FROM')
-        .replace(/ORDER BY.*$/, '')
-        .replace(/LIMIT.*$/, '')
-        .replace(/OFFSET.*$/, '');
+      // Run count and data in parallel. Use fast paths for simple list and search-only to reduce DB load (important for mobile/Android).
+      const isSimpleList =
+        !filters?.location &&
+        !filters?.search &&
+        !filters?.category &&
+        !filters?.businessId &&
+        !filters?.businessTypeCategoryId &&
+        filters?.isApproved === true;
 
-      const countParams = [...params];
-      try {
-      const countResult = await pool.query(countQuery, countParams);
-        if (!countResult.rows || countResult.rows.length === 0) {
-          console.error('[ProductService] Count query returned no rows. Query:', countQuery);
-          total = 0;
-        } else {
-      total = parseInt(countResult.rows[0].total) || 0;
-        }
-      } catch (error) {
-        console.error('[ProductService] Error executing count query:', error);
-        console.error('[ProductService] Count query:', countQuery);
-        console.error('[ProductService] Count params:', countParams);
-        total = 0;
+      const isSearchOnly =
+        !!filters?.search &&
+        !filters?.location &&
+        !filters?.category &&
+        !filters?.businessId &&
+        !filters?.businessTypeCategoryId &&
+        filters?.isApproved === true;
+
+      const searchPattern = `%${(filters?.search || "").trim()}%`;
+
+      let countQuery: string;
+      let countParams: any[];
+      let dataQuery: string;
+      let dataParams: any[];
+
+      if (isSimpleList) {
+        countQuery = `SELECT COUNT(*) as total FROM products p JOIN businesses b ON p.business_id = b.id WHERE p.is_approved = true AND b.is_suspended = false`;
+        countParams = [];
+        dataQuery = `SELECT p.id, p.business_id, p.name, p.description, p.price, p.stock, p.category, (p.images)[1] as first_image, p.is_approved, p.created_at, p.updated_at, p.sync_from_epos, p.square_item_id, p.shopify_product_id, p.last_epos_sync_at, b.business_name as business_name, b.postcode, b.city, b.latitude, b.longitude, u.username as business_username, COALESCE(p.review_count, 0) as review_count, COALESCE(p.average_rating, 0) as average_rating, b.square_sync_enabled, b.square_access_token, b.square_location_id, b.shopify_sync_enabled, b.shopify_access_token, b.shopify_shop FROM products p JOIN businesses b ON p.business_id = b.id JOIN users u ON b.user_id = u.id WHERE p.is_approved = true AND b.is_suspended = false ORDER BY p.created_at DESC LIMIT $1 OFFSET $2`;
+        dataParams = [limit, offset];
+      } else if (isSearchOnly) {
+        countQuery = `SELECT COUNT(*) as total FROM products p JOIN businesses b ON p.business_id = b.id WHERE p.is_approved = true AND b.is_suspended = false AND (p.name ILIKE $1 OR p.description ILIKE $1 OR b.business_name ILIKE $1)`;
+        countParams = [searchPattern];
+        dataQuery = `SELECT p.id, p.business_id, p.name, p.description, p.price, p.stock, p.category, (p.images)[1] as first_image, p.is_approved, p.created_at, p.updated_at, p.sync_from_epos, p.square_item_id, p.shopify_product_id, p.last_epos_sync_at, b.business_name as business_name, b.postcode, b.city, b.latitude, b.longitude, u.username as business_username, COALESCE(p.review_count, 0) as review_count, COALESCE(p.average_rating, 0) as average_rating, b.square_sync_enabled, b.square_access_token, b.square_location_id, b.shopify_sync_enabled, b.shopify_access_token, b.shopify_shop FROM products p JOIN businesses b ON p.business_id = b.id JOIN users u ON b.user_id = u.id WHERE p.is_approved = true AND b.is_suspended = false AND (p.name ILIKE $1 OR p.description ILIKE $1 OR b.business_name ILIKE $1) ORDER BY p.created_at DESC LIMIT $2 OFFSET $3`;
+        dataParams = [searchPattern, limit, offset];
+      } else {
+        countQuery = query
+          .replace(/SELECT.*?FROM/, 'SELECT COUNT(*) as total FROM')
+          .replace(/ORDER BY.*$/, '')
+          .replace(/LIMIT.*$/, '')
+          .replace(/OFFSET.*$/, '');
+        countParams = [...params];
+        dataQuery = query + ` LIMIT $${paramCount} OFFSET $${paramCount + 1}`;
+        dataParams = [...params, limit, offset];
       }
 
-    // Add pagination to main query
-    query += ` LIMIT $${paramCount} OFFSET $${paramCount + 1}`;
-    params.push(limit, offset);
-    paramCount += 2;
-
-    console.log(`[ProductService] Final query:`, query);
-    console.log(`[ProductService] Query params:`, params);
-    result = await pool.query(query, params);
-    console.log(`[ProductService] Query returned ${result.rows.length} rows`);
+      try {
+        const [countResult, dataResult] = await Promise.all([
+          pool.query(countQuery, countParams),
+          pool.query(dataQuery, dataParams),
+        ]);
+        total = countResult?.rows?.[0] ? parseInt(countResult.rows[0].total) || 0 : 0;
+        result = dataResult;
+      } catch (error) {
+        console.error('[ProductService] Error in count or data query:', error);
+        total = 0;
+        result = { rows: [] };
+      }
     }
-  
-    // Sync stock from Square for products with EPOS sync enabled
-    // Do this in parallel for better performance
-    const syncPromises = result.rows
-      .filter((row) => {
-        if (!row.sync_from_epos) return false;
-        if (row.square_item_id && row.square_sync_enabled && row.square_access_token && row.square_location_id) return true;
-        if (row.shopify_product_id && row.shopify_sync_enabled && row.shopify_access_token && row.shopify_shop) return true;
-        return false;
-      })
-      .map(async (row) => {
-        try {
-          const syncResult = row.square_item_id
-            ? await squareService.syncProductStock(row.id)
-            : row.shopify_product_id
-              ? await shopifyService.syncProductStock(row.id)
-              : { success: false as const, stock: null };
-          if (syncResult.success && syncResult.stock !== null) {
-            row.stock = syncResult.stock;
-            row.last_epos_sync_at = new Date();
-          }
-        } catch (error) {
-          console.error(`[ProductService] Failed to sync stock for product ${row.id}:`, error);
-        }
-      });
 
-    // Wait for all syncs to complete (but don't fail if some fail)
-    await Promise.allSettled(syncPromises);
+    // Sync stock from Square/Shopify only when not skipped (public list skips for fast load; detail/cron do sync)
+    if (!filters?.skipEposSync) {
+      const syncPromises = result.rows
+        .filter((row) => {
+          if (!row.sync_from_epos) return false;
+          if (row.square_item_id && row.square_sync_enabled && row.square_access_token && row.square_location_id) return true;
+          if (row.shopify_product_id && row.shopify_sync_enabled && row.shopify_access_token && row.shopify_shop) return true;
+          return false;
+        })
+        .map(async (row) => {
+          try {
+            const syncResult = row.square_item_id
+              ? await squareService.syncProductStock(row.id)
+              : row.shopify_product_id
+                ? await shopifyService.syncProductStock(row.id)
+                : { success: false as const, stock: null };
+            if (syncResult.success && syncResult.stock !== null) {
+              row.stock = syncResult.stock;
+              row.last_epos_sync_at = new Date();
+            }
+          } catch (error) {
+            console.error(`[ProductService] Failed to sync stock for product ${row.id}:`, error);
+          }
+        });
+      await Promise.allSettled(syncPromises);
+    }
 
     let products = result.rows.map((row) => ({
       id: row.id,
@@ -194,7 +212,7 @@ export class ProductService {
       price: parseFloat(row.price),
       stock: parseInt(row.stock) || 0,
       category: row.category,
-      images: row.images || [],
+      _rawImage: row.first_image || null,
       isApproved: row.is_approved,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
@@ -214,7 +232,7 @@ export class ProductService {
       squareItemId: row.square_item_id || null,
       shopifyProductId: row.shopify_product_id || null,
       lastEposSyncAt: row.last_epos_sync_at || null,
-        }));
+    }));
 
     // If radius search is enabled, filter by exact distance
     if (isRadiusSearch) {
@@ -260,13 +278,29 @@ export class ProductService {
 
       // Apply pagination after radius filtering
       const paginatedProducts = products.slice(offset, offset + limit);
-      
+
+      // Use image URLs (fast) or omit images (no base64 in list)
+      const imageUrl = filters.imageBaseUrl;
+      const listProducts = paginatedProducts.map(({ businessLatitude, businessLongitude, _rawImage, ...product }) => ({
+        ...product,
+        images:
+          imageUrl && _rawImage
+            ? [
+                _rawImage.startsWith("http://") || _rawImage.startsWith("https://")
+                  ? _rawImage
+                  : isManagedLocalImagePath(_rawImage)
+                    ? `${imageUrl.replace(/\/api\/?$/, "")}${getManagedVariantPath(_rawImage, "thumb")}`
+                    : _rawImage.startsWith("/")
+                      ? `${imageUrl.replace(/\/api\/?$/, "")}${_rawImage}`
+                      : `${imageUrl.replace(/\/api\/?$/, "")}/api/products/${product.id}/image/0?thumb=1`,
+              ]
+            : [],
+      }));
+
       // Calculate total pages
       const totalPages = Math.ceil(total / limit);
-
-      // Remove temporary location fields before returning
       return {
-        products: paginatedProducts.map(({ businessLatitude, businessLongitude, ...product }) => product),
+        products: listProducts,
         total,
         page,
         limit,
@@ -277,9 +311,25 @@ export class ProductService {
     // Calculate total pages for non-radius searches
     const totalPages = Math.ceil(total / limit);
 
-    // Remove temporary location fields before returning
+    // Use image URLs (fast ~30KB list) or omit; images loaded on demand via /image/0?thumb=1
+    const imageUrl = filters?.imageBaseUrl;
+    const listProducts = products.map(({ businessLatitude, businessLongitude, _rawImage, ...product }) => ({
+      ...product,
+      images:
+        imageUrl && _rawImage
+          ? [
+              _rawImage.startsWith("http://") || _rawImage.startsWith("https://")
+                ? _rawImage
+                : isManagedLocalImagePath(_rawImage)
+                  ? `${imageUrl.replace(/\/api\/?$/, "")}${getManagedVariantPath(_rawImage, "thumb")}`
+                  : _rawImage.startsWith("/")
+                    ? `${imageUrl.replace(/\/api\/?$/, "")}${_rawImage}`
+                    : `${imageUrl.replace(/\/api\/?$/, "")}/api/products/${product.id}/image/0?thumb=1`,
+            ]
+          : [],
+    }));
     return {
-      products: products.map(({ businessLatitude, businessLongitude, ...product }) => product),
+      products: listProducts,
       total,
       page,
       limit,

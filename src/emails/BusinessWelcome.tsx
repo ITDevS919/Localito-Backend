@@ -127,10 +127,10 @@ export default function BusinessWelcomeEmail({
                   <Text style={subStepItem}>
                     • Save and publish – live in minutes!
                   </Text>
+                  <Text style={stepNoteInBox}>
+                    (Aim for <strong>5–10 of your best selling products/services</strong> to start)
+                  </Text>
                 </Section>
-                <Text style={stepNote}>
-                  (Aim for <strong>5–10 of your best selling products/services</strong> to start)
-                </Text>
               </Section>
             </Section>
 
@@ -147,7 +147,7 @@ export default function BusinessWelcomeEmail({
             <Section style={helpBox}>
               <Text style={helpText}>
                 Need help? Reply to this email or contact support at{' '}
-                <Link href="mailto:hello@localito.com" style={linkStyle}>
+                <Link href="mailto:hello@localito.com" style={supportLinkStyle}>
                   hello@localito.com
                 </Link>
                 . We're here to help.
@@ -334,6 +334,14 @@ const stepNote = {
   fontStyle: 'italic',
 };
 
+const stepNoteInBox = {
+  fontSize: '14px',
+  lineHeight: '1.6',
+  color: '#64748b',
+  margin: '12px 0 0',
+  fontStyle: 'italic',
+};
+
 const stepCtaSection = {
   textAlign: 'left' as const,
   margin: '12px 0 0',
@@ -393,6 +401,12 @@ const helpText = {
 const linkStyle = {
   color: '#094b9e',
   textDecoration: 'underline',
+};
+
+const supportLinkStyle = {
+  color: '#094b9e',
+  textDecoration: 'underline',
+  fontWeight: '700',
 };
 
 const closingText = {

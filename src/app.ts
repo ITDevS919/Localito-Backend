@@ -8,6 +8,7 @@ import { pool } from "./db/connection";
 import { errorHandler } from "./middleware/errorHandler";
 import { requestLogger } from "./middleware/requestLogger";
 import { apiRoutes } from "./routes";
+import { bearerAuth } from "./middleware/auth";
 import { serveStaticFiles } from "./middleware/staticFiles";
 import { stripeService } from "./services/stripeService";
 import "./middleware/auth"; // Initialize Passport strategies
@@ -195,7 +196,10 @@ if (process.env.NODE_ENV !== "production" || process.env.DEBUG_COOKIES === "true
 // Request logging
 app.use(requestLogger);
 
-// API Routes
+// API Routes (Bearer token for mobile runs first so /auth/me works without cookies)
+app.use("/api", (req: Request, res: Response, next: NextFunction) => {
+  bearerAuth(req, res, next).catch(next);
+});
 app.use("/api", apiRoutes);
 
 // Serve static files in production

@@ -363,12 +363,29 @@ export async function runMigrations() {
     `);
 
     await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_businesses_name_gin ON businesses USING gin (business_name gin_trgm_ops)
+    `);
+
+    await client.query(`
       CREATE INDEX IF NOT EXISTS idx_products_business_id ON products(business_id)
     `);
 
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_products_category ON products(category)
     `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_products_is_approved_created_at ON products(is_approved, created_at DESC)
+    `);
+
+    // Speed up search (ILIKE) for marketplace – requires pg_trgm extension (DigitalOcean: enable in DB dashboard if needed)
+    try {
+      await client.query(`CREATE EXTENSION IF NOT EXISTS pg_trgm`);
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_products_name_gin ON products USING gin (name gin_trgm_ops)`);
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_products_description_gin ON products USING gin (description gin_trgm_ops)`);
+    } catch (e) {
+      console.warn('[migrations] pg_trgm or product search indexes skipped (extension may need enabling):', (e as Error).message);
+    }
 
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_cart_items_user_id ON cart_items(user_id)
@@ -1169,6 +1186,17 @@ export async function runMigrations() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_services_category ON services(category)
     `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_services_is_approved_created_at ON services(is_approved, created_at DESC)
+    `);
+
+    try {
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_services_name_gin ON services USING gin (name gin_trgm_ops)`);
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_services_description_gin ON services USING gin (description gin_trgm_ops)`);
+    } catch (e) {
+      console.warn('[migrations] services search GIN indexes skipped:', (e as Error).message);
+    }
 
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_cart_service_items_user_id ON cart_service_items(user_id)
