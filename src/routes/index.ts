@@ -1816,6 +1816,48 @@ router.delete("/admin/products/:id", isAuthenticated, async (req, res, next) => 
   }
 });
 
+// Get all services for admin (admin only) - MUST be before /admin/services/:id
+router.get("/admin/services/all", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ success: false, message: "Only admins can access this" });
+    }
+
+    const limit = parseInt(req.query.limit as string) || 100;
+    const offset = parseInt(req.query.offset as string) || 0;
+
+    const result = await pool.query(
+      `SELECT s.*, b.business_name as business_name, b.postcode, b.city
+       FROM services s
+       JOIN businesses b ON s.business_id = b.id
+       ORDER BY s.created_at DESC
+       LIMIT $1 OFFSET $2`,
+      [limit, offset]
+    );
+
+    const services = result.rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      description: row.description,
+      price: parseFloat(row.price),
+      category: row.category,
+      images: row.images || [],
+      durationMinutes: row.duration_minutes,
+      maxParticipants: row.max_participants,
+      locationType: row.location_type,
+      requiresStaff: row.requires_staff,
+      isApproved: row.is_approved,
+      business_name: row.business_name,
+      created_at: row.created_at,
+    }));
+
+    res.json({ success: true, data: services });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Delete service (admin only)
 router.delete("/admin/services/:id", isAuthenticated, async (req, res, next) => {
   try {
