@@ -5211,6 +5211,49 @@ router.get("/admin/businesses", isAuthenticated, async (req, res, next) => {
   }
 });
 
+// Admin: Get single business by id or username (for profile view)
+router.get("/admin/businesses/:id", isAuthenticated, async (req, res, next) => {
+  try {
+    const user = getCurrentUser(req);
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ success: false, message: "Only admins can access this" });
+    }
+
+    const { id } = req.params;
+    const isUuidParam = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+    const result = await pool.query(
+      `SELECT b.*, u.username, u.email
+       FROM businesses b
+       JOIN users u ON b.user_id = u.id
+       WHERE ${isUuidParam ? "b.id = $1" : "u.username = $1"}`,
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Business not found" });
+    }
+
+    const row = result.rows[0];
+    res.json({
+      success: true,
+      data: {
+        id: row.id,
+        business_name: row.business_name,
+        business_address: row.business_address,
+        postcode: row.postcode,
+        city: row.city,
+        phone: row.phone,
+        username: row.username,
+        email: row.email,
+        is_approved: row.is_approved,
+        is_suspended: row.is_suspended,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Admin: Get all users with pagination and filters
 router.get("/admin/users", isAuthenticated, async (req, res, next) => {
   try {
