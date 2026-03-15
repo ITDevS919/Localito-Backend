@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Patch GET /products/:id to return image URLs instead of base64 so detail page images load."""
+import shared.session
 path = "src/routes/index.ts"
 with open(path, "r", encoding="utf-8") as f:
     content = f.read()
